@@ -3102,6 +3102,10 @@ struct VehicleMediaRuntime::Impl {
       enqueue_control_trace({{"stage", "mock_telemetry_publish"}, {"seq", sequence},
           {"event_monotonic_ms", trace_now}, {"bytes", payload_value.dump().size()},
           {"channel_open", control_link_open.load()}, {"summary", payload_value.value("mock_telemetry_summary", false)},
+          {"feedback_path", feedback_transport_fence.negotiated() ?
+              Json(std::string(detail::control_path_name(feedback_transport_fence.path()))) : Json(nullptr)},
+          {"feedback_epoch", feedback_transport_fence.negotiated() ?
+              feedback_transport_fence.state().at("epoch") : Json(nullptr)},
           {"control_path", std::string(detail::control_path_name(control_transport_fence.path()))}});
       last_mock_telemetry_trace_ms = trace_now;
     }

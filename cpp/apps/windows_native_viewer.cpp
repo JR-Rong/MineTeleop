@@ -174,6 +174,7 @@ struct Window {
     Json telemetry;
     std::int64_t telemetry_at_ms = 0;
     std::uint64_t telemetry_seq = 0, safety_stop_episodes = 0, last_result_seq = 0;
+    std::uint64_t telemetry_status_observed = 0;
     bool was_active = false, stop_episode = false;
     Json dc_send_trace = Json::array();
     std::uint64_t dc_send_trace_dropped = 0;
@@ -318,6 +319,7 @@ struct Window {
         profile_accepted = true;
       }
       if (value.value("event", "") == "vehicle_telemetry") {
+        ++telemetry_status_observed;
         const auto seq = value.value("seq", std::uint64_t{0});
         if (seq <= telemetry_seq || !value.contains("control_timing") || !value.at("control_timing").is_object()) return;
         telemetry_seq = seq;
@@ -439,6 +441,7 @@ struct Window {
         }
         const auto native = status.at("native_control");
         const auto transport = native.at("control_transport");
+        const auto feedback = transport.value("feedback_transport", Json::object());
         const auto sends = channel->send_stats();
         const Json evidence{{"event", "native_mock_observation"}, {"monotonic_ms", now_ms},
             {"video_ready", video_health.ready}, {"remote_media_ready", gate->ready(now_ms)},
@@ -447,6 +450,9 @@ struct Window {
             {"sctp_direct_udp", channel->direct_udp(mock_local_ip, mock_peer_ip)}, {"control_path", transport.value("path", "unknown")},
             {"control_selecting", transport.value("selecting", true)}, {"intent_fresh", native.value("intent_fresh", false)},
             {"control_failed_dc_trials", transport.value("failed_dc_trials", 0)},
+            {"feedback_path", feedback.is_object() ? feedback.value("path", "unknown") : "unknown"},
+            {"feedback_epoch", feedback.is_object() ? feedback.value("epoch", std::uint64_t{0}) : 0},
+            {"feedback_selecting", feedback.is_object() ? feedback.value("selecting", true) : true},
             {"mock_idle_reprobe_used", transport.value("mock_idle_reprobe_used", false)},
             {"channel_send", {{"attempted", sends.attempted}, {"queued", sends.queued},
                 {"buffered", sends.buffered}, {"unavailable", sends.unavailable}, {"errors", sends.errors}}},
@@ -456,6 +462,7 @@ struct Window {
             {"profile_accepted", profile_accepted}, {"profile_attempts", profile_retry.attempts()},
             {"control_epoch", transport.value("epoch", std::uint64_t{0})}, {"handshake_sent", handshake_sent},
             {"telemetry_age_ms", telemetry_at_ms ? Json(now_ms - telemetry_at_ms) : Json(nullptr)},
+            {"telemetry_status_observed", telemetry_status_observed},
             {"telemetry", telemetry}, {"safety_stop_episodes", safety_stop_episodes}};
         std::fprintf(stderr, "%s\n", evidence.dump().c_str()); std::fflush(stderr);
         next_evidence = now + 1s;
