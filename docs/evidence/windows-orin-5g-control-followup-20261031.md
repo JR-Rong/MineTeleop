@@ -136,6 +136,7 @@ quality was not evaluated.
 | long-23 | New Windows temporary IPv6 address | Direct ICE and video did not become ready within the 120 s startup deadline; no formal window started. |
 | long-24 | Original still-preferred Windows address, 30 fps | Direct ICE re-established; two braking entries at 243.450 and 248.801 s. |
 | long-25 | Same endpoint, 30 fps | Incomplete: the native window lost foreground focus and input authorization was revoked. No vehicle braking entry was logged in its measured portion. |
+| long-26 | Same endpoint, 30 fps | Three braking entries at 1,620.463, 1,621.069 and 1,626.093 s; five periodic nonzero mock inputs were accepted before the failure. |
 
 The newer diagnostic build adds only mock-scoped, payload-free feedback-path,
 telemetry receive/consume counts and send-buffer metadata. In long-21, 11,233
@@ -144,8 +145,12 @@ DTLS records matched; the capture began after the measurement started, so the
 as packet loss. The largest matched sender-to-kernel delta was about 312 ms
 above the median cross-clock offset. In long-24, capture covered the whole
 window: 8,738 records matched and nine did not; their cause is unknown. Its
-largest matched delta was about 278 ms above that median. Neither comparison
-identifies the particular wireless, cellular or intermediate segment.
+largest matched delta was about 278 ms above that median. Long-26 matched
+55,053 of 55,080 sender records; 27 remain unexplained. Around the failure,
+seven matched records sent roughly 50 ms apart arrived at the Orin kernel
+within the same millisecond, with the largest matched delta about 425 ms above
+the median cross-clock offset. No comparison identifies the particular
+wireless, cellular or intermediate segment.
 
 The Windows test guard was refined after long-22 to check that the exact ICE
 local address is still Preferred on WLAN and that the route to the specified
