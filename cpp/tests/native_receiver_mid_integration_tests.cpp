@@ -110,6 +110,7 @@ int main(int argc, char** argv) {
     Options options;
     options.camera_ids = {"rear", "front"};
     options.fixture_loopback = true;
+    options.trace_dtls_headers = true;
     std::atomic<unsigned> software_front{0}, software_rear{0}, software_invalid{0};
     if (software) options.software_frame = [&](const std::string& camera, GstSample* sample) {
       GstVideoInfo info{};
@@ -170,6 +171,8 @@ int main(int argc, char** argv) {
     }
     const auto pair = receiver.selected_pair();
     receiver.stop();
+    const auto dtls = receiver.drain_dtls_trace();
+    require(!dtls.records.empty() && dtls.dropped == 0, "synthetic ICE sink produced no bounded DTLS metadata");
     require(swap_identity ? rejected_swap : passed, "two decoded tracks did not retain their negotiated camera identities");
     require(pair.is_object() && pair.value("local_address", "") == "127.0.0.1" &&
             pair.value("remote_address", "") == "127.0.0.1" && pair.value("local_transport", "") == "udp" &&

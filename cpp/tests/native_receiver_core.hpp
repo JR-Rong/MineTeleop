@@ -6,6 +6,7 @@
 #include "mine_teleop/detail/ice_diagnostics.hpp"
 #include "mine_teleop/detail/gstreamer_decoder.hpp"
 #include "mine_teleop/detail/native_control_channel.hpp"
+#include "mine_teleop/detail/dtls_record_trace.hpp"
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/sdp/sdp.h>
@@ -154,6 +155,7 @@ struct Options {
   std::function<void(const std::string&, GstSample*)> software_frame;
   std::optional<detail::NativeMediaScope> control_scope;
   bool fixture_loopback{false};  // In-process test only; never a command-line option.
+  bool trace_dtls_headers{false}; // Explicit isolated mock diagnostics only.
 };
 
 #ifdef __APPLE__
@@ -690,6 +692,7 @@ class Receiver {
   }
   Json selected_pair() { std::lock_guard lock(mutex_); return selected_pair_; }
   detail::NativeControlChannel* control_channel() { return control_channel_.get(); }
+  detail::DtlsRecordTrace::Batch drain_dtls_trace() { return dtls_trace_->drain(); }
   std::deque<Json> candidates() { std::lock_guard lock(mutex_); std::deque<Json> result; result.swap(candidates_); return result; }
   void check() {
     { std::lock_guard lock(mutex_);
@@ -738,11 +741,29 @@ class Receiver {
   static void on_element(GstBin*, GstBin*, GstElement* element, gpointer data) {
     auto& self = *static_cast<Receiver*>(data);
     auto* factory = gst_element_get_factory(element);
-    if (!factory || std::string(gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory))) != "rtpjitterbuffer") return;
+    if (!factory) return;
+    const std::string_view name = gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory));
+    if (self.options_.trace_dtls_headers && name == "nicesink") {
+      if (auto* sink = gst_element_get_static_pad(element, "sink")) {
+        gst_pad_add_probe(sink, GST_PAD_PROBE_TYPE_BUFFER, retained_probe<detail::DtlsRecordTrace, trace_outbound_dtls>,
+            new std::shared_ptr<detail::DtlsRecordTrace>(self.dtls_trace_), release_callback_owner<detail::DtlsRecordTrace>);
+        gst_object_unref(sink);
+      }
+    }
+    if (name != "rtpjitterbuffer") return;
     auto* sink = gst_element_get_static_pad(element, "sink");
     gst_pad_add_probe(sink, GST_PAD_PROBE_TYPE_BUFFER, retained_probe<ArrivalTimes, ArrivalTimes::record>,
         new std::shared_ptr<ArrivalTimes>(self.arrivals_), release_callback_owner<ArrivalTimes>);
     gst_object_unref(sink);
+  }
+  static GstPadProbeReturn trace_outbound_dtls(GstPad*, GstPadProbeInfo* info, gpointer data) {
+    auto* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!buffer) return GST_PAD_PROBE_OK;
+    std::array<std::uint8_t, 13> header{};
+    const auto count = gst_buffer_extract(buffer, 0, header.data(), header.size());
+    const auto now = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count();
+    static_cast<detail::DtlsRecordTrace*>(data)->record(header.data(), count, gst_buffer_get_size(buffer), now);
+    return GST_PAD_PROBE_OK;
   }
   static const char* candidate_type(NiceCandidateType type) {
     switch (type) {
@@ -907,6 +928,7 @@ class Receiver {
     track->start(options_.stall_ms, options_.software_frame);
   }
   std::shared_ptr<ArrivalTimes> arrivals_{std::make_shared<ArrivalTimes>()};
+  std::shared_ptr<detail::DtlsRecordTrace> dtls_trace_{std::make_shared<detail::DtlsRecordTrace>()};
   std::unique_ptr<detail::NativeControlChannel> control_channel_;
   Options options_;
   GstElement* pipeline_{}, *peer_{};

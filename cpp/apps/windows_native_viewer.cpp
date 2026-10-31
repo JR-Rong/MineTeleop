@@ -404,6 +404,21 @@ struct Window {
       if (now >= next_evidence) {
         flush_dc_trace();
         flush_guard_trace();
+        if (config.control_trace_commands) {
+          const auto batch = receiver.drain_dtls_trace();
+          Json records = Json::array();
+          for (const auto& entry : batch.records)
+            records.push_back({{"monotonic_us", entry.monotonic_us}, {"bytes", entry.bytes},
+                {"type", entry.header.type}, {"epoch", entry.header.epoch}, {"record_seq", entry.header.sequence}});
+          const auto wall_us = std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::system_clock::now().time_since_epoch()).count();
+          const auto mono_us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count();
+          const Json packet_trace{{"event", "native_mock_dtls_outbound_batch"}, {"records", std::move(records)},
+              {"dropped", batch.dropped}, {"clock_wall_us", wall_us}, {"clock_monotonic_us", mono_us},
+              {"clock_offset_ms", sync.value("offset_ms", std::int64_t{0})},
+              {"clock_uncertainty_ms", sync.value("uncertainty_ms", std::int64_t{-1})}};
+          std::fprintf(stderr, "%s\n", packet_trace.dump().c_str());
+        }
         const auto native = status.at("native_control");
         const auto transport = native.at("control_transport");
         const auto sends = channel->send_stats();
@@ -532,6 +547,7 @@ struct Window {
                 options.address_family = mock_ip_family;
                 options.ice_transport = "udp";
                 options.ice_route_mode = "direct";
+                options.trace_dtls_headers = config.control_trace_commands;
               }
               negotiation = payload.at("media_negotiation_id").get<std::string>();
               if (payload.value("control_transport_capability", "") == detail::kControlTransportCapability)

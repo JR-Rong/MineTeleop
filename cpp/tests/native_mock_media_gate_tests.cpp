@@ -2,6 +2,7 @@
 #include "mine_teleop/detail/native_mock_input_sequence.hpp"
 #include "mine_teleop/detail/native_mock_profile_retry.hpp"
 #include "mine_teleop/detail/native_mock_keyboard.hpp"
+#include "mine_teleop/detail/dtls_record_trace.hpp"
 #include <iostream>
 #include <stdexcept>
 using mine_teleop::detail::NativeMockMediaGate;
@@ -68,6 +69,26 @@ void test_profile_retry_stays_bounded_and_needs_live_guards() {
   require(!retry.due(true, true, false, 1, 60000) && retry.attempts() == retry.kMaxAttempts,
           "profile retry budget was not exhausted");
 }
+void test_dtls_header_trace_is_bounded_and_excludes_payloads() {
+  using namespace mine_teleop::detail;
+  std::array<std::uint8_t, 13> header{23, 0xfe, 0xfd, 0, 1, 0, 0, 0, 0, 0, 42, 0, 4};
+  auto parsed = parse_dtls_record_header(header.data(), header.size());
+  require(parsed && parsed->type == 23 && parsed->epoch == 1 && parsed->sequence == 42,
+          "DTLS record header identity is wrong");
+  require(!parse_dtls_record_header(header.data(), 12), "truncated record accepted");
+  auto rtp = header; rtp[0] = 0x80;
+  require(!parse_dtls_record_header(rtp.data(), rtp.size()), "non-DTLS packet accepted");
+  auto invalid = header; invalid[2] = 0x01;
+  require(!parse_dtls_record_header(invalid.data(), invalid.size()), "invalid DTLS version accepted");
+  DtlsRecordTrace trace;
+  for (std::size_t i = 0; i < DtlsRecordTrace::kCapacity + 3; ++i)
+    trace.record(header.data(), header.size(), 1024, static_cast<std::int64_t>(i));
+  auto batch = trace.drain();
+  require(batch.records.size() == DtlsRecordTrace::kCapacity && batch.dropped == 3 &&
+          batch.records.front().header.sequence == 42 && batch.records.front().bytes == 1024,
+          "DTLS diagnostics did not bound the queue or account for loss");
+  require(trace.drain().records.empty(), "DTLS trace drain retained records");
+}
 void test_mock_keyboard_rearms_only_after_release() {
   mine_teleop::detail::NativeMockKeyboard keyboard;
   using Keys = mine_teleop::detail::NativeMockKeyboard::Keys;
@@ -125,6 +146,6 @@ void test_live_clock_keyboard_and_media_guard() {
           !native_mock_input_fresh(1001, 1201), "200 ms input lease boundary changed");
 }
 }
-int main() { try { test_gate(); test_neutral_refresh_sequence(); test_profile_retry_stays_bounded_and_needs_live_guards(); test_mock_keyboard_rearms_only_after_release(); test_live_clock_keyboard_and_media_guard();
+int main() { try { test_gate(); test_neutral_refresh_sequence(); test_profile_retry_stays_bounded_and_needs_live_guards(); test_dtls_header_trace_is_bounded_and_excludes_payloads(); test_mock_keyboard_rearms_only_after_release(); test_live_clock_keyboard_and_media_guard();
   std::cout << "PASS scoped mock media, input renewal, keyboard and clock guard\n"; return 0; }
 catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; } }
