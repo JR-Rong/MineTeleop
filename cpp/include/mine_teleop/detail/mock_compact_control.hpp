@@ -59,7 +59,7 @@ inline std::optional<Json> decode_mock_compact_control(std::span<const std::uint
 inline std::optional<std::vector<std::uint8_t>> encode_mock_compact_control(const Json& j) {
   try {
     if (!j.is_object() || j.at("type") != "control_command" || j.at("estop") != false ||
-        j.at("control_transport").at("protocol") != kControlTransportCapability ||
+        j.at("control_transport").at("protocol").get<std::string>() != kControlTransportCapability ||
         j.at("control_transport").at("path") != "dc") return std::nullopt;
     const auto& t = j.at("control_transport");
     if (t.at("action") != "select" && t.at("action") != "command") return std::nullopt;

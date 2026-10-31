@@ -219,10 +219,16 @@ int main(int argc, char** argv) {
     // but can still exercise the vehicle-facing binary channel and decoder.
     g_signal_connect(b.rtc, "on-data-channel", G_CALLBACK(+[](GstElement*, GstWebRTCDataChannel* channel, gpointer data) {
       auto* peer = static_cast<Peer*>(data);
+      gchar* label = nullptr; g_object_get(channel, "label", &label, nullptr);
+      const bool control = label && std::string_view(label) == "control";
+      g_free(label); if (!control) return;
       peer->channel = GST_WEBRTC_DATA_CHANNEL(g_object_ref(channel));
       g_signal_connect(channel, "on-open", G_CALLBACK(+[](GstWebRTCDataChannel*, gpointer owner) {
         static_cast<Peer*>(owner)->open = true;
       }), peer);
+      GstWebRTCDataChannelState state = GST_WEBRTC_DATA_CHANNEL_STATE_CLOSED;
+      g_object_get(channel, "ready-state", &state, nullptr);
+      if (state == GST_WEBRTC_DATA_CHANNEL_STATE_OPEN) peer->open = true;
     }), &b);
     a.start(true); b.start(false); a.describe(b, true); b.describe(a, false);
     const auto open_deadline = std::chrono::steady_clock::now() + 15s;

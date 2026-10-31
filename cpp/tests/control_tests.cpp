@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -439,8 +440,13 @@ void test_bounded_persistent_http_framing() {
   raw_send_all(queued, "GET /old-input HTTP/1.1\r\nHost: localhost\r\n\r\n");
   release_slow.set_value();
   const auto slow_response = response(queued);
-  expect(slow_response.first.find("Connection: close") != std::string::npos && old_input_handled == 0,
-         "a request queued behind a slow handler was processed as fresh");
+  // Input may arrive after the pre-response check but before the post-response
+  // check. In that case the header says keep-alive even though the server must
+  // immediately close without dispatching the queued request.
+  const auto following = ::recv(queued, &byte, 1, 0);
+  const bool closed = following == 0 || (following < 0 && errno == ECONNRESET);
+  expect(slow_response.second == "/slow:" && closed && old_input_handled == 0,
+         "a request queued behind a slow handler was processed as fresh or the connection stayed open");
   ::close(queued);
   const int failed = connect();
   raw_send_all(failed, "GET /handler-error HTTP/1.1\r\nHost: localhost\r\n\r\n");
@@ -8541,11 +8547,15 @@ void test_source_aware_api_and_websocket_rate_limit() {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::string_view(argv[1]) == "--http-framing-only") {
+    try { test_bounded_persistent_http_framing(); return 0; }
+    catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+  }
   bool runtime_only = false;
   if (argc == 2 && std::string_view(argv[1]) == "--runtime-only") {
     runtime_only = true;
   } else if (argc != 1) {
-    std::cerr << "Usage: mine-teleop-control-tests [--runtime-only]\n";
+    std::cerr << "Usage: mine-teleop-control-tests [--runtime-only|--http-framing-only]\n";
     return 64;
   }
   const std::unordered_set<std::string> source_contracts{
