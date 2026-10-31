@@ -175,6 +175,7 @@ struct Window {
     std::int64_t telemetry_at_ms = 0;
     std::uint64_t telemetry_seq = 0, safety_stop_episodes = 0, last_result_seq = 0;
     std::uint64_t telemetry_status_observed = 0;
+    std::uint64_t telemetry_wire_observed = 0, telemetry_wire_last_seq = 0;
     bool was_active = false, stop_episode = false;
     Json dc_send_trace = Json::array();
     std::uint64_t dc_send_trace_dropped = 0;
@@ -363,7 +364,21 @@ struct Window {
         const detail::NativeCourierScope current{{session_id, generation, attempt}, owner, current_epoch};
         if (!courier) courier = std::make_unique<detail::NativeControlCourier>(current);
         detail::NativeControlCourier::Io io{
-            [&] { return channel->pop(); }, [&] { return channel->direct_udp(mock_local_ip, mock_peer_ip); },
+            [&] {
+              auto bytes = channel->pop();
+              if (config.control_trace_commands && bytes && bytes->find("\"vehicle_telemetry\"") != std::string::npos) {
+                const auto envelope = Json::parse(*bytes, nullptr, false);
+                if (envelope.is_object()) {
+                  const auto value = envelope.contains("status") && envelope.at("status").is_object() ? envelope.at("status") : envelope;
+                  if (value.contains("event") && value.at("event").is_string() && value.at("event") == "vehicle_telemetry" &&
+                      value.contains("seq") && value.at("seq").is_number_unsigned()) {
+                    ++telemetry_wire_observed;
+                    telemetry_wire_last_seq = value.at("seq").get<std::uint64_t>();
+                  }
+                }
+              }
+              return bytes;
+            }, [&] { return channel->direct_udp(mock_local_ip, mock_peer_ip); },
             [&](const Json& request) { return driver.control_transport_bridge(request); },
             [&](const std::string& bytes) {
               const auto started = static_cast<std::int64_t>(bench_now_ms());
@@ -462,6 +477,7 @@ struct Window {
             {"profile_accepted", profile_accepted}, {"profile_attempts", profile_retry.attempts()},
             {"control_epoch", transport.value("epoch", std::uint64_t{0})}, {"handshake_sent", handshake_sent},
             {"telemetry_age_ms", telemetry_at_ms ? Json(now_ms - telemetry_at_ms) : Json(nullptr)},
+            {"telemetry_wire_observed", telemetry_wire_observed}, {"telemetry_wire_last_seq", telemetry_wire_last_seq},
             {"telemetry_status_observed", telemetry_status_observed},
             {"telemetry", telemetry}, {"safety_stop_episodes", safety_stop_episodes}};
         std::fprintf(stderr, "%s\n", evidence.dump().c_str()); std::fflush(stderr);

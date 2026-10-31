@@ -3099,8 +3099,11 @@ struct VehicleMediaRuntime::Impl {
     const auto trace_now = steady_now_ms();
     if (config.runtime.control_log_commands && config.vehicle_id.starts_with("test_bench_") &&
         config.vehicle_adapter.type == "mock" && trace_now - last_mock_telemetry_trace_ms >= 1000) {
+      guint64 buffered_bytes = 0;
+      if (control_channel) g_object_get(control_channel, "buffered-amount", &buffered_bytes, nullptr);
       enqueue_control_trace({{"stage", "mock_telemetry_publish"}, {"seq", sequence},
           {"event_monotonic_ms", trace_now}, {"bytes", payload_value.dump().size()},
+          {"channel_buffered_bytes", buffered_bytes},
           {"channel_open", control_link_open.load()}, {"summary", payload_value.value("mock_telemetry_summary", false)},
           {"feedback_path", feedback_transport_fence.negotiated() ?
               Json(std::string(detail::control_path_name(feedback_transport_fence.path()))) : Json(nullptr)},
