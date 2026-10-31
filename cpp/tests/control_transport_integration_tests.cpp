@@ -39,7 +39,7 @@ struct DriverConsoleTransportTestAccess {
       runtime.control_signaling_ack_window_.reset();
       runtime.control_signaling_ack_window_.note_sent(runtime.native_control_last_seq_.load() + 1, now - 501);
     }
-    return {{"frame", frame}, {"published_at", runtime.control_transport_latest_dc_at_ms_}};
+    return {{"frame", frame}, {"published_at", runtime.control_transport_latest_dc_at_ms_}, {"injected_at", now}};
   }
   static bool retired(DriverConsoleRuntime& runtime) {
     std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
@@ -582,7 +582,9 @@ void product_recovery_withdraws_unfetched_motion() {
     while (steady() < deadline && transport().at("path") == "dc") std::this_thread::sleep_for(std::chrono::milliseconds(1));
     const auto withdrawn = transport();
     expect(withdrawn.at("path") == "wss", "recovery did not withdraw DC; cause=" +
-        std::to_string(cause) + "; state=" + withdrawn.dump());
+        std::to_string(cause) + "; elapsed_ms=" +
+        std::to_string(steady() - pending.at("injected_at").get<std::int64_t>()) +
+        "; native=" + f.driver->status().at("native_control").dump());
     // No WSS select has been delivered to the vehicle. Neither expiry nor
     // replay rejection may hide a stale publication at this boundary.
     expect(steady() - pending.at("published_at").get<std::int64_t>() < kNativeBridgePublicationMaxAgeMs,
