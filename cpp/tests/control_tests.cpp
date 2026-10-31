@@ -912,10 +912,6 @@ void test_local_http_page_takeover_abort_reordering_and_production_lease() {
       native.at("effective_throttle") == 0.4 && !native.value("requires_fresh_input", true),
       "late retired-page HTTP request changed the current page's input");
 
-  const auto refresh_before_abort = native.at("accepted_refresh_sample_id").get<std::uint64_t>();
-  // A refresh is identified by a strictly newer monotonic millisecond. Make
-  // that precondition explicit rather than depending on HTTP call overhead.
-  std::this_thread::sleep_for(std::chrono::milliseconds(2));
   auto slow_response = input; slow_response["test_response_gate"] = true;
   struct ResponseSocket {
     int value{-1};
@@ -933,6 +929,14 @@ void test_local_http_page_takeover_abort_reordering_and_production_lease() {
   local_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   expect(::connect(response_socket.value, reinterpret_cast<const sockaddr*>(&local_address),
       sizeof(local_address)) == 0, "cannot connect cancellation fixture socket");
+  // Socket setup is not a page heartbeat. Refresh after setup so a slow CI
+  // scheduler cannot silently spend the production input lease before the
+  // request whose response this fixture deliberately holds.
+  const auto before_gate = http.post_json_response(local_base + "/api/control-intent", input);
+  expect(before_gate.value("accepted", false), "pre-gate page heartbeat rejected: " + before_gate.dump());
+  const auto refresh_before_abort = before_gate.at("accepted_refresh_sample_id").get<std::uint64_t>();
+  // A refresh is identified by a strictly newer monotonic millisecond.
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
   const auto slow_body = slow_response.dump();
   raw_send_all(response_socket.value, "POST /api/control-intent HTTP/1.1\r\nHost: 127.0.0.1\r\n"
       "Content-Type: application/json\r\nContent-Length: " + std::to_string(slow_body.size()) +
@@ -945,7 +949,9 @@ void test_local_http_page_takeover_abort_reordering_and_production_lease() {
   expect(response_delay_applied.load(std::memory_order_acquire) &&
       response_delay_acceptance.value("accepted", false) &&
       response_delay_acceptance.at("accepted_refresh_sample_id").get<std::uint64_t>() > refresh_before_abort,
-      "cancelled request was not accepted before its response was held");
+      "cancelled request was not accepted before its response was held: " +
+          Json{{"handler_applied", response_delay_applied.load(std::memory_order_acquire)},
+               {"refresh_before", refresh_before_abort}, {"acceptance", response_delay_acceptance}}.dump());
   // Closing this real client socket cancels only its pending response. A
   // timer-based HTTP timeout could resume after the independent200ms lease.
   const bool response_aborted = ::shutdown(response_socket.value, SHUT_RDWR) == 0;
