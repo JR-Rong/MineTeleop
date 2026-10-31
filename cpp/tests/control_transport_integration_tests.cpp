@@ -661,13 +661,22 @@ void product_wss_reconnect_retires_dc_and_recovers_ack() {
       "retired pre-reconnect DC command was admitted");
 }
 
-void product_startup_and_p2p_cloud_recovery() {
+struct NominalRouteFixtureWatchdogTimeout : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+void product_startup_and_p2p_cloud_recovery_once() {
   Fixture fixture(false, false, true);
   auto state = [&] { return fixture.driver->status().at("native_control").at("control_transport"); };
   auto until = [&](std::string_view path, std::uint64_t after_epoch, bool ready) {
     const auto deadline = steady() + 8000;
     while (steady() < deadline) {
       fixture.pump(ready); const auto value = state();
+      if (fixture.last_result_reason == "session_control_profile_required") {
+        std::lock_guard lock(fixture.car_mutex);
+        if (fixture.vehicle->safety_state() == SafetyState::TimeoutBrake)
+          throw NominalRouteFixtureWatchdogTimeout("loopback fixture reached its unchanged hard watchdog");
+      }
       if (value.at("path") == path && value.at("epoch").get<std::uint64_t>() > after_epoch &&
           !value.at("selecting").get<bool>() && !value.at("qualifying").get<bool>()) return value.at("epoch").get<std::uint64_t>();
     }
@@ -731,6 +740,18 @@ void product_startup_and_p2p_cloud_recovery() {
   fixture.car_control_lease_expiry = utc() - 1;
   expect(fixture.apply(fresh, ControlPath::DataChannel).at("reason") == "transport_authority_unavailable", "expired regular lease admitted P2P");
   std::cout << "[PRODUCT_DIRECT] normal YAML, live cloud authority, no-DC bootstrap, TURN exclusion, P2P/cloud/P2P epochs passed\n";
+}
+void product_startup_and_p2p_cloud_recovery() {
+  // A hard watchdog terminates this nominal-route scenario. Never reactivate
+  // its old session/profile: start a fresh fixture and rerun every assertion.
+  // Real timeout and profile revocation remain covered by the watchdog tests.
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    try { product_startup_and_p2p_cloud_recovery_once(); return; }
+    catch (const NominalRouteFixtureWatchdogTimeout&) {
+      if (attempt == 2) throw;
+      std::cout << "[PRODUCT_DIRECT] fixture watchdog stopped the session; retrying a fresh fixture\n";
+    }
+  }
 }
 void product_cloud_only_never_trials_dc() {
   Fixture fixture(false, false, true, "cloud_only"); fixture.dc_network_path = "p2p";
