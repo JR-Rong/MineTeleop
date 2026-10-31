@@ -51,7 +51,7 @@ PRELUDE = r'''
 #include "mine_teleop/detail/ice_diagnostics.hpp"
 namespace detail { using mine_teleop::detail::ice_candidate_summary; using mine_teleop::detail::ice_direct_sdp; }
 using Json=nlohmann::json;
-namespace detail { constexpr std::string_view kControlTransportCapability="native-control-transport-v1"; constexpr std::string_view kEmergencyStopCapability="native-stop-only-v1"; constexpr std::string_view kFeedbackTransportCapability="native-feedback-transport-v1"; }
+namespace detail { constexpr std::string_view kControlTransportCapability="native-control-transport-v1"; constexpr std::string_view kEmergencyStopCapability="native-stop-only-v1"; constexpr std::string_view kFeedbackTransportCapability="native-feedback-transport-v1"; constexpr std::string_view kMockCompactControl="mock-compact-control-cbor-v1"; }
 using namespace std::chrono_literals;
 enum class VideoCodec {H264,H265};
 const char* to_string(VideoCodec value){return value==VideoCodec::H264?"h264":"h265";}
@@ -73,6 +73,7 @@ struct Impl {
 '''
 
 MEMBERS = r'''
+  bool mock_compact_control_enabled() const {return false;}
   struct {struct {int experimental_direct_authority_max_ms=0;bool mock_control_diagnostic=false;} runtime;} config;
   struct Lane {struct {std::string id;} camera;struct {int width=16,height=16,fps=20,bitrate_kbps=1;} profile;};
   std::vector<std::unique_ptr<Lane>> lanes;
