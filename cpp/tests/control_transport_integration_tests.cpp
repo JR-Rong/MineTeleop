@@ -571,7 +571,9 @@ void product_recovery_withdraws_unfetched_motion() {
     expect(pending.at("frame").at("seq").get<std::uint64_t>() > f.last_dc_seq, "pending frame was already consumed");
     deadline = steady() + 80;
     while (steady() < deadline && transport().at("path") == "dc") std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    expect(transport().at("path") == "wss", "recovery did not withdraw DC");
+    const auto withdrawn = transport();
+    expect(withdrawn.at("path") == "wss", "recovery did not withdraw DC; cause=" +
+        std::to_string(cause) + "; state=" + withdrawn.dump());
     // No WSS select has been delivered to the vehicle. Neither expiry nor
     // replay rejection may hide a stale publication at this boundary.
     expect(steady() - pending.at("published_at").get<std::int64_t>() < kNativeBridgePublicationMaxAgeMs,
