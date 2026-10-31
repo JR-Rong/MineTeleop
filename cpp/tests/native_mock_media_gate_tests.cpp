@@ -144,6 +144,10 @@ void test_live_clock_keyboard_and_media_guard() {
           "missing or future input observation was admitted");
   require(native_mock_input_fresh(1001, 1001) && native_mock_input_fresh(1001, 1200) &&
           !native_mock_input_fresh(1001, 1201), "200 ms input lease boundary changed");
+  using mine_teleop::detail::native_mock_clock_fresh;
+  require(!native_mock_clock_fresh(0, 1000) && !native_mock_clock_fresh(1001, 1000) &&
+          native_mock_clock_fresh(1001, 1500) && !native_mock_clock_fresh(1001, 1501),
+          "500 ms clock observation boundary changed");
 }
 }
 int main() { try { test_gate(); test_neutral_refresh_sequence(); test_profile_retry_stays_bounded_and_needs_live_guards(); test_dtls_header_trace_is_bounded_and_excludes_payloads(); test_mock_keyboard_rearms_only_after_release(); test_live_clock_keyboard_and_media_guard();

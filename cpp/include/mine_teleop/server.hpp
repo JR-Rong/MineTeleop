@@ -418,6 +418,11 @@ inline bool control_transport_mode_is_valid(std::string_view mode) {
   return mode == "p2p_preferred" || mode == "cloud_only";
 }
 
+struct DriverTimeSyncSnapshot {
+  TimeSyncStatus clock;
+  TimeSyncReadinessState readiness;
+};
+
 class DriverConsoleRuntime {
  public:
   DriverConsoleRuntime(DriverConfig config, std::string vehicle_id, std::string password);
@@ -455,6 +460,9 @@ class DriverConsoleRuntime {
   // The in-process courier can omit the signaling socket snapshot so a long
   // poll cannot delay its safety-critical publication loop.
   [[nodiscard]] Json status(bool omit_signaling_socket = false);
+  // Independent of signaling and control transport locks; retains the same
+  // clock uncertainty and readiness gate as the native sender.
+  [[nodiscard]] DriverTimeSyncSnapshot time_sync_snapshot();
   [[nodiscard]] Json log_sessions();
   [[nodiscard]] Json start_log_export(std::string_view key);
   [[nodiscard]] Json log_export_status() const;

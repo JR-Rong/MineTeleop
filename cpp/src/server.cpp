@@ -8481,6 +8481,14 @@ Json DriverConsoleRuntime::update_control_intent(const Json& input, const HttpRe
   };
 }
 
+DriverTimeSyncSnapshot DriverConsoleRuntime::time_sync_snapshot() {
+  auto clock = clock_.status();
+  auto readiness = time_sync_readiness_gate_.observe(clock,
+      config_.max_time_sync_uncertainty_ms, monotonic_now_ms(),
+      TimeSyncReadinessGate::candidate_timeout_ms(config_.time_sync_interval_ms, config_.time_sync_samples));
+  return {std::move(clock), std::move(readiness)};
+}
+
 Json DriverConsoleRuntime::status(bool omit_signaling_socket) {
   // Monitoring is a local snapshot. Network time samples and authority
   // renewal belong to their workers and must not delay input-lease refresh.

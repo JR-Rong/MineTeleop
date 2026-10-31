@@ -191,6 +191,22 @@ struct Window {
     // The sender independently checks its current clock before publication.
     std::atomic<bool> input_failed{false};
     std::atomic<std::int64_t> clock_observed_ms{0}, input_authorized_at_ms{0};
+    // Clock health must not depend on a courier/bridge cycle completing. The
+    // observation age is measured from the start of the actual snapshot, so a
+    // blocked clock read cannot make old evidence look fresh.
+    std::jthread clock_worker([&](std::stop_token clock_stop) {
+      while (!clock_stop.stop_requested() && !stop.stop_requested() && !parent.stop_requested()) {
+        const auto observed_at = static_cast<std::int64_t>(bench_now_ms());
+        try {
+          const auto snapshot = driver.time_sync_snapshot();
+          const bool healthy = snapshot.clock.synchronized && snapshot.clock.uncertainty_ms >= 0 &&
+              snapshot.clock.uncertainty_ms <= 25 && snapshot.readiness.ready;
+          clock_observed_ms.store(healthy ? observed_at : 0);
+        } catch (...) { clock_observed_ms.store(0); }
+        std::this_thread::sleep_for(25ms);
+      }
+      clock_observed_ms.store(0);
+    });
     // Keep diagnostics off the lease worker's I/O path and bound memory if
     // the observation thread stalls. -1 means a short-circuited check.
     struct GuardState {
@@ -232,7 +248,7 @@ struct Window {
         while (!input_stop.stop_requested() && !stop.stop_requested() && !parent.stop_requested()) {
           const auto clock_at = clock_observed_ms.load();
           const auto now_ms = static_cast<std::int64_t>(bench_now_ms());
-          const bool clock_ok = clock_at > 0 && now_ms >= clock_at && now_ms - clock_at < 500;
+          const bool clock_ok = detail::native_mock_clock_fresh(clock_at, now_ms);
           const auto video_health = render->health->snapshot_now();
           const bool focused = IsWindowVisible(hwnd) && !IsIconic(hwnd) && GetForegroundWindow() == hwnd;
           if (!focused) for (const auto& id : render->cameras) static_cast<void>(render->health->set_usable(id, 1, false));
@@ -335,7 +351,6 @@ struct Window {
       if (!focused) for (const auto& id : render->cameras) static_cast<void>(render->health->set_usable(id, 1, false));
       const bool ready = focused && clock_ok && gate->ready_now() && video_health.ready &&
           channel->direct_udp(mock_local_ip, mock_peer_ip);
-      clock_observed_ms.store(clock_ok ? now_ms : 0);
       if (input_failed.load()) throw std::runtime_error("mock input worker failed");
       const auto current_epoch = epoch.load();
       if (current_epoch == 0) {

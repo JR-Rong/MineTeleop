@@ -16,6 +16,16 @@ namespace mine_teleop {
 // Inspect an unfetched native publication and inject a recovery observation
 // while holding the real transport mutex. Sending/fallback/bridge stay real.
 struct DriverConsoleTransportTestAccess {
+  static bool clock_does_not_wait_for_transport(DriverConsoleRuntime& runtime) {
+    std::unique_lock signal_lock(runtime.signaling_websocket_mutex_);
+    std::unique_lock control_lock(runtime.control_signaling_websocket_mutex_);
+    std::unique_lock state_lock(runtime.mutex_);
+    auto result = std::async(std::launch::async, [&] { return runtime.time_sync_snapshot(); });
+    const bool timely = result.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    state_lock.unlock(); control_lock.unlock(); signal_lock.unlock();
+    const auto value = result.get();
+    return timely && !value.clock.synchronized && !value.readiness.ready;
+  }
   static bool status_does_not_wait_for_signaling(DriverConsoleRuntime& runtime) {
     std::unique_lock lock(runtime.signaling_websocket_mutex_);
     auto result = std::async(std::launch::async, [&] { return runtime.status(true); });
@@ -75,6 +85,8 @@ void courier_status_does_not_wait_for_signaling_poll() {
   DriverConsoleRuntime driver(config, "test_bench_status", "fixture");
   expect(DriverConsoleTransportTestAccess::status_does_not_wait_for_signaling(driver),
       "courier status waited for signaling poll or exposed an unavailable socket snapshot");
+  expect(DriverConsoleTransportTestAccess::clock_does_not_wait_for_transport(driver),
+      "clock health waited for transport locks or accepted an unsynchronized clock");
 }
 
 // Only the DC byte courier is mocked. Native producer, cloud HTTP/WSS,
