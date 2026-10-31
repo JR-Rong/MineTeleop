@@ -364,7 +364,7 @@ struct Window {
         if (!courier->tick(current, io)) throw std::runtime_error("mock courier retired");
         const auto transport = status.at("native_control").at("control_transport");
         const bool negotiated = transport.value("epoch", 0) > 0 && !transport.value("selecting", true);
-        if (profile_retry.due(ready, negotiated, profile_accepted, now_ms)) {
+        if (profile_retry.due(ready, negotiated, profile_accepted, current_epoch, now_ms)) {
           if (!profile_request) {
             SessionControlProfile profile;
             profile.target_speed_kph = 0; profile.max_motor_torque_nm = 0;
@@ -381,7 +381,7 @@ struct Window {
           static_cast<void>(driver.send_control_management({{"source_session_id", session_id},
               {"source_control_session_generation", generation}, {"media_negotiation_id", attempt},
               {"ui_instance_id", owner}, {"ui_control_epoch", current_epoch}, {"message", *profile_request}}));
-          profile_retry.sent(now_ms);
+          profile_retry.sent(current_epoch, now_ms);
         }
         if (ready && negotiated && profile_accepted && !handshake_sent) {
           static_cast<void>(driver.send_control_management({{"source_session_id", session_id},

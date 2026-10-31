@@ -78,7 +78,9 @@ The Windows test viewer came from commit `024dbaf811411cba9b0d811c7a309719eaddd0
 The Orin ARM64 test binary was built from `f001af8c92e9118c5c7f7b9fb66425d87a013324`
 (SHA-256 `a2a40ba91a902fc7b2267de7a7273396dc50723a85f4b93e31ab9bc65bef6dd2`);
 the later commit changed only Windows mock code and its tests, not the Orin
-production sources. A subsequent commit changed test diagnostics only.
+production sources. A subsequent commit changed test diagnostics only; a
+later owner-epoch retry guard was added after the WAN run and has automated
+coverage, but was not exercised by that run.
 All temporary test processes, restricted cloud public keys, credentials,
 Windows scheduled tasks and packet-monitor filters were removed; CAN remained
 down and both cameras were released.

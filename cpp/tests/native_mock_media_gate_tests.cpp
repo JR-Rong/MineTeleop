@@ -53,17 +53,19 @@ void test_neutral_refresh_sequence() {
 }
 void test_profile_retry_stays_bounded_and_needs_live_guards() {
   mine_teleop::detail::NativeMockProfileRetry retry;
-  require(!retry.due(false, true, false, 0) && !retry.due(true, false, false, 0) &&
-          !retry.due(true, true, true, 0), "profile retry ignored startup gates");
+  require(!retry.due(false, true, false, 1, 0) && !retry.due(true, false, false, 1, 0) &&
+          !retry.due(true, true, true, 1, 0) && !retry.due(true, true, false, 0, 0),
+          "profile retry ignored startup gates");
   for (unsigned n = 0; n < retry.kMaxAttempts; ++n) {
     const auto t = static_cast<std::int64_t>(n) * retry.kRetryMs;
-    require(retry.due(true, true, false, t), "bounded profile attempt missing");
-    retry.sent(t);
-    require(!retry.due(true, true, false, t + retry.kRetryMs - 1), "profile retry too early");
-    require(!retry.due(true, true, true, t + retry.kRetryMs), "accepted profile was resent");
-    require(!retry.due(true, true, false, t - 1), "backward clock enabled retry");
+    require(retry.due(true, true, false, 1, t), "bounded profile attempt missing");
+    retry.sent(1, t);
+    require(!retry.due(true, true, false, 1, t + retry.kRetryMs - 1), "profile retry too early");
+    require(!retry.due(true, true, true, 1, t + retry.kRetryMs), "accepted profile was resent");
+    require(!retry.due(true, true, false, 1, t - 1), "backward clock enabled retry");
+    require(!retry.due(true, true, false, 2, t + retry.kRetryMs), "owner handoff reused old profile");
   }
-  require(!retry.due(true, true, false, 60000) && retry.attempts() == retry.kMaxAttempts,
+  require(!retry.due(true, true, false, 1, 60000) && retry.attempts() == retry.kMaxAttempts,
           "profile retry budget was not exhausted");
 }
 void test_mock_keyboard_rearms_only_after_release() {
