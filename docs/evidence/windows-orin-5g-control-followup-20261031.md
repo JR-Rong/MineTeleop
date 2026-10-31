@@ -116,3 +116,42 @@ The prior and new failures cannot establish real-vehicle safety, uninterrupted
 5G availability or browser-versus-native superiority. A successful single
 future window would establish only that window under its recorded workload,
 not a guarantee for other networks or times.
+
+## Further direct-path retries and route observations
+
+All of these are incomplete mock-only trials with two physical camera feeds,
+not successful 1,800-second windows. The timestamps are relative to each
+trial's recorded formal measurement start. The 20 fps trial retained the same
+configured minimum-frame-rate and control safety gates; its temporal image
+quality was not evaluated.
+
+| Trial | Configuration | Result |
+| --- | --- | --- |
+| long-16 | 1,500 kb/s per stream, 30 fps | Three vehicle braking-wait entries at 271.848, 273.537 and 277.648 s. |
+| long-17 | 1,500 kb/s per stream, 20 fps | Two entries at 11.031 and 11.642 s; later the viewer telemetry sequence stopped advancing while vehicle publication continued. Vehicle shutdown exceeded the test runner's 8 s graceful wait and the runner terminated its own process. |
+| long-18 | 1,500 kb/s per stream, 30 fps | One entry at 1,579.582 s; three late commands were rejected. |
+| long-20 | 1,500 kb/s per stream, 30 fps | Three entries at 779.211, 779.782 and 784.866 s. |
+| long-21 | 1,500 kb/s per stream, 30 fps | Two entries at 303.664 and 309.022 s. |
+| long-22 | 1,500 kb/s per stream, 30 fps | Incomplete: Windows default IPv6 source selection changed; the test's strict source preflight aborted. No vehicle braking entry was logged in its measured portion. |
+| long-23 | New Windows temporary IPv6 address | Direct ICE and video did not become ready within the 120 s startup deadline; no formal window started. |
+| long-24 | Original still-preferred Windows address, 30 fps | Direct ICE re-established; two braking entries at 243.450 and 248.801 s. |
+| long-25 | Same endpoint, 30 fps | Incomplete: the native window lost foreground focus and input authorization was revoked. No vehicle braking entry was logged in its measured portion. |
+
+The newer diagnostic build adds only mock-scoped, payload-free feedback-path,
+telemetry receive/consume counts and send-buffer metadata. In long-21, 11,233
+DTLS records matched; the capture began after the measurement started, so the
+537 unmatched sends include records from before capture and cannot be counted
+as packet loss. The largest matched sender-to-kernel delta was about 312 ms
+above the median cross-clock offset. In long-24, capture covered the whole
+window: 8,738 records matched and nine did not; their cause is unknown. Its
+largest matched delta was about 278 ms above that median. Neither comparison
+identifies the particular wireless, cellular or intermediate segment.
+
+The Windows test guard was refined after long-22 to check that the exact ICE
+local address is still Preferred on WLAN and that the route to the specified
+peer still uses WLAN. It no longer rejects a live bound source merely because
+Windows selects a different default IPv6 source for new sockets. Exact
+selected-pair addresses remain checked by the native client, and the Orin
+capture filters the expected endpoints on the cellular interface. This is a
+test-harness correction; it does not establish automatic ICE recovery after an
+actual address or interface loss.
