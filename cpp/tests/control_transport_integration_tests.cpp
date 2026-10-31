@@ -643,23 +643,28 @@ void product_startup_and_p2p_cloud_recovery() {
   fixture.dc_network_path = "p2p";
   const auto direct_epoch = until("dc", cloud_epoch, true);
   const auto retired = fixture.last_received_payload;
-  // The page continues refreshing an old held motion request across both
-  // switches. Native must keep it neutral until a real release/repress.
+  // A held request crosses the route withdrawal. Native must keep it neutral
+  // until a real release/repress, including the later return to P2P.
   fixture.input(); // Release the completed initial route boundary before pressing motion.
   fixture.requested_throttle = 0.4; fixture.input();
   fixture.dc_network_path = "unknown";
+  // Keep the held request across the route change, but release it as soon as
+  // the sender withdraws DC. Waiting for the whole WSS round trip while this
+  // fixture maps a held throttle to D can prevent the vehicle from accepting
+  // neutral in its previous gear; the real 800 ms watchdog then correctly
+  // clears the profile before a slow CI runner finishes the switch.
+  const auto withdraw_deadline = steady() + 600;
+  while (steady() < withdraw_deadline && state().at("path") == "dc") fixture.pump(true);
+  expect(state().at("path") == "wss" &&
+      fixture.driver->status().at("native_control").at("requires_fresh_input") == true &&
+      fixture.driver->status().at("native_control").at("effective_throttle") == 0.0,
+      "held pre-switch motion was not withdrawn when selecting cloud fallback");
+  fixture.requested_throttle = 0.0; fixture.input();
   const auto fallback_epoch = until("wss", direct_epoch, true);
   expect(fixture.fence.path() == ControlPath::Wss && fixture.apply(retired, ControlPath::DataChannel).at("transport_admitted") == false,
       "retired direct command re-entered after fallback");
-  fixture.input();
-  expect(fixture.driver->status().at("native_control").at("requires_fresh_input") == true &&
-      fixture.driver->status().at("native_control").at("effective_throttle") == 0.0 &&
-      fixture.last_received_payload.at("throttle") == 0.0,
-      "held pre-switch motion rearmed after cloud fallback");
-  // Release inside the existing 800ms vehicle watchdog. Keeping a rejected
-  // nonzero request through the entire 5s retry delay must hard-stop, not renew
-  // the input lease or install a new profile.
-  fixture.requested_throttle = 0.0; fixture.input();
+  expect(fixture.last_received_payload.at("throttle") == 0.0,
+      "cloud fallback sent nonzero motion before a fresh press");
   fixture.dc_network_path = "p2p";
   const auto recovered_epoch = until("dc", fallback_epoch, true);
   expect(recovered_epoch > fallback_epoch, "recovered P2P reused an old route epoch");
