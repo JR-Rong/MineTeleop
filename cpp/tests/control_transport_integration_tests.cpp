@@ -998,7 +998,10 @@ void actual_native_short_cloud_outage_and_independent_vehicle_expiry() {
     remaining = authority.value("remaining_ms", std::int64_t{0});
     if (authority.value("continuation_available", false) && remaining > 400) break;
   }
-  expect(remaining > 400, "fixture did not observe a fresh vehicle-accepted grant before outage");
+  const auto pre_cut = fixture.driver->status().at("native_control").at("control_transport");
+  expect(remaining > 400 && pre_cut.value("path", "") == "dc" &&
+      pre_cut.at("direct_authority").value("continuation_available", false),
+      "fixture did not retain a healthy direct path and fresh grant before outage: " + pre_cut.dump());
   const auto before = fixture.dc_commands;
   // Cloud shutdown must not pause the independently healthy driver/DC pump.
   // server.stop() closes real sockets but may join workers for longer than the
@@ -1039,6 +1042,7 @@ void actual_native_short_cloud_outage_and_independent_vehicle_expiry() {
       {"grant_remaining_at_cut_ms", grant_at_cut}, {"observation_budget_ms", observation_budget},
       {"cut_wait_ms", cut_observed_at - outage_started}, {"cloud_socket_closed", cloud_socket_closed},
       {"observation_elapsed_ms", observed_at - cut_observed_at}, {"shutdown_join_elapsed_ms", steady() - outage_started},
+      {"pre_cut_transport", pre_cut}, {"cut_transport", at_cut.at("control_transport")},
       {"accepted_seq_at_cut", accepted_at_cut}, {"accepted_seq_after_cut", result_progress.value("last_accepted_command_seq", std::uint64_t{0})},
       {"dc_commands_before", before}, {"dc_commands_at_cut", before_observation}, {"dc_commands_during", fixture.dc_commands}, {"transport", during}}.dump() << '\n';
   expect(cloud_socket_closed && observed_at <= outage_deadline && fixture.dc_commands > before_observation &&
