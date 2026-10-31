@@ -137,6 +137,8 @@ quality was not evaluated.
 | long-24 | Original still-preferred Windows address, 30 fps | Direct ICE re-established; two braking entries at 243.450 and 248.801 s. |
 | long-25 | Same endpoint, 30 fps | Incomplete: the native window lost foreground focus and input authorization was revoked. No vehicle braking entry was logged in its measured portion. |
 | long-26 | Same endpoint, 30 fps | Three braking entries at 1,620.463, 1,621.069 and 1,626.093 s; five periodic nonzero mock inputs were accepted before the failure. |
+| long-27 | Same endpoint, 30 fps | Three braking entries near four minutes; 9,030 of 9,061 DTLS records matched and the largest matched sender-to-kernel delta was approximately 278 ms above the median. |
+| long-28 | Same endpoint, 30 fps, with separate cloud STUN probes | Three braking entries. Around the first, the Windows-to-cloud IPv4 STUN samples ranged from 15.19 to 357.89 ms, while Orin-to-cloud samples ranged from 18.19 to 33.41 ms. These probes do not establish the delay of the IPv6 control path or identify its responsible segment. |
 
 The newer diagnostic build adds only mock-scoped, payload-free feedback-path,
 telemetry receive/consume counts and send-buffer metadata. In long-21, 11,233
@@ -160,3 +162,38 @@ selected-pair addresses remain checked by the native client, and the Orin
 capture filters the expected endpoints on the cellular interface. This is a
 test-harness correction; it does not establish automatic ICE recovery after an
 actual address or interface loss.
+
+## One completed 30-minute native direct mock window
+
+Long-29 ran for 1,800.460 seconds from 2026-10-31 16:16:33 UTC. Windows used
+Wi-Fi and Orin used its independently routed 5G interface; the selected ICE
+pair was checked against the configured IPv6 endpoints. All 1,790 viewer
+samples reported direct UDP and the DataChannel control path, and all 35,249
+recorded command sends used that path. The vehicle recorded 35,248 DataChannel
+commands and no rejection reasons within the window. No vehicle braking-wait
+entry occurred in the window; a startup braking and recovery happened before
+the window and are retained in the raw evidence. The control guard reported
+no not-ready or unauthorized interval and no dropped guard batches.
+
+Five periodic mock throttle exercises produced 119 nonzero commands, all 119
+matched to vehicle acceptance. There were no steering exercises. The viewer's
+35,206 DataChannel result RTT samples were p50 39 ms, p95 50 ms, p99 54 ms,
+and max 96 ms. These are application result round trips, not physical
+camera-to-display latency or a guarantee about unacknowledged commands. Clock
+uncertainty reached at most 16 ms in sampled viewer metrics; the existing
+25 ms gate and other safety thresholds were unchanged. CAN was DOWN after
+the run, the adapter was mock, and configured speed was zero.
+
+The Orin capture matched all 59,915 Windows outgoing encrypted DTLS records
+in the formal window, with zero packet-socket drops or missing kernel
+timestamps. This confirms those encrypted records reached the selected Orin
+interface, not that each record was a distinct accepted control command.
+Three concurrent low-rate diagnostic probes added load: Windows and Orin
+each probed the cloud STUN endpoint over IPv4, and Windows probed its local
+Wi-Fi gateway; neither carried the test's control or video. The test used the
+experimental mock-only compact control and telemetry formats, including reduced
+non-safety telemetry fields between full updates. It does not establish
+production telemetry equivalence, real-vehicle acceptance, automatic recovery
+after a network change, or stability under other workloads. The earlier failed
+windows remain material evidence that this link can exceed the unchanged
+safety budget even though this particular window passed.
