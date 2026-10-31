@@ -36,8 +36,12 @@ struct DriverConsoleTransportTestAccess {
     else if (cause == 1) runtime.control_dc_ack_recovery_.enter(now, 5000, runtime.control_dc_last_ack_seq_);
     else if (cause == 2) runtime.control_transport_dc_ready_ = false;
     else {
-      runtime.control_signaling_ack_window_.reset();
-      runtime.control_signaling_ack_window_.note_sent(runtime.native_control_last_seq_.load() + 1, now - 501);
+      // Do not discard genuine WSS acknowledgements still in flight. The
+      // sender drains them before inspecting the injected stall, and resetting
+      // the window here would make a valid ACK look like a protocol error.
+      // Preserve its ACK history so duplicate packets remain duplicates.
+      if (runtime.control_signaling_ack_window_.pending_count() != 0) return nullptr;
+      runtime.control_signaling_ack_window_.note_sent(frame.at("seq").get<std::uint64_t>(), now - 501);
     }
     return {{"frame", frame}, {"published_at", runtime.control_transport_latest_dc_at_ms_}, {"injected_at", now}};
   }
