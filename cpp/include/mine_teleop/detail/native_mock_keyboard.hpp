@@ -2,7 +2,9 @@
 
 #include <cstdint>
 #include <chrono>
+#include <cmath>
 #include <mutex>
+#include <stdexcept>
 
 namespace mine_teleop::detail {
 
@@ -19,8 +21,25 @@ inline bool native_mock_clock_fresh(std::int64_t observed_ms, std::int64_t now_m
 // used by the isolated, zero-speed mock viewer; it cannot authorize motion.
 class NativeMockKeyboard {
  public:
-  struct Keys { bool forward{}, left{}, right{}, brake{}; };
+  struct Keys { bool forward{}, left{}, right{}, brake{}, hard_brake{}; };
   struct Input { double throttle{}, steering{}, brake{}; };
+
+  // Match the confirmed vehicle profile rather than assuming a fixed pressure.
+  // A changed profile invalidates held input until the operator releases it.
+  void set_brake_profile(double service, double hard, double maximum) {
+    if (!std::isfinite(service) || !std::isfinite(hard) || !std::isfinite(maximum) ||
+        service < 0 || hard < service || maximum < hard)
+      throw std::invalid_argument("invalid confirmed brake profile");
+    const double service_ratio = maximum > 0 ? service / maximum : 0;
+    const double hard_ratio = maximum > 0 ? hard / maximum : 0;
+    std::lock_guard lock(mutex_);
+    if (!profile_ready_ || service_ratio != service_brake_ || hard_ratio != hard_brake_) {
+      service_brake_ = service_ratio;
+      hard_brake_ = hard_ratio;
+      profile_ready_ = true;
+      needs_release_ = true;
+    }
+  }
 
   void observe(bool focused, Keys keys, std::int64_t now_ms) {
     std::lock_guard lock(mutex_);
@@ -72,25 +91,27 @@ class NativeMockKeyboard {
   }
 
   Input sample_locked(bool safety_ready, std::int64_t now_ms) {
-    if (!safety_ready || !focused_ || observed_at_ms_ <= 0 || now_ms < observed_at_ms_ ||
+    if (!safety_ready || !profile_ready_ || !focused_ || observed_at_ms_ <= 0 || now_ms < observed_at_ms_ ||
         now_ms - observed_at_ms_ >= 150) {
       needs_release_ = true;
       return {};
     }
-    const bool any = keys_.forward || keys_.left || keys_.right || keys_.brake;
+    const bool any = keys_.forward || keys_.left || keys_.right || keys_.brake || keys_.hard_brake;
     if (needs_release_) {
       if (!any) needs_release_ = false;
       return {};
     }
     // Braking wins over forward input. Opposing steering keys cancel out.
-    return {keys_.forward && !keys_.brake ? 0.25 : 0.0,
+    return {keys_.forward && !keys_.brake && !keys_.hard_brake ? 0.25 : 0.0,
             keys_.left == keys_.right ? 0.0 : (keys_.left ? -0.25 : 0.25),
-            keys_.brake ? 0.3 : 0.0};
+            keys_.hard_brake ? hard_brake_ : (keys_.brake ? service_brake_ : 0.0)};
   }
   std::mutex mutex_;
   Keys keys_{};
   std::int64_t observed_at_ms_{};
   bool focused_{false};
   bool needs_release_{true};
+  bool profile_ready_{false};
+  double service_brake_{0}, hard_brake_{0};
 };
 }  // namespace mine_teleop::detail

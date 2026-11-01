@@ -398,6 +398,9 @@ struct DriverConfig {
   bool defer_control_bootstrap{false};
   // In-process isolated zero-speed mock experiment; never loaded from YAML.
   bool mock_idle_direct_reprobe{false};
+  // In-process opt-in only. The peer must separately advertise the mock-only
+  // capability; normal YAML and non-bench identities cannot enable it.
+  bool mock_dual_control{false};
   std::filesystem::path browser_event_log_path;
   std::uint64_t browser_event_log_max_bytes{2 * 1024 * 1024};
   int browser_event_log_files{3};
@@ -621,10 +624,15 @@ class DriverConsoleRuntime {
   bool control_signaling_capabilities_verified_{false};
   std::uint64_t control_signaling_last_ack_seq_{0};
   detail::NativeControlAcknowledgementWindow control_signaling_ack_window_;
+  detail::NativeMirrorIngressAcks control_mirror_ingress_acks_;
+  std::int64_t mock_dual_last_sent_ms_{-1}; // transport mutex; local enqueue only
+  std::string mock_dual_last_vehicle_path_; // signed vehicle result, transport mutex
+  std::uint64_t mock_dual_last_vehicle_seq_{0};
   detail::VehicleResultLatencyWindow control_vehicle_result_latency_;
   detail::ControlTransportSender control_transport_sender_;
   bool control_transport_cloud_capable_{false};
   bool control_transport_vehicle_capable_{false}; // mutex_
+  bool mock_dual_control_vehicle_capable_{false}; // mutex_
   bool emergency_stop_vehicle_capable_{false}; // mutex_
   bool feedback_transport_vehicle_capable_{false}; // mutex_
   detail::FeedbackTransportSender feedback_transport_sender_; // existing transport mutex

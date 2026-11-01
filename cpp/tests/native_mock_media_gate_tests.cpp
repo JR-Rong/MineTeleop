@@ -4,6 +4,7 @@
 #include "mine_teleop/detail/native_mock_keyboard.hpp"
 #include "mine_teleop/detail/dtls_record_trace.hpp"
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 using mine_teleop::detail::NativeMockMediaGate;
 using Json = nlohmann::json;
@@ -94,6 +95,10 @@ void test_mock_keyboard_rearms_only_after_release() {
   using Keys = mine_teleop::detail::NativeMockKeyboard::Keys;
   keyboard.observe(true, Keys{}, 100);
   require(keyboard.heartbeat_alive(101), "foreground UI heartbeat not recorded");
+  keyboard.observe(true, Keys{true, false, false, true}, 100);
+  require(keyboard.sample(true, 101).brake == 0.0, "unconfirmed profile enabled input");
+  keyboard.set_brake_profile(30, 80, 100);
+  keyboard.observe(true, Keys{}, 100);
   require(keyboard.sample(true, 101).throttle == 0.0, "initial neutral did not arm");
   keyboard.observe(true, Keys{true, true, false, false}, 110);
   auto input = keyboard.sample(true, 111);
@@ -107,10 +112,27 @@ void test_mock_keyboard_rearms_only_after_release() {
   input = keyboard.sample(true, 131);
   require(input.throttle == 0.0 && input.steering == 0.0 && input.brake == .3,
           "brake priority or opposing steering handling failed");
-  require(keyboard.sample(true, 280).brake == 0.0, "stale UI heartbeat retained input");
-  require(!keyboard.heartbeat_alive(280), "stale UI heartbeat retained lease eligibility");
-  keyboard.observe(true, Keys{true, false, false, false}, 281);
-  require(keyboard.sample(true, 282).throttle == 0.0, "stale heartbeat resumed a held key");
+  keyboard.observe(true, Keys{true, false, false, true, true}, 132);
+  input = keyboard.sample(true, 133);
+  require(input.throttle == 0.0 && input.brake == .8, "hard brake did not override service brake and throttle");
+  keyboard.set_brake_profile(30, 80, 100);
+  require(keyboard.sample(true, 134).brake == .8, "identical profile unexpectedly invalidated held input");
+  keyboard.set_brake_profile(20, 60, 100);
+  require(keyboard.sample(true, 135).brake == 0.0, "changed profile retained held input");
+  keyboard.observe(true, Keys{}, 136); static_cast<void>(keyboard.sample(true, 137));
+  keyboard.observe(true, Keys{false, false, false, false, true}, 138);
+  require(keyboard.sample(true, 139).brake == .6, "fresh hard brake did not use confirmed pressure");
+  bool invalid_rejected = false;
+  try { keyboard.set_brake_profile(90, 80, 100); } catch (const std::invalid_argument&) { invalid_rejected = true; }
+  require(invalid_rejected, "invalid brake ordering was accepted");
+  invalid_rejected = false;
+  try { keyboard.set_brake_profile(std::numeric_limits<double>::quiet_NaN(), 80, 100); }
+  catch (const std::invalid_argument&) { invalid_rejected = true; }
+  require(invalid_rejected, "nonfinite brake pressure was accepted");
+  require(keyboard.sample(true, 288).brake == 0.0, "stale UI heartbeat retained input");
+  require(!keyboard.heartbeat_alive(288), "stale UI heartbeat retained lease eligibility");
+  keyboard.observe(true, Keys{true, false, false, false}, 289);
+  require(keyboard.sample(true, 289).throttle == 0.0, "stale heartbeat resumed a held key");
   keyboard.withdraw();
   keyboard.observe(true, Keys{true, false, false, false}, 290);
   require(keyboard.sample(true, 291).throttle == 0.0, "focus recovery resumed a held key");
@@ -124,6 +146,7 @@ void test_live_clock_keyboard_and_media_guard() {
       Clock::now().time_since_epoch()).count(); };
   mine_teleop::detail::NativeMockKeyboard keyboard;
   using Keys = mine_teleop::detail::NativeMockKeyboard::Keys;
+  keyboard.set_brake_profile(30, 80, 100);
   keyboard.observe(true, Keys{}, now());
   require(keyboard.heartbeat_alive_now(), "live keyboard heartbeat missing");
   static_cast<void>(keyboard.sample_now(true));

@@ -12,9 +12,13 @@
 
 namespace mine_teleop::detail {
 inline constexpr std::string_view kMockCompactControl = "mock-compact-control-cbor-v1";
+inline bool isolated_mock_control_allowed(bool explicitly_enabled, std::string_view vehicle,
+                                          std::string_view adapter, double max_speed_kph) {
+  return explicitly_enabled && vehicle.starts_with("test_bench_") && adapter == "mock" && max_speed_kph == 0.0;
+}
 inline bool mock_compact_control_allowed(bool explicitly_enabled, std::string_view vehicle,
                                          std::string_view adapter, double max_speed_kph) {
-  return explicitly_enabled && vehicle.starts_with("test_bench_") && adapter == "mock" && max_speed_kph == 0.0;
+  return isolated_mock_control_allowed(explicitly_enabled, vehicle, adapter, max_speed_kph);
 }
 struct MockCompactScope {
   std::string vehicle, driver, session, token, attempt;

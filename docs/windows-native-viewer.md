@@ -18,12 +18,27 @@ process, mock adapter, zero-speed configuration, CAN-down state and cellular
 route before starting. The profile retains neutral gear, zero speed, zero motor
 torque and zero steering limit; this mode is not a motion-control interface.
 Focus the main viewer or click a video panel. W/up requests mock throttle,
-A/left and D/right request mock steering, and S/down/space requests mock brake.
+A/left and D/right request mock steering, S/down/space requests service brake,
+and B requests hard brake. Brake ratios come from the acknowledged session
+profile; hard brake takes precedence. E or the mock emergency button latches
+an emergency request. The display distinguishes a request from fresh vehicle
+telemetry confirming the software latch; it does not prove physical execution.
 Braking wins over throttle. Input is neutralized when focus, the UI heartbeat,
 critical video, clock, direct media path, acknowledged profile, fresh mock
 telemetry or control readiness is lost. Held keys must be released before a
 new press can take effect after a loss. There is no production emergency-stop
 input or authorization in this prototype.
+
+An additional dual-control experiment requires the vehicle process to set
+`MINE_TELEOP_MOCK_DUAL_CONTROL=1`; the vehicle advertises it only for a
+`test_bench_` identity, mock adapter and zero speed. The mock native viewer
+then sends the same authenticated, sequenced command via its DC and the cloud
+WSS path. The receiver admits the first fresh copy and rejects duplicates and
+older commands without reapplying them or refreshing safety; an ingress ACK is
+not vehicle receipt. A selected direct media path and all existing authority,
+video, input and clock gates remain required. The paths may share the same
+Wi-Fi and cellular links and cannot guarantee independence or bounded delay.
+This is an isolated experiment, not a production transport or safety claim.
 
 With `logging.control_trace_commands` enabled, mock mode batches a bounded
 record of command sequence, local DataChannel enqueue start/end and outcome.
@@ -91,26 +106,23 @@ evidence and are not established by that test.
 ## Control work still required
 
 The experimental scoped DataChannel courier and its bounded receive mailbox
-are available as an explicit receiver option, but are not enabled in this
-window or connected to the production transport bridge. They reject a
+are connected to the isolated mock mode. They reject a
 mismatched negotiation, unsuitable channel properties,
 late messages after retirement, duplicate control channels, oversized input
 and queue overflow. GStreamer without the early channel callback is rejected;
-local send success means queued, not vehicle receipt. The loopback test does
-not establish path identity, command authentication, video freshness, or any
-vehicle-control behavior. Receive-only mode remains enforced in the window.
+local send success means queued, not vehicle receipt. Receive-only mode remains
+enforced outside the explicitly scoped mock mode.
 The native publication filter rejects expired, replayed, wrongly scoped or
-byte-mismatched bridge frames before a one-time send attempt. It is an
-experimental component, not yet connected to the runtime or window; the
-caller must serialize sends with session and owner retirement.
+byte-mismatched bridge frames before a one-time send attempt. The caller
+serializes sends with session and owner retirement.
 An isolated integration fixture exercises that filter with the real control
 bridge, signed commands and a mock vehicle service; it simulates the DC byte
 path and does not prove WebRTC delivery or physical vehicle behavior.
 With GStreamer 1.28 or later the experimental channel can inspect the selected
 ICE pair of the SCTP transport itself and classify a connected non-relay UDP
-pair. Older versions and missing or ambiguous state return false. The result
-is a snapshot, not proof of peer identity or a WAN route, and is not yet used
-to authorize control or to claim a relay protocol.
+pair. Older versions and missing or ambiguous state return false. Mock mode
+also checks the expected addresses; the snapshot alone is not WAN proof or
+evidence of a TURN leg's protocol.
 
 The isolated mock mode is wired to `update_control_intent` with session and
 input-ownership fences, an input lease, focus handling, profile acknowledgement,

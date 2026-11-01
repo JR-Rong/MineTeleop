@@ -10,6 +10,7 @@
 namespace mine_teleop::detail {
 
 inline constexpr std::string_view kControlTransportCapability = "native-control-transport-v1";
+inline constexpr std::string_view kMockDualControlCapability = "mock-dual-control-v1";
 std::string control_transport_mac(std::string_view value, std::string_view key);
 inline std::string transport_message_mac(const Json& value, std::string_view key, bool vehicle_result) {
   auto unsigned_value = value;
@@ -172,7 +173,8 @@ class ControlTransportFence {
   }
   Decision admit(const ControlCommand& command, const Json* stamp_json, ControlPath received_path,
       std::string_view current_media_attempt, std::int64_t now_utc_ms, std::int64_t lease_expires_at_ms,
-      int max_command_gap_ms, bool cloud_authority_live, bool verified_stop_only = false) {
+      int max_command_gap_ms, bool cloud_authority_live, bool verified_stop_only = false,
+      bool allow_wss_mirror_of_dc = false) {
     if (session_.empty() || command.vehicle_id != vehicle_ || command.driver_id != driver_ ||
         command.session_id != session_ || command.control_token != token_)
       return {false, false, "transport_authority_mismatch"};
@@ -195,7 +197,14 @@ class ControlTransportFence {
       last_seq_ = command.seq; return {true, false, "legacy_wss"};
     }
     const auto stamp = ControlTransportStamp::from_json(*stamp_json);
-    if (stamp.path != received_path || (stamp.path == ControlPath::DataChannel && stamp.media_attempt != current_media_attempt))
+    // An explicitly negotiated duplicate may carry the exact DC-stamped,
+    // authenticated command over WSS. The logical owner and epoch remain DC;
+    // the global sequence below admits at most one copy. This flag is false
+    // for existing sessions and never bypasses lease, expiry or attempt checks.
+    const bool mirrored = allow_wss_mirror_of_dc && received_path == ControlPath::Wss &&
+        stamp.path == ControlPath::DataChannel;
+    if ((!mirrored && stamp.path != received_path) ||
+        (stamp.path == ControlPath::DataChannel && stamp.media_attempt != current_media_attempt))
       return {false, false, "transport_path_or_attempt_mismatch"};
     bool changed = false;
     if (stamp.select) {

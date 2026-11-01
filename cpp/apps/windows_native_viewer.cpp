@@ -130,7 +130,7 @@ struct RenderSession {
 struct Window {
   HWND hwnd{}, driver_config{}, vehicle_config{}, password{}, status{}, start{}, stop{};
   std::array<HWND, 3> config_labels{};
-  HWND help{};
+  HWND help{}, mock_info{}, mock_estop_button{};
   HFONT font{}, title_font{}, small_font{};
   HBRUSH background{}, surface{}, input_background{};
   std::array<HWND, 2> video{};
@@ -138,9 +138,12 @@ struct Window {
   std::mutex render_mutex;
   std::shared_ptr<RenderSession> render_session;
   std::wstring message{L"仅观看台架：控制禁用。车端隔离须独立核验。"};
+  std::wstring mock_message{L"控制：等待连接\n画面：等待\n校时：等待"};
   std::jthread worker;
   std::atomic<bool> running{false};
   std::atomic<std::int64_t> last_observation_ms{0};
+  std::atomic<std::int64_t> last_mock_observation_ms{0};
+  std::atomic<bool> mock_estop_requested{false};
   detail::NativeMockKeyboard keyboard;
   bool mock_control{false};
   std::string mock_local_ip, mock_peer_ip, mock_ip_family;
@@ -156,6 +159,18 @@ struct Window {
     { std::lock_guard lock(mutex); message = std::move(value); }
     last_observation_ms = static_cast<std::int64_t>(bench_now_ms());
     PostMessageW(hwnd, WM_APP + 1, 0, 0);
+  }
+
+  void report_mock(std::wstring value) {
+    { std::lock_guard lock(mutex); mock_message = std::move(value); }
+    last_mock_observation_ms = static_cast<std::int64_t>(bench_now_ms());
+    PostMessageW(hwnd, WM_APP + 2, 0, 0);
+  }
+
+  void request_mock_estop() {
+    if (!mock_control || !running.load() || mock_estop_requested.exchange(true)) return;
+    keyboard.withdraw();
+    report(L"已请求 mock 急停，等待车端确认。");
   }
 
   // Isolated bench mode is constrained to a mock adapter and zero speed. It
@@ -279,14 +294,15 @@ struct Window {
               previous_guard = state;
             }
           }
-          const auto keyboard_input = keyboard.sample_now(ready && authorized);
+          const auto keyboard_input = keyboard.sample_now(ready && authorized && !mock_estop_requested.load());
           const auto current_epoch = epoch.load();
-          if ((ready || current_epoch != 0) && (ui_alive || !withdrawn)) {
+          const bool estop = mock_estop_requested.load();
+          if (estop || ((ready || current_epoch != 0) && (ui_alive || !withdrawn))) {
             Json input{{"session_id", session_id}, {"session_generation", generation},
-                {"ui_instance_id", owner}, {"ui_control_epoch", current_epoch}, {"takeover", current_epoch == 0},
+                {"ui_instance_id", owner}, {"ui_control_epoch", current_epoch}, {"takeover", !estop && current_epoch == 0},
                 {"gear", "N"}, {"steering", keyboard_input.steering},
                 {"throttle", keyboard_input.throttle}, {"brake", keyboard_input.brake},
-                {"estop", false}, {"critical_video_ready", ready},
+                {"estop", estop}, {"critical_video_ready", ready},
                 {"critical_video_sample_healthy", ready && video_health.sample_healthy},
                 {"critical_video_bad_sample_revision", video_health.bad_revision},
                 {"critical_video_brake_revision", video_health.brake_revision}};
@@ -324,6 +340,8 @@ struct Window {
         if (!profile_status.contains("effective_profile") || !profile_status.at("effective_profile").is_object() ||
             !requested_profile || SessionControlProfile::from_json(profile_status.at("effective_profile")) != *requested_profile)
           throw std::runtime_error("mock control profile changed");
+        keyboard.set_brake_profile(requested_profile->service_brake_pressure_bar,
+            requested_profile->hard_brake_pressure_bar, requested_profile->max_brake_pressure_bar);
         profile_accepted = true;
       }
       if (value.value("event", "") == "vehicle_telemetry") {
@@ -436,7 +454,7 @@ struct Window {
       // The courier may have delivered newer telemetry after the loop's
       // initial timestamp. Compare against a clock read taken after delivery.
       const auto authorization_observed_ms = static_cast<std::int64_t>(bench_now_ms());
-      const bool authorized = ready && profile_accepted && handshake_sent &&
+      const bool authorized = !mock_estop_requested.load() && ready && profile_accepted && handshake_sent &&
           detail::native_mock_input_fresh(telemetry_at_ms, authorization_observed_ms) && telemetry.is_object() &&
           telemetry.value("safety_state", "") == "CONTROL_ACTIVE" &&
           !telemetry.value("braking_wait", true) && telemetry.value("gear", "") == "N" &&
@@ -465,6 +483,19 @@ struct Window {
         const auto transport = native.at("control_transport");
         const auto feedback = transport.value("feedback_transport", Json::object());
         const auto sends = channel->send_stats();
+        const auto path = transport.value("path", "unknown");
+        const bool selecting = transport.value("selecting", true);
+        const auto control_path = selecting ? L"切换中" : transport.value("mock_dual_control", false) ? L"双路已发送" :
+            path == "dc" ? L"DataChannel" :
+            path == "wss" ? L"WSS 回退" : L"未知";
+        const auto time_uncertainty = sync.value("uncertainty_ms", -1);
+        const bool estop_confirmed = mock_estop_requested.load() &&
+            detail::native_mock_input_fresh(telemetry_at_ms, authorization_observed_ms) &&
+            telemetry.is_object() && telemetry.value("safety_state", "") == "ESTOP";
+        report_mock(std::wstring(L"控制：") + control_path + (authorized ? L" · 输入就绪" : L" · 输入禁止") +
+            L"\n画面：" + (video_health.ready && gate->ready_now() ? L"关键画面就绪" : L"未就绪") +
+            L"\n校时：" + (clock_ok ? std::wstring(L"±") + std::to_wstring(time_uncertainty) + L" ms" : L"不可用") +
+            (mock_estop_requested.load() ? (estop_confirmed ? L"\n车端：急停锁存" : L"\n急停：等待车端确认") : L""));
         const Json evidence{{"event", "native_mock_observation"}, {"monotonic_ms", now_ms},
             {"video_ready", video_health.ready}, {"remote_media_ready", gate->ready(now_ms)},
             {"remote_media_reason", gate->reason(now_ms)},
@@ -498,6 +529,7 @@ struct Window {
           last_result_seq = seq;
           const Json result{{"event", "native_mock_vehicle_result"}, {"monotonic_ms", now_ms},
               {"command_seq", seq}, {"command_path", latency.value("command_path", Json(nullptr))},
+              {"vehicle_received_path", latency.value("vehicle_received_path", Json(nullptr))},
               {"round_trip_ms", latency.value("round_trip_ms", Json(nullptr))},
               {"accepted", latency.value("accepted", Json(nullptr))}};
           std::fprintf(stderr, "%s\n", result.dump().c_str());
@@ -546,6 +578,7 @@ struct Window {
       config.receive_only = !mock_control;
       config.defer_control_bootstrap = mock_control;
       config.mock_idle_direct_reprobe = mock_control;
+      config.mock_dual_control = mock_control;
       config.max_time_sync_uncertainty_ms = vehicle.field_safety.max_time_sync_uncertainty_ms;
       config.time_sync_interval_ms = vehicle.field_safety.time_sync_interval_ms;
       config.time_sync_samples = vehicle.field_safety.time_sync_samples;
@@ -719,6 +752,7 @@ struct Window {
           L"连接或视频失败。请检查配置、台架隔离、信令和 GStreamer 依赖。");
     }
     { std::lock_guard lock(render_mutex); render_session.reset(); }
+    if (mock_control) report_mock(L"控制：已断开\n画面：未就绪\n校时：未就绪");
     for (const auto handle : video) InvalidateRect(handle, nullptr, TRUE);
     running = false;
     PostMessageW(hwnd, WM_APP + 1, 0, 0);
@@ -749,6 +783,8 @@ void layout(Window& app, int width, int height) {
   MoveWindow(app.start, left, 414, (field_width - gap) / 2, 34, TRUE);
   MoveWindow(app.stop, left + (field_width + gap) / 2, 414, (field_width - gap) / 2, 34, TRUE);
   MoveWindow(app.help, left, 477, field_width, 70, TRUE);
+  if (app.mock_estop_button) MoveWindow(app.mock_estop_button, left, 548, field_width, 32, TRUE);
+  if (app.mock_info) MoveWindow(app.mock_info, left, 590, field_width, 80, TRUE);
 }
 
 void fill(HDC dc, int left, int top, int right, int bottom, HBRUSH brush) {
@@ -810,9 +846,12 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       app->start = control(hwnd, L"BUTTON", L"连接视频", BS_OWNERDRAW, 0, 0, 1, 1, 1);
       app->stop = control(hwnd, L"BUTTON", L"断开", BS_OWNERDRAW, 0, 0, 1, 1, 2);
       app->help = control(hwnd, L"STATIC", app->mock_control ?
-          L"仅限隔离 mock 台架，零车速\nW / ↑ 油门    A / D 转向\nS / 空格 制动" :
+          L"仅限隔离 mock 台架，零车速\nW / ↑ 油门    A / D 转向\nS / 空格 缓刹    B 急刹\nE 急停" :
           L"仅观看台架画面\n控制功能保持禁用", 0, 0, 0, 1, 1);
+      if (app->mock_control) app->mock_info = control(hwnd, L"STATIC", app->mock_message.c_str(), 0, 0, 0, 1, 1);
+      if (app->mock_control) app->mock_estop_button = control(hwnd, L"BUTTON", L"请求急停", BS_OWNERDRAW, 0, 0, 1, 1, 3);
       EnableWindow(app->stop, FALSE);
+      if (app->mock_estop_button) EnableWindow(app->mock_estop_button, FALSE);
       if (app->mock_control) app->message = L"隔离 mock 控制台：等待连接和安全条件。";
       app->status = control(hwnd, L"STATIC", app->message.c_str(), 0, 0, 0, 1, 1);
       app->video[0] = control(hwnd, L"MineTeleopNativePanel", L"", 0, 0, 0, 1, 1, 10);
@@ -831,7 +870,7 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     }
     case WM_GETMINMAXINFO: {
       auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
-      info->ptMinTrackSize = POINT{900, 640};
+      info->ptMinTrackSize = POINT{900, 720};
       return 0;
     }
     case WM_ERASEBKGND: return 1;
@@ -866,9 +905,10 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     }
     case WM_DRAWITEM: {
       const auto* item = reinterpret_cast<DRAWITEMSTRUCT*>(lparam);
-      if (item->CtlID != 1 && item->CtlID != 2) return DefWindowProcW(hwnd, msg, wparam, lparam);
+      if (item->CtlID != 1 && item->CtlID != 2 && item->CtlID != 3) return DefWindowProcW(hwnd, msg, wparam, lparam);
       const bool enabled = !(item->itemState & ODS_DISABLED);
-      const COLORREF color = !enabled ? RGB(38, 54, 77) : item->CtlID == 1 ? RGB(14, 116, 144) : RGB(30, 47, 68);
+      const COLORREF color = !enabled ? RGB(38, 54, 77) : item->CtlID == 1 ? RGB(14, 116, 144) :
+          item->CtlID == 3 ? RGB(150, 42, 55) : RGB(30, 47, 68);
       const auto brush = CreateSolidBrush(color); FillRect(item->hDC, &item->rcItem, brush); DeleteObject(brush);
       wchar_t caption[32]{}; GetWindowTextW(item->hwndItem, caption, 32);
       SetBkMode(item->hDC, TRANSPARENT); SetTextColor(item->hDC, enabled ? RGB(231, 237, 246) : RGB(142, 160, 184));
@@ -886,6 +926,7 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       if (LOWORD(wparam) == 1 && !app->running.exchange(true)) {
         try {
           if (app->worker.joinable()) app->worker.join();
+          app->mock_estop_requested.store(false);
           auto secret = text_of(app->password);
           auto driver = utf8(text_of(app->driver_config)), vehicle = utf8(text_of(app->vehicle_config));
           auto encoded = utf8(secret);
@@ -902,13 +943,22 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       } else if (LOWORD(wparam) == 2 && app->worker.joinable()) {
         app->keyboard.withdraw();
         app->worker.request_stop(); app->report(L"正在断开视频会话……");
-      }
+      } else if (LOWORD(wparam) == 3) app->request_mock_estop();
       return 0;
     case WM_APP + 1: {
       std::lock_guard lock(app->mutex);
       SetWindowTextW(app->status, app->message.c_str());
       EnableWindow(app->start, !app->running.load());
       EnableWindow(app->stop, app->running.load());
+      if (app->mock_estop_button) EnableWindow(app->mock_estop_button, app->running.load());
+      return 0;
+    }
+    case WM_APP + 2: {
+      std::lock_guard lock(app->mutex);
+      if (app->mock_info) SetWindowTextW(app->mock_info,
+          app->running.load() && detail::viewer_observation_stale(
+              static_cast<std::int64_t>(bench_now_ms()), app->last_mock_observation_ms.load())
+              ? L"控制状态过期，请停止操作\n画面与校时状态未知" : app->mock_message.c_str());
       return 0;
     }
     case WM_TIMER:
@@ -917,9 +967,10 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         const bool focused = app->running.load() && IsWindowVisible(hwnd) && !IsIconic(hwnd) &&
             GetForegroundWindow() == hwnd && (focus == hwnd || focus == app->video[0] || focus == app->video[1]);
         const auto down = [](int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; };
+        if (focused && down('E')) app->request_mock_estop();
         app->keyboard.observe(focused,
             {down('W') || down(VK_UP), down('A') || down(VK_LEFT), down('D') || down(VK_RIGHT),
-             down('S') || down(VK_DOWN) || down(VK_SPACE)}, static_cast<std::int64_t>(bench_now_ms()));
+             down('S') || down(VK_DOWN) || down(VK_SPACE), down('B')}, static_cast<std::int64_t>(bench_now_ms()));
         return 0;
       }
       if (wparam == 1 && app->running.load() && detail::viewer_observation_stale(
@@ -927,6 +978,9 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         SetWindowTextW(app->status, app->mock_control ?
             L"状态采样中断，画面可能停滞；请核验控制状态。" :
             L"状态采样中断，画面可能停滞；仅观看，控制禁用。");
+      if (wparam == 1 && app->mock_info && app->running.load() && detail::viewer_observation_stale(
+          static_cast<std::int64_t>(bench_now_ms()), app->last_mock_observation_ms.load()))
+        SetWindowTextW(app->mock_info, L"控制状态过期，请停止操作\n画面与校时状态未知");
       return 0;
     case WM_CLOSE:
       KillTimer(hwnd, 1);

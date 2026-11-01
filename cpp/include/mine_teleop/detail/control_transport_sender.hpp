@@ -9,6 +9,11 @@
 
 namespace mine_teleop::detail {
 
+inline bool mock_dual_sender_allowed(bool enabled, bool direct_authority, std::string_view vehicle,
+                                     bool peer_capable, bool transport_capable) {
+  return enabled && !direct_authority && vehicle.starts_with("test_bench_") && peer_capable && transport_capable;
+}
+
 inline bool mock_idle_reprobe_eligible(bool enabled, bool dc_ready, bool ack_waiting,
                                        const NativeControlIntentSample& sample, bool clock_ready) {
   return enabled && dc_ready && !ack_waiting && clock_ready && sample.active && sample.fresh &&

@@ -5505,6 +5505,10 @@ bool DriverConsoleRuntime::connect_control_signaling_websocket(
   control_transport_cloud_capable_ = control_signaling_websocket_->response_header("x-mine-teleop-transport-capabilities") == detail::kControlTransportCapability;
   control_signaling_last_ack_seq_ = 0;
   control_signaling_ack_window_.reset();
+  control_mirror_ingress_acks_.reset();
+  mock_dual_last_sent_ms_ = -1;
+  mock_dual_last_vehicle_path_.clear();
+  mock_dual_last_vehicle_seq_ = 0;
   control_signaling_ack_recovery_.connection_reopened(monotonic_now_ms());
   control_signaling_next_connect_monotonic_ms_ = 0;
   return true;
@@ -5519,6 +5523,10 @@ void DriverConsoleRuntime::close_control_signaling_websocket() {
   control_signaling_capabilities_verified_ = false;
   control_signaling_last_ack_seq_ = 0;
   control_signaling_ack_window_.reset();
+  control_mirror_ingress_acks_.reset();
+  mock_dual_last_sent_ms_ = -1;
+  mock_dual_last_vehicle_path_.clear();
+  mock_dual_last_vehicle_seq_ = 0;
   control_signaling_ack_recovery_.reset();
   control_vehicle_result_latency_.reset();
   control_transport_sender_.reset(); control_transport_cloud_capable_ = false;
@@ -5549,6 +5557,7 @@ void DriverConsoleRuntime::reset_native_control_state() {
     std::lock_guard lock(mutex_);
     control_sequence_ = 0;
     control_transport_vehicle_capable_ = false;
+    mock_dual_control_vehicle_capable_ = false;
     emergency_stop_vehicle_capable_ = false; feedback_transport_vehicle_capable_ = false;
     control_transport_mac_key_.clear();
     ++control_session_generation_;
@@ -5684,7 +5693,11 @@ bool DriverConsoleRuntime::consume_vehicle_control_result_locked(const Json& inp
   const auto seq = result.at("command_seq").get<std::uint64_t>();
   const auto intent = result.at("intent_seq").get<std::uint64_t>();
   const bool accepted = result.at("accepted").get<bool>();
-  static_cast<void>(control_vehicle_result_latency_.note_result(seq, intent, now, accepted, false, direct_return));
+  const auto latency_sample = control_vehicle_result_latency_.note_result(seq, intent, now, accepted, false, direct_return);
+  if (config_.mock_dual_control && latency_sample && result.contains("command_received_path")) {
+    mock_dual_last_vehicle_path_ = result.at("command_received_path").get<std::string>();
+    mock_dual_last_vehicle_seq_ = seq;
+  }
   bool rearm = receipt.boundary;
   if (seq > native_control_last_feedback_command_seq_) {
     native_control_last_feedback_command_seq_ = seq;
@@ -5715,6 +5728,7 @@ bool DriverConsoleRuntime::consume_vehicle_control_result_locked(const Json& inp
       {"reason", result.at("reason")}, {"transport_admitted", result.at("transport_admitted")},
       {"transport_selected", result.at("transport_selected")},
       {"round_trip_ms", receipt.round_trip_ms}, {"return_path", direct_return ? "dc" : "wss"}, {"transport", result.value("control_transport", Json(nullptr))},
+      {"command_received_path", result.value("command_received_path", "unknown")},
       {"authority_epoch", result.at("authority_epoch")}, {"feedback_transport", result.value("feedback_transport", Json(nullptr))}, {"requires_fresh_input", rearm}});
   return rearm;
 }
@@ -6034,6 +6048,13 @@ bool DriverConsoleRuntime::drain_native_control_acknowledgements_locked(
     }
     const auto acknowledged_seq =
         received.message.value("seq", std::uint64_t{0});
+    if (control_mirror_ingress_acks_.consume(acknowledged_seq)) {
+      // Cloud ingress only: never treat this as a vehicle result, an active
+      // WSS ACK, a fresh control sample, or a reason to clear a safety hold.
+      if (native_control_trace_) native_control_trace_->enqueue({
+          {"stage", "mock_mirror_ingress_ack"}, {"trace_session_id", session}, {"seq", acknowledged_seq}});
+      continue;
+    }
     const auto acknowledgement_received_at_utc_ms = clock_.now_ms();
     const auto acknowledgement_received_monotonic_ms = monotonic_now_ms();
     const bool ack_advanced = control_signaling_ack_window_.acknowledge_through(
@@ -6233,7 +6254,7 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
   int recovery_timeout_ms = 5000;
   Json trace_record;
   std::int64_t socket_lock_acquired_ms = 0, socket_lock_released_ms = 0;
-  bool vehicle_transport_capable = false, vehicle_stop_capable = false;
+  bool vehicle_transport_capable = false, vehicle_stop_capable = false, vehicle_mock_dual_capable = false;
   std::string current_media_attempt, transport_signing_key;
   {
     std::lock_guard update_lock(native_control_update_mutex_);
@@ -6259,6 +6280,7 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
       recovery_timeout_ms = control_recovery_timeout_ms_;
       sequence = ++control_sequence_;
       vehicle_transport_capable = control_transport_vehicle_capable_ && control_transport_mac_key_.size() >= 32;
+      vehicle_mock_dual_capable = mock_dual_control_vehicle_capable_;
       transport_signing_key = control_transport_mac_key_;
       vehicle_stop_capable = emergency_stop_vehicle_capable_;
       current_media_attempt = media_scope_id_;
@@ -6631,6 +6653,10 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
             send_started_monotonic_ms, recovery_timeout_ms);
         feedback_transport_sender_.decorate(envelope["payload"]);
       }
+      const bool mock_dual = detail::mock_dual_sender_allowed(config_.mock_dual_control,
+          config_.enable_experimental_direct_authority, vehicle, vehicle_mock_dual_capable, vehicle_transport_capable) &&
+          control_transport_sender_.path() == detail::ControlPath::DataChannel;
+      if (mock_dual) envelope["payload"]["mock_dual_control"] = detail::kMockDualControlCapability;
       if (envelope.at("payload").contains("control_transport") || envelope.at("payload").contains("feedback_request"))
         envelope["payload"]["native_mac"] = detail::transport_message_mac(envelope.at("payload"), transport_signing_key, false);
       if (emergency_payload.is_object()) envelope["payload"] = emergency_payload; // Exact same signed bytes on both carriers.
@@ -6665,6 +6691,19 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
         control_transport_latest_dc_["bridge_ui_epoch"] = sample.ui_control_epoch;
         control_transport_latest_dc_at_ms_ = send_started_monotonic_ms;
         control_dc_ack_window_.note_sent(sequence, send_started_monotonic_ms);
+        if (mock_dual && control_mirror_ingress_acks_.can_send() &&
+            control_signaling_websocket_ && control_signaling_websocket_->connected()) {
+          try {
+            // Exact same signed envelope and original timestamp; no extra
+            // input lease or authority is created by the cloud copy.
+            control_signaling_websocket_->send_json(envelope, std::chrono::milliseconds(20), stop);
+            control_mirror_ingress_acks_.note_sent(sequence);
+            mock_dual_last_sent_ms_ = monotonic_now_ms();
+            if (native_control_trace_) trace_record["mock_dual_wss_sent"] = true;
+          } catch (const WebSocketSendNotStarted&) {
+            if (native_control_trace_) trace_record["mock_dual_wss_sent"] = false;
+          }
+        }
       } else {
         if (!control_signaling_websocket_ || !control_signaling_websocket_->connected())
           throw std::runtime_error("WSS fallback unavailable after direct path boundary");
@@ -7836,6 +7875,7 @@ Json DriverConsoleRuntime::poll_signaling() {
       if (id.empty() || id != media_scope_id_) { ++media_offer_count_; media_scope_id_ = id; }
       media_scope_legacy_allowed_ = payload.value("legacy_bootstrap_allowed", media_offer_count_ == 1);
       control_transport_vehicle_capable_ = payload.value("control_transport_capability", "") == detail::kControlTransportCapability;
+      mock_dual_control_vehicle_capable_ = payload.value("mock_dual_control", "") == detail::kMockDualControlCapability;
       emergency_stop_vehicle_capable_ = payload.value("emergency_stop_capability", "") == detail::kEmergencyStopCapability;
       feedback_transport_vehicle_capable_ = payload.value("feedback_transport_capability", "") == detail::kFeedbackTransportCapability;
     }
@@ -8547,8 +8587,16 @@ Json DriverConsoleRuntime::status(bool omit_signaling_socket) {
     control_transport_status["cloud_capable"] = control_transport_cloud_capable_;
     control_transport_status["dc_network_path"] = control_transport_dc_network_path_;
     control_transport_status["dc_ready"] = control_transport_dc_ready_;
+    control_transport_status["mock_dual_last_vehicle_path"] = mock_dual_last_vehicle_path_.empty()
+        ? Json(nullptr) : Json(mock_dual_last_vehicle_path_);
     { std::lock_guard state_lock(mutex_);
       control_transport_status["vehicle_capable"] = control_transport_vehicle_capable_;
+      control_transport_status["mock_dual_control"] = detail::mock_dual_sender_allowed(config_.mock_dual_control,
+          config_.enable_experimental_direct_authority, vehicle_id_, mock_dual_control_vehicle_capable_,
+          control_transport_vehicle_capable_ && control_transport_mac_key_.size() >= 32) &&
+          control_transport_sender_.path() == detail::ControlPath::DataChannel &&
+          mock_dual_last_sent_ms_ >= 0 && monotonic_now_ms() >= mock_dual_last_sent_ms_ &&
+          monotonic_now_ms() - mock_dual_last_sent_ms_ < detail::NativeControlAckRecovery::kFreshAckMs;
       control_transport_status["session_key_present"] = control_transport_mac_key_.size() >= 32; }
     control_transport_status["cloud_authority_required"] = !config_.enable_experimental_direct_authority;
     control_transport_status["feedback_transport"] = feedback_transport_sender_.status();
@@ -8560,6 +8608,8 @@ Json DriverConsoleRuntime::status(bool omit_signaling_socket) {
     vehicle_result_latency = {
         {"method", "native_dispatch_to_vehicle_result_received"},
         {"command_path", result.last ? Json(result.last->data_channel ? "dc" : "wss") : Json(nullptr)},
+        {"vehicle_received_path", result.last && result.last->command_seq == mock_dual_last_vehicle_seq_ &&
+            !mock_dual_last_vehicle_path_.empty() ? Json(mock_dual_last_vehicle_path_) : Json(nullptr)},
         {"feedback_path", result.last ? Json(result.last->feedback_data_channel ? "dc" : "wss") : Json(nullptr)},
         {"includes_cloud_piggyback_wait", result.last ? Json(result.last->piggyback_return) : Json(nullptr)},
         {"physical_execution_confirmed", false},

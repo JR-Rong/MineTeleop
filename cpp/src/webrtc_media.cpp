@@ -1164,6 +1164,12 @@ struct VehicleMediaRuntime::Impl {
         config.vehicle_adapter.type, config.field_safety.max_speed_kph);
   }
 
+  bool mock_dual_control_enabled() const {
+    const char* enabled = std::getenv("MINE_TELEOP_MOCK_DUAL_CONTROL");
+    return detail::isolated_mock_control_allowed(enabled && std::string_view(enabled) == "1", config.vehicle_id,
+        config.vehicle_adapter.type, config.field_safety.max_speed_kph);
+  }
+
   static void on_control_message_data(GstWebRTCDataChannel* channel, GBytes* bytes, gpointer user_data) {
     auto* self = static_cast<Impl*>(user_data);
     if (!self->mock_compact_control_enabled() || !bytes) return;
@@ -1256,6 +1262,7 @@ struct VehicleMediaRuntime::Impl {
          {"type", "offer"},
          {"control_transport_capability", self->signaling.transport_mac_key().size() >= 32 ? detail::kControlTransportCapability : std::string_view{}},
          {"mock_compact_control", self->mock_compact_control_enabled() ? detail::kMockCompactControl : std::string_view{}},
+         {"mock_dual_control", self->mock_dual_control_enabled() ? detail::kMockDualControlCapability : std::string_view{}},
          {"emergency_stop_capability", self->config.runtime.experimental_direct_authority_max_ms > 0 && self->signaling.transport_mac_key().size() >= 32 ? detail::kEmergencyStopCapability : std::string_view{}},
          {"feedback_transport_capability", self->config.runtime.experimental_direct_authority_max_ms > 0 && self->signaling.transport_mac_key().size() >= 32 ? detail::kFeedbackTransportCapability : std::string_view{}},
          {"sdp", text == nullptr ? "" : text},
@@ -1667,6 +1674,10 @@ struct VehicleMediaRuntime::Impl {
         throw std::invalid_argument("control result authority mismatch");
       if ((message.contains("control_transport") || message.contains("emergency_stop") || message.contains("feedback_request")) && !detail::verify_transport_message(message, signaling.transport_mac_key(), false))
         throw std::invalid_argument("native control authentication failed");
+      const bool mock_dual = mock_dual_control_enabled() &&
+          message.value("mock_dual_control", "") == detail::kMockDualControlCapability &&
+          message.contains("control_transport") &&
+          message.at("control_transport").value("path", "") == "dc" && !command.estop;
       std::string current_attempt;
       { std::lock_guard scope_lock(media_signal_state->mutex); current_attempt = media_signal_state->negotiation_id; }
       Json result_message = {{"event", "vehicle_control_result"}, {"protocol", detail::kControlTransportCapability},
@@ -1674,7 +1685,7 @@ struct VehicleMediaRuntime::Impl {
           {"command_seq", command.seq}, {"intent_seq", intent_seq}, {"accepted", false},
           {"rearm_required", false}, {"control_status_seq", 0}, {"reason", "control_not_applied"},
           {"transport_admitted", false}, {"transport_selected", false}};
-      if (config.runtime.experimental_direct_authority_max_ms > 0)
+      if (config.runtime.experimental_direct_authority_max_ms > 0 || mock_dual)
         result_message["command_received_path"] = transport == ControlMessageTransport::DataChannel ? "dc" : "wss";
       if (message.contains("control_transport")) {
         const auto stamp = detail::ControlTransportStamp::from_json(message.at("control_transport"));
@@ -1711,12 +1722,12 @@ struct VehicleMediaRuntime::Impl {
         const bool probe = selected_feedback && message.at("feedback_request").value("probe", false);
         const bool via_wss = !selected_feedback || probe || feedback_transport_fence.path() == detail::ControlPath::Wss;
         const bool via_dc = selected_feedback ? probe || feedback_transport_fence.path() == detail::ControlPath::DataChannel :
-            transport == ControlMessageTransport::DataChannel || message.contains("emergency_stop");
+            transport == ControlMessageTransport::DataChannel || message.contains("emergency_stop") || mock_dual;
         if (via_wss) {
           latest_control_result = result_message;
           // The native WSS handler already sends its own result immediately.
           // Only an asynchronous publisher needs to interrupt its receive wait.
-          if (!native_feedback) wake_native_control_feedback();
+          if (!native_feedback || mock_dual) wake_native_control_feedback();
         }
         if (native_feedback && via_wss) *native_feedback = result_message;
         const bool dc_send_invoked = control_link_open && control_channel && via_dc &&
@@ -1946,12 +1957,22 @@ struct VehicleMediaRuntime::Impl {
             transport == ControlMessageTransport::DataChannel ? detail::ControlPath::DataChannel : detail::ControlPath::Wss,
             current_attempt, signaling.now_ms(), signaling.control_lease_expiry(), config.control.max_command_gap_ms,
             direct_authority.configured() ? direct_authority.valid(steady_now_ms()) :
-                (native_control_websocket_connected.load() && native_control_transport_cloud_capable.load()), verified_stop_only);
+                (native_control_websocket_connected.load() && native_control_transport_cloud_capable.load()), verified_stop_only,
+            mock_dual && control_link_open && control_channel);
         result_message["reason"] = decision.reason;
         result_message["transport_admitted"] = decision.admitted;
         result_message["transport_selected"] = decision.admitted && message.contains("control_transport") &&
             message.at("control_transport").value("action", "") == "select";
         if (!decision.admitted) {
+          if (mock_dual && decision.reason == "transport_sequence_replayed") {
+            // The authenticated competing copy consumed this identity. Do not
+            // apply it or emit a rejection that can race its actual result.
+            publish_result.publish = [] {};
+            lock.unlock();
+            queue_control_trace(nullptr, "mock_dual_duplicate", false,
+                std::nullopt, std::nullopt, std::nullopt, std::nullopt);
+            return;
+          }
           ++rejected_control_commands;
           lock.unlock();
           queue_control_trace(nullptr, decision.reason, false,
