@@ -4,6 +4,7 @@
 #include "mine_teleop/detail/native_mock_media_gate.hpp"
 #include "mine_teleop/detail/native_mock_input_sequence.hpp"
 #include "mine_teleop/detail/native_mock_profile_retry.hpp"
+#include "mine_teleop/detail/native_mock_profile_state.hpp"
 #include "mine_teleop/detail/native_mock_keyboard.hpp"
 #include "mine_teleop/detail/native_can_feedback.hpp"
 #include "mine_teleop/detail/native_control_courier.hpp"
@@ -20,6 +21,7 @@
 #include <commdlg.h>
 #include <algorithm>
 #include <cstring>
+#include <exception>
 #include <cstdio>
 #include <condition_variable>
 #include <fstream>
@@ -227,6 +229,7 @@ struct Window {
   std::atomic<std::int64_t> last_observation_ms{0};
   std::atomic<std::int64_t> last_mock_observation_ms{0};
   std::atomic<bool> mock_estop_requested{false};
+  std::atomic<bool> mock_profile_needs_confirmation{false}, mock_profile_confirmation_requested{false};
   std::atomic<bool> mock_ui_posted{false};
   detail::NativeMockKeyboard keyboard;
   std::mutex gamepad_mutex;
@@ -306,6 +309,7 @@ struct Window {
     std::uint64_t profile_seq = 0;
     bool profile_accepted = false, handshake_sent = false;
     detail::NativeMockProfileRetry profile_retry;
+    detail::NativeMockProfileState profile_state;
     std::optional<SessionControlProfile> requested_profile;
     std::optional<Json> profile_request;
     auto next_evidence = Clock::now();
@@ -490,20 +494,33 @@ struct Window {
       if (value.value("event", "") == "session_control_profile_status") profile_status = value;
       else if (value.value("event", "") == "vehicle_telemetry" && value.contains("session_control_profile"))
         profile_status = value.at("session_control_profile");
-      if (profile_seq && profile_status.is_object() && profile_status.contains("last_request_seq") &&
-          profile_status.at("last_request_seq").is_number_unsigned() &&
-          profile_status.at("last_request_seq").get<std::uint64_t>() == profile_seq) {
-        if (!profile_status.value("accepted", false) || !profile_status.value("active", false))
-          throw std::runtime_error("mock control profile inactive or rejected");
-        if (!profile_status.contains("effective_profile") || !profile_status.at("effective_profile").is_object() ||
-            !requested_profile || SessionControlProfile::from_json(profile_status.at("effective_profile")) != *requested_profile)
-          throw std::runtime_error("mock control profile changed");
-        keyboard.set_brake_profile(requested_profile->service_brake_pressure_bar,
-            requested_profile->hard_brake_pressure_bar, requested_profile->max_brake_pressure_bar);
-        // This isolated profile has a zero target speed and zero steering limit.
-        // The web client consequently sends zero on both normalized axes.
-        keyboard.set_control_limits(0.0, requested_profile->max_steering_angle_deg, 30.0);
-        profile_accepted = true;
+      if (profile_seq && profile_status.is_object() && value.contains("control_status_seq") &&
+          value.at("control_status_seq").is_number_unsigned()) {
+        const auto request = profile_status.contains("last_request_seq") &&
+            profile_status.at("last_request_seq").is_number_unsigned()
+            ? profile_status.at("last_request_seq").get<std::uint64_t>() : 0;
+        bool valid = profile_status.value("accepted", false) && profile_status.value("active", false) &&
+            profile_status.contains("applied_revision") && profile_status.at("applied_revision").is_number_unsigned() &&
+            profile_status.at("applied_revision").get<std::uint64_t>() == profile_seq && requested_profile &&
+            profile_status.contains("effective_profile") && profile_status.at("effective_profile").is_object();
+        if (valid) {
+          try { valid = !(SessionControlProfile::from_json(profile_status.at("effective_profile")) != *requested_profile); }
+          catch (const std::exception&) { valid = false; }
+        }
+        const auto result = profile_state.observe(value.at("control_status_seq").get<std::uint64_t>(), request, valid);
+        if (result == detail::NativeMockProfileState::Result::invalidated) {
+          profile_accepted = false;
+          input_authorized_at_ms.store(0);
+          keyboard.withdraw();
+          mock_profile_confirmation_requested.store(false);
+          mock_profile_needs_confirmation.store(true);
+          report(L"会话限幅已失效，输入已禁止；请人工重新确认。");
+        } else if (result == detail::NativeMockProfileState::Result::accepted) {
+          keyboard.set_brake_profile(requested_profile->service_brake_pressure_bar,
+              requested_profile->hard_brake_pressure_bar, requested_profile->max_brake_pressure_bar);
+          keyboard.set_control_limits(0.0, requested_profile->max_steering_angle_deg, 30.0);
+          profile_accepted = true;
+        }
       }
       if (value.value("event", "") == "vehicle_telemetry") {
         ++telemetry_status_observed;
@@ -531,7 +548,8 @@ struct Window {
                 ? value.at("speed_mps") : Json(nullptr)}};
       }
     };
-    while (!stop.stop_requested() && !parent.stop_requested()) {
+    std::exception_ptr control_failure;
+    try { while (!stop.stop_requested() && !parent.stop_requested()) {
       const auto now = Clock::now();
       const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
       if (now >= next_status) { cached_status = driver.status(true); next_status = now + 25ms; }
@@ -589,7 +607,26 @@ struct Window {
         if (!courier->tick(current, io)) throw std::runtime_error("mock courier retired");
         const auto transport = status.at("native_control").at("control_transport");
         const bool negotiated = transport.value("epoch", 0) > 0 && !transport.value("selecting", true);
-        if (profile_retry.due(ready, negotiated, profile_accepted, current_epoch, now_ms)) {
+        if (mock_profile_confirmation_requested.load() && mock_profile_needs_confirmation.load() &&
+            ready && negotiated && requested_profile && !mock_estop_requested.load() &&
+            detail::native_mock_input_fresh(telemetry_at_ms, static_cast<std::int64_t>(bench_now_ms())) &&
+            detail::native_mock_source_fresh(telemetry_source_ms,
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(),
+                sync.value("offset_ms", std::int64_t{0}), sync.value("uncertainty_ms", std::int64_t{-1})) &&
+            telemetry.is_object() && telemetry.contains("speed_mps") && telemetry.at("speed_mps").is_number() &&
+            telemetry.at("speed_mps").get<double>() == 0.0) {
+          profile_request = driver.prepare_control_profile(requested_profile->to_json()).at("request");
+          profile_seq = profile_request->at("seq").get<std::uint64_t>();
+          if (!profile_state.begin(profile_seq, true)) throw std::runtime_error("invalid manual profile sequence");
+          profile_retry = detail::NativeMockProfileRetry{};
+          profile_accepted = false;
+          keyboard.withdraw();
+          mock_profile_confirmation_requested.store(false);
+          mock_profile_needs_confirmation.store(false);
+          report(L"已发送会话限幅确认，等待车端应答。");
+        }
+        if (!mock_profile_needs_confirmation.load() &&
+            profile_retry.due(ready, negotiated, profile_accepted, current_epoch, now_ms)) {
           if (!profile_request) {
             SessionControlProfile profile;
             profile.target_speed_kph = 0; profile.max_motor_torque_nm = 0;
@@ -602,6 +639,7 @@ struct Window {
             requested_profile = profile;
             profile_request = driver.prepare_control_profile(profile.to_json()).at("request");
             profile_seq = profile_request->at("seq").get<std::uint64_t>();
+            if (!profile_state.begin(profile_seq, false)) throw std::runtime_error("invalid initial profile sequence");
           }
           static_cast<void>(driver.send_control_management({{"source_session_id", session_id},
               {"source_control_session_generation", generation}, {"media_negotiation_id", attempt},
@@ -778,12 +816,14 @@ struct Window {
         }
       }
       std::this_thread::sleep_for(10ms);
-    }
+    } } catch (...) { control_failure = std::current_exception(); }
     input_authorized_at_ms.store(0);
     keyboard.withdraw();
     flush_dc_trace();
     input_worker.request_stop();
     if (input_worker.joinable()) input_worker.join();
+    clock_worker.request_stop();
+    if (clock_worker.joinable()) clock_worker.join();
     flush_guard_trace();
     if (courier) courier->retire();
     std::array<Samples, 2> gaps, decoded_gaps, submission_waits;
@@ -795,6 +835,7 @@ struct Window {
         {"decoded_callback_to_submission", Json::array({submission_waits[0].json(), submission_waits[1].json()})},
         {"safety_stop_episodes", safety_stop_episodes}};
     std::fprintf(stderr, "%s\n", summary.dump().c_str()); std::fflush(stderr);
+    if (control_failure) std::rethrow_exception(control_failure);
   }
 
   void connect(std::string driver_path, std::string vehicle_path, std::string requested_driver, std::string secret,
@@ -1346,7 +1387,13 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       else for (const auto panel : app->video) InvalidateRect(panel, nullptr, FALSE);
       return 0;
     case WM_COMMAND:
-      if (LOWORD(wparam) == 1 && app->running.load()) {
+      if (LOWORD(wparam) == 1 && app->running.load() && app->mock_profile_needs_confirmation.load()) {
+        app->keyboard.withdraw();
+        app->mock_profile_confirmation_requested.store(true);
+        EnableWindow(app->start, FALSE);
+        SetFocus(hwnd);
+        app->report(L"等待视频、时钟和 mock 状态恢复后发送人工确认。");
+      } else if (LOWORD(wparam) == 1 && app->running.load()) {
         const auto selected = SendMessageW(app->vehicle_list, CB_GETCURSEL, 0, 0);
         bool valid = false;
         {
@@ -1363,6 +1410,8 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         try {
           if (app->worker.joinable()) app->worker.join();
           app->mock_estop_requested.store(false);
+          app->mock_profile_needs_confirmation.store(false);
+          app->mock_profile_confirmation_requested.store(false);
           auto secret = text_of(app->password);
           auto driver = utf8(text_of(app->driver_config)), vehicle = utf8(text_of(app->vehicle_config));
           auto requested_driver = utf8(detail::native_trim_identity(text_of(app->driver_id)));
@@ -1395,7 +1444,10 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       std::lock_guard lock(app->mutex);
       SetWindowTextW(app->status, app->message.c_str());
       { std::lock_guard selection_lock(app->selection_mutex);
-        EnableWindow(app->start, !app->running.load() || (app->awaiting_selection && !app->selection_busy));
+        const bool confirm_profile = app->running.load() && app->mock_profile_needs_confirmation.load();
+        EnableWindow(app->start, !app->running.load() || (app->awaiting_selection && !app->selection_busy) ||
+            (confirm_profile && !app->mock_profile_confirmation_requested.load()));
+        if (confirm_profile) SetWindowTextW(app->start, L"重新确认限幅");
         if (!app->running.load()) {
           ShowWindow(app->can_detail, SW_HIDE);
           for (const auto label : app->config_labels) ShowWindow(label, SW_SHOW);

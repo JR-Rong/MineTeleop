@@ -71,6 +71,10 @@ values use the acknowledged profile scaling, so that profile sends zero
 throttle and steering in this mock configuration. Directional key presses
 must therefore be verified separately from delivered motion values in a bench
 test; a zero value alone is not proof that a key was or was not pressed.
+Mock gear selection currently waits for fresh matching telemetry, but does not
+implement the web client's complete status-sequence-fenced transition and
+correlated rejection/rollback logic. It must not be treated as equivalent
+production gear control.
 
 For the `b93bfff` UI build, a Windows smoke check opened the isolated mock
 window without connecting a vehicle, checked four edit fields and Tab focus,

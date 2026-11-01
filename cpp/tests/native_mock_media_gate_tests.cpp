@@ -1,6 +1,7 @@
 #include "mine_teleop/detail/native_mock_media_gate.hpp"
 #include "mine_teleop/detail/native_mock_input_sequence.hpp"
 #include "mine_teleop/detail/native_mock_profile_retry.hpp"
+#include "mine_teleop/detail/native_mock_profile_state.hpp"
 #include "mine_teleop/detail/native_mock_keyboard.hpp"
 #include "mine_teleop/detail/dtls_record_trace.hpp"
 #include <iostream>
@@ -73,6 +74,23 @@ void test_profile_retry_stays_bounded_and_needs_live_guards() {
   }
   require(!retry.due(true, true, false, 1, 60000) && retry.attempts() == retry.kMaxAttempts,
           "profile retry budget was not exhausted");
+}
+void test_profile_requires_new_manual_confirmation_after_invalidation() {
+  using State = mine_teleop::detail::NativeMockProfileState;
+  State state;
+  require(state.begin(10, false), "initial profile request refused");
+  require(state.observe(2, 9, true) == State::Result::ignored, "old acknowledgement accepted");
+  require(state.observe(3, 10, true) == State::Result::accepted, "matching acknowledgement rejected");
+  require(state.observe(3, 10, false) == State::Result::ignored, "duplicate status invalidated profile");
+  require(state.observe(4, 10, false) == State::Result::invalidated, "inactive profile remained authorized");
+  require(state.observe(5, 10, true) == State::Result::ignored, "late acknowledgement restored authorization");
+  require(!state.begin(11, false) && !state.begin(10, true), "profile automatically retried or reused sequence");
+  require(state.begin(11, true), "manual new request refused");
+  require(state.observe(6, 10, true) == State::Result::ignored, "old request accepted during manual confirmation");
+  require(state.observe(7, 11, true) == State::Result::accepted, "manual request acknowledgement rejected");
+  require(state.observe(8, 12, true) == State::Result::invalidated, "replaced profile remained authorized");
+  require(state.begin(12, true), "second manual request refused");
+  require(state.observe(9, 12, false) == State::Result::invalidated, "mismatched effective profile accepted");
 }
 void test_dtls_header_trace_is_bounded_and_excludes_payloads() {
   using namespace mine_teleop::detail;
@@ -274,6 +292,6 @@ void test_mock_gamepad_neutral_and_profile_limits() {
   require(input.throttle == 0 && input.steering == 0, "zero mock limits produced nonzero motion intent");
 }
 }
-int main() { try { test_gate(); test_neutral_refresh_sequence(); test_profile_retry_stays_bounded_and_needs_live_guards(); test_dtls_header_trace_is_bounded_and_excludes_payloads(); test_mock_keyboard_rearms_only_after_release(); test_mock_direction_combinations_require_gear_confirmation(); test_live_clock_keyboard_and_media_guard(); test_mock_gamepad_neutral_and_profile_limits();
+int main() { try { test_gate(); test_neutral_refresh_sequence(); test_profile_retry_stays_bounded_and_needs_live_guards(); test_profile_requires_new_manual_confirmation_after_invalidation(); test_dtls_header_trace_is_bounded_and_excludes_payloads(); test_mock_keyboard_rearms_only_after_release(); test_mock_direction_combinations_require_gear_confirmation(); test_live_clock_keyboard_and_media_guard(); test_mock_gamepad_neutral_and_profile_limits();
   std::cout << "PASS scoped mock media, input renewal, keyboard and clock guard\n"; return 0; }
 catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; } }

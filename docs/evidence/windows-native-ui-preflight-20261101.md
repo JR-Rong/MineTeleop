@@ -79,3 +79,46 @@ identity and SHA-256, it was moved without overwriting to the dedicated
 `ui-log-preflight-01/session.zip` test directory. Two subsequent attempts to
 automate a custom save location did not identify the native file-name control;
 custom-path saving remains unverified, not a demonstrated client failure.
+
+## First 30-minute attempt
+
+The first long attempt used Windows viewer `b842b42` and the same Orin mock
+runtime. It ended after 1,261.06 seconds because a safety stop occurred; it
+did not pass the requested 30-minute uninterrupted window. All 1,254 client
+observations reported the pinned direct UDP pair. The logical control path
+was DataChannel in 1,249 observations and WSS in five. Two vehicle braking
+waits were recorded during the measurement (`control_link` and
+`readiness_history`); the client counted one stop episode. Of 210 scheduled
+input windows, 209 matched accepted vehicle commands. The unmatched left-key
+window overlapped the failure. All nine scenarios were exercised, and the
+recorded effective mock traction and steering remained zero.
+
+During the three seconds centered on the first vehicle stop, the gateway probe
+had one timeout and a maximum successful RTT of 113 ms. The vehicle rejected
+12 expired commands, four from DataChannel and eight from WSS; the estimated
+sender-to-callback delays for those commands were 204–307 ms, subject to
+cross-host clock uncertainty. The maximum callback-to-control-mutex wait was
+1 ms. This is consistent with a delay before or at callback entry and shared
+access-path trouble, but does not establish the exact cause or network segment.
+
+The two decoded-sample callback interval distributions had p99/max values of
+approximately 52/319 ms and 52/323 ms. Decoded callback to foreground GDI
+submission had p99/max of approximately 4.5/16.7 ms and 5.1/17.3 ms. These
+local measurements do not establish capture-to-display latency, but show that
+the large gaps in this attempt arose before the measured UI submission stage
+or in scheduling shared with it. Raw evidence and the complete analysis remain
+in the local artifact directory under `ui-long-01-b842`.
+
+## Second 30-minute attempt
+
+Viewer `1d707e1` ran for 186.76 seconds before a critical-video stop and a
+subsequent control-link stop. All 186 sampled observations showed the pinned
+direct pair and DataChannel logical path. The 31 scheduled input windows all
+matched accepted mock commands and covered all nine scenarios. The client
+terminated when the vehicle invalidated the control profile. The gateway probe
+had one timeout in the six-second window around the first stop; the maximum
+successful RTT there was 12 ms. Estimated sender-to-vehicle callback delay
+peaked at 439 ms across the run, subject to cross-host clock uncertainty;
+callback-to-control-mutex wait peaked at 1 ms. These observations do not
+identify the responsible network segment or establish an uninterrupted pass.
+Raw evidence is retained under `ui-long-02-1d707` in the artifact directory.
