@@ -923,6 +923,7 @@ struct Window {
                 const auto zip = driver.log_export_zip();
                 std::ofstream file(std::filesystem::path(path), std::ios::binary | std::ios::trunc);
                 file.write(zip.data(), static_cast<std::streamsize>(zip.size()));
+                file.close();
                 if (!file) throw std::runtime_error("log save failed");
                 report(L"日志 ZIP 已保存；录像文件不包含在内。");
               }

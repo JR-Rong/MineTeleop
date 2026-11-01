@@ -59,7 +59,9 @@ The login/vehicle-selection screen also offers an export for authorized,
 completed session logs through the existing driver runtime. It must run while
 there is no active session, and its ZIP does not contain video. Partial export
 or unconfirmed recording completeness must not be interpreted as a complete
-recording. This native export flow has not yet been validated end to end.
+recording. An isolated mock preflight listed authorized sessions and saved a
+readable ZIP at the default location; all three log sources in that ZIP were
+partial. Automated verification of a user-selected save path remains open.
 
 The native viewer is not yet functionally equivalent to the web console. It
 does not implement all of the web console's CAN presentation, editable session

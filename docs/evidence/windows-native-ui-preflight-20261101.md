@@ -47,3 +47,35 @@ guarantee throughout a session. No physical gamepad was connected. Raw logs
 and analysis remain in the local artifact directory under `ui-preflight-01-87`.
 No 30-minute result, physical CAN result, or real-vehicle acceptance is
 established by this preflight.
+
+## Second short run with all nine inputs
+
+A second run using the same viewer and vehicle builds measured 66.25 seconds.
+All 11 scheduled key windows had at least one matching accepted vehicle
+command, covering the eight requested directions and brake. Ten windows had
+at least 77 matches; the initial forward window had only 10. All 66 sampled
+observations reported the pinned direct UDP pair and the DataChannel logical
+control path. One critical-video safety stop occurred during measurement, so
+uninterrupted-control acceptance again failed.
+
+In the six seconds centered on that stop, the Windows-to-Wi-Fi-gateway probe
+recorded five replies, no timeouts and a maximum of 10 ms. This single probe
+does not exclude a problem later in the network path or a scheduling delay.
+The two GDI submission streams had p99/max gaps of approximately 145/555 ms
+and 121/379 ms. The vehicle runner reported 24 polls matching a FrameForge
+process but did not capture process identities; the other workload and its
+impact are unconfirmed. No other task was paused. Raw evidence remains in
+`ui-preflight-03-87` in the local artifact directory.
+
+## Session log export preflight
+
+With no control session open and the isolated mock vehicle online, the native
+viewer from `87bff3f` displayed two authorized completed sessions and produced
+a readable ZIP for `test_bench_pr26`. The ZIP manifest marked the vehicle,
+cloud and controller sources partial; it is not a complete three-end export.
+The automated test selected the wrong Windows dialog input and saved to the
+default Documents location. After verifying the file's creation time, mock
+identity and SHA-256, it was moved without overwriting to the dedicated
+`ui-log-preflight-01/session.zip` test directory. Two subsequent attempts to
+automate a custom save location did not identify the native file-name control;
+custom-path saving remains unverified, not a demonstrated client failure.
