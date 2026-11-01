@@ -7263,10 +7263,17 @@ void test_expired_websocket_authority_clears_local_control() {
   const auto connected = driver.connect("vehicle-001");
   std::this_thread::sleep_for(std::chrono::milliseconds(130));
   bool authority_loss_reported = false;
-  try {
-    static_cast<void>(driver.poll_signaling());
-  } catch (const std::runtime_error& error) {
-    authority_loss_reported = std::string(error.what()).find("authority is no longer valid") != std::string::npos;
+  // A poll can first return an already-buffered message while the server's
+  // reaper is concurrently closing the socket. Drain until the closed socket
+  // is observed; do not reinterpret another error as authority loss.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (std::chrono::steady_clock::now() < deadline && !authority_loss_reported) {
+    try {
+      static_cast<void>(driver.poll_signaling());
+    } catch (const std::runtime_error& error) {
+      if (std::string(error.what()).find("authority is no longer valid") == std::string::npos) throw;
+      authority_loss_reported = true;
+    }
   }
   expect(authority_loss_reported, "expired WSS control authority was not reported");
   const auto status = driver.status();
