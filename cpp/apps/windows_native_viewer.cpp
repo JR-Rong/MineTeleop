@@ -8,11 +8,13 @@
 #include "mine_teleop/detail/native_control_courier.hpp"
 #include "mine_teleop/detail/mock_compact_control.hpp"
 #include "mine_teleop/detail/native_viewer_observation.hpp"
+#include "mine_teleop/detail/native_operator_readouts.hpp"
 #include "mine_teleop/detail/native_video_layout.hpp"
 #include <gst/video/video.h>
 #include <gio/gnetworking.h>
 #include <windows.h>
 #include <shellapi.h>
+#include <algorithm>
 #include <cstring>
 #include <cstdio>
 
@@ -130,15 +132,23 @@ struct RenderSession {
 struct Window {
   HWND hwnd{}, driver_config{}, vehicle_config{}, password{}, status{}, start{}, stop{};
   std::array<HWND, 3> config_labels{};
+  std::array<HWND, 6> operator_labels{}, operator_readouts{};
+  std::array<HWND, 6> keycaps{};
+  std::array<bool, 6> shown_keys{};
   HWND help{}, mock_info{}, mock_estop_button{};
   HFONT font{}, title_font{}, small_font{};
   HBRUSH background{}, surface{}, input_background{};
   std::array<HWND, 2> video{};
   std::mutex mutex;
+  std::mutex intent_display_mutex;
+  struct IntentDisplay { detail::NativeOperatorIntent input{}; std::int64_t observed_ms{}; bool valid{}; };
+  IntentDisplay intent_display;
   std::mutex render_mutex;
   std::shared_ptr<RenderSession> render_session;
   std::wstring message{L"仅观看台架：控制禁用。车端隔离须独立核验。"};
   std::wstring mock_message{L"控制：等待连接\n画面：等待\n校时：等待"};
+  std::array<std::wstring, 6> operator_values{L"—", L"—", L"—", L"—", L"—", L"—"};
+  bool operator_display_stale{false};
   std::jthread worker;
   std::atomic<bool> running{false};
   std::atomic<std::int64_t> last_observation_ms{0};
@@ -148,6 +158,15 @@ struct Window {
   detail::NativeMockKeyboard keyboard;
   bool mock_control{false};
   std::string mock_local_ip, mock_peer_ip, mock_ip_family;
+
+  void clear_input_display() {
+    for (std::size_t i = 0; i < shown_keys.size(); ++i) {
+      shown_keys[i] = false;
+      if (keycaps[i]) InvalidateRect(keycaps[i], nullptr, TRUE);
+    }
+    for (std::size_t i = 2; i < operator_readouts.size(); ++i)
+      if (operator_readouts[i]) SetWindowTextW(operator_readouts[i], L"—");
+  }
 
   void suspend_render_health() {
     std::shared_ptr<RenderSession> current;
@@ -162,8 +181,9 @@ struct Window {
     PostMessageW(hwnd, WM_APP + 1, 0, 0);
   }
 
-  void report_mock(std::wstring value) {
-    { std::lock_guard lock(mutex); mock_message = std::move(value); }
+  void report_mock(std::wstring value,
+                   std::array<std::wstring, 6> values = {L"—", L"—", L"—", L"—", L"—", L"—"}) {
+    { std::lock_guard lock(mutex); mock_message = std::move(value); operator_values = std::move(values); }
     last_mock_observation_ms = static_cast<std::int64_t>(bench_now_ms());
     if (!mock_ui_posted.exchange(true) && !PostMessageW(hwnd, WM_APP + 2, 0, 0))
       mock_ui_posted.store(false);
@@ -172,6 +192,7 @@ struct Window {
   void request_mock_estop() {
     if (!mock_control || !running.load() || mock_estop_requested.exchange(true)) return;
     keyboard.withdraw();
+    { std::lock_guard lock(intent_display_mutex); intent_display.valid = false; }
     report(L"已请求 mock 急停，等待车端确认。");
   }
 
@@ -314,6 +335,12 @@ struct Window {
             input["intent_seq"] = input_sequence.next(input);
             const auto result = driver.update_control_intent(input);
             if (!result.value("accepted", false)) throw std::runtime_error("mock input rejected");
+            {
+              std::lock_guard lock(intent_display_mutex);
+              intent_display = {{keyboard_input.gear, keyboard_input.steering, keyboard_input.throttle,
+                                  keyboard_input.brake}, static_cast<std::int64_t>(bench_now_ms()),
+                                ready && authorized && !estop};
+            }
             epoch.store(result.at("ui_control_epoch").get<std::uint64_t>());
             withdrawn = !ui_alive;
           }
@@ -526,11 +553,27 @@ struct Window {
           result_text = std::to_wstring(latest_result.at("round_trip_ms").get<std::int64_t>()) + L" ms · " +
               (latest_result.at("accepted").get<bool>() ? L"软件接受" : L"已拒绝");
         }
+        std::optional<double> speed;
+        std::optional<char> actual_gear;
+        const bool evidence_fresh = telemetry_fresh && detail::native_mock_source_fresh(telemetry_source_ms, wall_ms,
+            sync.value("offset_ms", std::int64_t{0}), sync.value("uncertainty_ms", std::int64_t{-1}));
+        if (evidence_fresh) {
+          if (telemetry.contains("speed_mps") && telemetry.at("speed_mps").is_number())
+            speed = telemetry.at("speed_mps").get<double>();
+          if (telemetry_gear.size() == 1) actual_gear = telemetry_gear.front();
+        }
+        std::optional<detail::NativeOperatorIntent> shown_intent;
+        {
+          std::lock_guard lock(intent_display_mutex);
+          if (authorized && intent_display.valid &&
+              detail::native_mock_input_fresh(intent_display.observed_ms, static_cast<std::int64_t>(bench_now_ms())))
+            shown_intent = intent_display.input;
+        }
         report_mock(std::wstring(L"控制：") + control_path + (authorized ? L" · 输入就绪" : L" · 输入禁止") +
             L"\n画面：" + (video_health.ready && gate->ready_now() ? L"就绪" : L"未就绪") +
             L"  校时：" + (clock_ok ? std::wstring(L"±") + std::to_wstring(time_uncertainty) + L" ms" : L"不可用") +
             L"\n车端：" + (mock_estop_requested.load() && safety_state != "ESTOP" ? L"急停等待确认" : vehicle_state) +
-            L"\n结果：" + result_text);
+            L"\n结果：" + result_text, detail::native_operator_readouts(speed, actual_gear, shown_intent));
         next_mock_ui = now + 100ms;
       }
       if (now >= next_evidence) {
@@ -615,6 +658,7 @@ struct Window {
   void connect(std::string driver_path, std::string vehicle_path, std::string secret,
                std::stop_token stop_token) {
     const char* phase = "configuration";
+    { std::lock_guard lock(intent_display_mutex); intent_display.valid = false; }
     try {
       const auto vehicle = load_vehicle_config(vehicle_path);
       if (mock_control) validate_mock_control(vehicle);
@@ -831,21 +875,36 @@ void layout(Window& app, int width, int height) {
   constexpr int gap = 12, margin = 16, side_width = 300;
   const int side_x = width - margin - side_width;
   const int video_width = std::max(1, (side_x - 3 * margin) / 2);
-  const int video_height = std::max(1, height - 202);
+  const int video_height = std::max(1, height - 250);
   MoveWindow(app.status, margin + 12, 78, width - 2 * margin - 24, 24, TRUE);
+  const int strip_width = std::max(6, side_x - margin - gap);
+  for (int i = 0; i < 6; ++i) {
+    const int left = margin + i * strip_width / 6;
+    const int cell_width = (i + 1) * strip_width / 6 - i * strip_width / 6;
+    MoveWindow(app.operator_labels[i], left + 8, 126, std::max(1, cell_width - 12), 18, TRUE);
+    MoveWindow(app.operator_readouts[i], left + 8, 146, std::max(1, cell_width - 12), 24, TRUE);
+  }
   for (int i = 0; i < 2; ++i)
-    MoveWindow(app.video[i], margin + i * (video_width + gap), 162, video_width, video_height, TRUE);
+    MoveWindow(app.video[i], margin + i * (video_width + gap), 210, video_width, video_height, TRUE);
   const int left = side_x + 16, field_width = side_width - 32;
   for (int i = 0; i < 3; ++i) {
-    MoveWindow(app.config_labels[i], left, 188 + i * 67, field_width, 20, TRUE);
+    MoveWindow(app.config_labels[i], left, 188 + i * 55, field_width, 20, TRUE);
     HWND field = i == 0 ? app.driver_config : (i == 1 ? app.vehicle_config : app.password);
-    MoveWindow(field, left, 210 + i * 67, field_width, 28, TRUE);
+    MoveWindow(field, left, 210 + i * 55, field_width, 28, TRUE);
   }
-  MoveWindow(app.start, left, 414, (field_width - gap) / 2, 34, TRUE);
-  MoveWindow(app.stop, left + (field_width + gap) / 2, 414, (field_width - gap) / 2, 34, TRUE);
-  MoveWindow(app.help, left, 477, field_width, 70, TRUE);
-  if (app.mock_estop_button) MoveWindow(app.mock_estop_button, left, 548, field_width, 32, TRUE);
-  if (app.mock_info) MoveWindow(app.mock_info, left, 590, field_width, 80, TRUE);
+  MoveWindow(app.start, left, 365, (field_width - gap) / 2, 34, TRUE);
+  MoveWindow(app.stop, left + (field_width + gap) / 2, 365, (field_width - gap) / 2, 34, TRUE);
+  MoveWindow(app.help, left, 430, field_width, app.mock_control ? 20 : 70, TRUE);
+  if (app.mock_control) {
+    constexpr int key_width = 40, key_height = 25, key_gap = 4;
+    MoveWindow(app.keycaps[0], left + key_width + key_gap, 455, key_width, key_height, TRUE);
+    for (int i = 1; i < 4; ++i)
+      MoveWindow(app.keycaps[i], left + (i - 1) * (key_width + key_gap), 484, key_width, key_height, TRUE);
+    MoveWindow(app.keycaps[4], left + 3 * (key_width + key_gap), 455, field_width - 3 * (key_width + key_gap), key_height, TRUE);
+    MoveWindow(app.keycaps[5], left + 3 * (key_width + key_gap), 484, field_width - 3 * (key_width + key_gap), key_height, TRUE);
+  }
+  if (app.mock_estop_button) MoveWindow(app.mock_estop_button, left, 516, field_width, 32, TRUE);
+  if (app.mock_info) MoveWindow(app.mock_info, left, 558, field_width, 80, TRUE);
 }
 
 void fill(HDC dc, int left, int top, int right, int bottom, HBRUSH brush) {
@@ -907,24 +966,39 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       app->start = control(hwnd, L"BUTTON", L"连接视频", BS_OWNERDRAW, 0, 0, 1, 1, 1);
       app->stop = control(hwnd, L"BUTTON", L"断开", BS_OWNERDRAW, 0, 0, 1, 1, 2);
       app->help = control(hwnd, L"STATIC", app->mock_control ?
-          L"仅限隔离 mock 台架，零车速\nW / S 前后    A / D 转向\n空格 缓刹    B 急刹\nE 急停" :
+          L"按键状态 · E 急停 · 非执行确认" :
           L"仅观看台架画面\n控制功能保持禁用", 0, 0, 0, 1, 1);
+      if (app->mock_control) {
+        constexpr std::array<const wchar_t*, 6> captions{L"↑ W", L"← A", L"↓ S", L"→ D", L"SPACE 缓刹", L"B 急刹"};
+        for (std::size_t i = 0; i < captions.size(); ++i)
+          app->keycaps[i] = control(hwnd, L"STATIC", captions[i], SS_OWNERDRAW, 0, 0, 1, 1, 20 + static_cast<int>(i));
+      }
       if (app->mock_control) app->mock_info = control(hwnd, L"STATIC", app->mock_message.c_str(), 0, 0, 0, 1, 1);
       if (app->mock_control) app->mock_estop_button = control(hwnd, L"BUTTON", L"请求急停", BS_OWNERDRAW, 0, 0, 1, 1, 3);
       EnableWindow(app->stop, FALSE);
       if (app->mock_estop_button) EnableWindow(app->mock_estop_button, FALSE);
       if (app->mock_control) app->message = L"隔离 mock 控制台：等待连接和安全条件。";
       app->status = control(hwnd, L"STATIC", app->message.c_str(), 0, 0, 0, 1, 1);
+      {
+        constexpr std::array<const wchar_t*, 6> labels{L"实测车速", L"实际挡位", L"指令挡位", L"转向", L"目标车速比例", L"刹车"};
+        for (std::size_t i = 0; i < labels.size(); ++i) {
+          app->operator_labels[i] = control(hwnd, L"STATIC", labels[i], 0, 0, 0, 1, 1);
+          app->operator_readouts[i] = control(hwnd, L"STATIC", L"—", 0, 0, 0, 1, 1);
+        }
+      }
       app->video[0] = control(hwnd, L"MineTeleopNativePanel", L"", 0, 0, 0, 1, 1, 10);
       app->video[1] = control(hwnd, L"MineTeleopNativePanel", L"", 0, 0, 0, 1, 1, 11);
       for (auto child = GetWindow(hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT))
         SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(app->font), TRUE);
+      for (const auto value : app->operator_readouts)
+        SendMessageW(value, WM_SETFONT, reinterpret_cast<WPARAM>(app->title_font), TRUE);
+      if (app->mock_control) SendMessageW(app->help, WM_SETFONT, reinterpret_cast<WPARAM>(app->small_font), TRUE);
       { RECT rect{}; GetClientRect(hwnd, &rect); layout(*app, rect.right, rect.bottom); }
       SetTimer(hwnd, 1, 1000, nullptr);
       if (app->mock_control) SetTimer(hwnd, 2, 50, nullptr);
       return 0;
     case WM_SIZE: {
-      if (wparam == SIZE_MINIMIZED) { app->keyboard.withdraw(); app->suspend_render_health(); }
+      if (wparam == SIZE_MINIMIZED) { app->keyboard.withdraw(); app->clear_input_display(); app->suspend_render_health(); }
       layout(*app, LOWORD(lparam), HIWORD(lparam));
       InvalidateRect(hwnd, nullptr, TRUE);
       return 0;
@@ -941,12 +1015,13 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       fill(dc, 0, 0, rect.right, rect.bottom, app->background);
       fill(dc, 16, 68, rect.right - 16, 111, app->input_background);
       fill(dc, rect.right - 316, 124, rect.right - 16, rect.bottom - 16, app->surface);
+      fill(dc, 16, 120, rect.right - 328, 176, app->surface);
       label(dc, app->title_font, RGB(231, 237, 246), 16, 15, 300, 52, L"Mine Teleop 控制台");
       label(dc, app->small_font, RGB(142, 160, 184), 300, 16, rect.right - 16, 52,
           app->mock_control ? L"Windows 原生端  ·  隔离 mock 台架  ·  零车速" : L"Windows 原生端  ·  仅观看");
-      label(dc, app->font, RGB(231, 237, 246), 16, 123, rect.right - 330, 153, L"实时视频");
+      label(dc, app->font, RGB(231, 237, 246), 16, 180, rect.right - 330, 205, L"实时视频");
       label(dc, app->font, RGB(231, 237, 246), rect.right - 300, 138, rect.right - 32, 168, L"连接与控制");
-      label(dc, app->small_font, RGB(142, 160, 184), rect.right - 300, 451, rect.right - 32, 474,
+      label(dc, app->small_font, RGB(142, 160, 184), rect.right - 300, 401, rect.right - 32, 425,
           app->mock_control ? L"键盘控制" : L"操作说明");
       EndPaint(hwnd, &ps);
       return 0;
@@ -955,7 +1030,8 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       auto* dc = reinterpret_cast<HDC>(wparam);
       const auto child = reinterpret_cast<HWND>(lparam);
       const bool is_status = child == app->status;
-      SetTextColor(dc, is_status ? RGB(231, 237, 246) : RGB(142, 160, 184));
+      const bool is_readout = std::find(app->operator_readouts.begin(), app->operator_readouts.end(), child) != app->operator_readouts.end();
+      SetTextColor(dc, is_status || is_readout ? RGB(231, 237, 246) : RGB(142, 160, 184));
       SetBkColor(dc, is_status ? RGB(17, 31, 50) : RGB(15, 25, 41));
       return reinterpret_cast<LRESULT>(is_status ? app->input_background : app->surface);
     }
@@ -966,6 +1042,17 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     }
     case WM_DRAWITEM: {
       const auto* item = reinterpret_cast<DRAWITEMSTRUCT*>(lparam);
+      if (item->CtlID >= 20 && item->CtlID < 26 && app->mock_control) {
+        const bool pressed = app->shown_keys[item->CtlID - 20];
+        const auto brush = CreateSolidBrush(pressed ? RGB(14, 116, 144) : RGB(30, 47, 68));
+        FillRect(item->hDC, &item->rcItem, brush); DeleteObject(brush);
+        wchar_t caption[32]{}; GetWindowTextW(item->hwndItem, caption, 32);
+        SetBkMode(item->hDC, TRANSPARENT); SetTextColor(item->hDC, RGB(231, 237, 246));
+        const auto old = SelectObject(item->hDC, app->small_font);
+        RECT bounds = item->rcItem; DrawTextW(item->hDC, caption, -1, &bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(item->hDC, old);
+        return TRUE;
+      }
       if (item->CtlID != 1 && item->CtlID != 2 && item->CtlID != 3) return DefWindowProcW(hwnd, msg, wparam, lparam);
       const bool enabled = !(item->itemState & ODS_DISABLED);
       const COLORREF color = !enabled ? RGB(38, 54, 77) : item->CtlID == 1 ? RGB(14, 116, 144) :
@@ -980,7 +1067,7 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       return TRUE;
     }
     case WM_ACTIVATE:
-      if (LOWORD(wparam) == WA_INACTIVE) { app->keyboard.withdraw(); app->suspend_render_health(); }
+      if (LOWORD(wparam) == WA_INACTIVE) { app->keyboard.withdraw(); app->clear_input_display(); app->suspend_render_health(); }
       else for (const auto panel : app->video) InvalidateRect(panel, nullptr, FALSE);
       return 0;
     case WM_COMMAND:
@@ -1016,6 +1103,16 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     }
     case WM_APP + 2: {
       std::lock_guard lock(app->mutex);
+      const bool stale = !app->running.load() || !detail::native_mock_input_fresh(
+          app->last_mock_observation_ms.load(), static_cast<std::int64_t>(bench_now_ms()));
+      const auto focus = GetFocus();
+      const bool input_focused = GetForegroundWindow() == hwnd &&
+          (focus == hwnd || focus == app->video[0] || focus == app->video[1]);
+      for (std::size_t i = 0; i < app->operator_readouts.size(); ++i) {
+        const bool hidden = stale || (i >= 2 && (!input_focused || app->mock_estop_requested.load()));
+        SetWindowTextW(app->operator_readouts[i], hidden ? L"—" : app->operator_values[i].c_str());
+      }
+      app->operator_display_stale = stale;
       if (app->mock_info) SetWindowTextW(app->mock_info,
           app->running.load() && app->last_mock_observation_ms.load() > 0 && !detail::native_mock_input_fresh(
               app->last_mock_observation_ms.load(), static_cast<std::int64_t>(bench_now_ms()))
@@ -1033,9 +1130,23 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         if (app->mock_info && app->running.load() && app->last_mock_observation_ms.load() > 0 &&
             !detail::native_mock_input_fresh(app->last_mock_observation_ms.load(), static_cast<std::int64_t>(bench_now_ms())))
           SetWindowTextW(app->mock_info, L"控制状态过期，请停止操作\n画面与校时状态未知");
-        app->keyboard.observe(focused,
-            {down('W') || down(VK_UP), down('A') || down(VK_LEFT), down('D') || down(VK_RIGHT),
-             down(VK_SPACE), down('B'), down('S') || down(VK_DOWN)}, static_cast<std::int64_t>(bench_now_ms()));
+        if (!app->operator_display_stale && !detail::native_mock_input_fresh(
+                app->last_mock_observation_ms.load(), static_cast<std::int64_t>(bench_now_ms()))) {
+          for (const auto readout : app->operator_readouts) SetWindowTextW(readout, L"—");
+          app->operator_display_stale = true;
+        }
+        const bool up = down('W') || down(VK_UP), left = down('A') || down(VK_LEFT);
+        const bool right = down('D') || down(VK_RIGHT), reverse = down('S') || down(VK_DOWN);
+        const bool brake = down(VK_SPACE), hard_brake = down('B');
+        const std::array<bool, 6> displayed{focused && up, focused && left, focused && reverse,
+                                            focused && right, focused && brake, focused && hard_brake};
+        for (std::size_t i = 0; i < displayed.size(); ++i) {
+          if (displayed[i] != app->shown_keys[i]) {
+            app->shown_keys[i] = displayed[i]; InvalidateRect(app->keycaps[i], nullptr, TRUE);
+          }
+        }
+        app->keyboard.observe(focused, {up, left, right, brake, hard_brake, reverse},
+            static_cast<std::int64_t>(bench_now_ms()));
         return 0;
       }
       if (wparam == 1 && app->running.load() && detail::viewer_observation_stale(

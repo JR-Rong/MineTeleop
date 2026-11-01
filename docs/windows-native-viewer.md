@@ -34,6 +34,13 @@ telemetry or control readiness is lost. Held keys must be released before a
 new press can take effect after a loss. There is no production emergency-stop
 input or authorization in this prototype.
 
+The native status strip follows the web console's distinction between measured
+speed and gear and locally requested gear, steering, throttle and brake.
+Measured values require fresh vehicle telemetry, including its source time;
+requested values require a fresh accepted local input and active authorization.
+Unknown or stale values display as `—`. Keyboard highlights describe local key
+state, not vehicle receipt or physical actuation, and clear on focus loss.
+
 An additional dual-control experiment requires the vehicle process to set
 `MINE_TELEOP_MOCK_DUAL_CONTROL=1`; the vehicle advertises it only for a
 `test_bench_` identity, mock adapter and zero speed. The mock native viewer
