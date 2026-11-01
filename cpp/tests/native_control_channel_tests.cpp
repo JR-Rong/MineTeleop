@@ -24,7 +24,7 @@ struct Peer {
   GstWebRTCDataChannel* decoy{};
   std::mutex mutex;
   std::vector<std::pair<guint, std::string>> candidates;
-  std::atomic<bool> open{false}, received{false}, courier_command_received{false}, compact_received{false};
+  std::atomic<bool> open{false}, received{false}, courier_command_received{false}, compact_received{false}, compact_dual_received{false};
   Peer() {
     require(pipeline && rtc, "webrtcbin unavailable");
     gst_bin_add(GST_BIN(pipeline), rtc);
@@ -70,8 +70,11 @@ struct Peer {
         const mine_teleop::detail::MockCompactScope scope{"vehicle-001", "driver-001", "session-001", "fixture", "media-a"};
         const auto value = mine_teleop::detail::decode_mock_compact_control(std::span<const std::uint8_t>(raw, size), scope);
         const std::string key = "01234567890123456789012345678901";
-        if (value && mine_teleop::detail::verify_transport_message(*value, key, false) && value->at("seq") == 42)
-          static_cast<Peer*>(data)->compact_received = true;
+        if (value && mine_teleop::detail::verify_transport_message(*value, key, false) && value->at("seq") == 42) {
+          if (value->value("mock_dual_control", "") == mine_teleop::detail::kMockDualControlCapability)
+            static_cast<Peer*>(data)->compact_dual_received = true;
+          else static_cast<Peer*>(data)->compact_received = true;
+        }
       })), this);
     }
     require(gst_element_set_state(pipeline, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE, "PLAYING failed");
@@ -97,7 +100,7 @@ struct Peer {
     for (const auto& [index, text] : pending) g_signal_emit_by_name(other.rtc, "add-ice-candidate", index, text.c_str());
   }
 };
-std::optional<std::vector<std::uint8_t>> compact_fixture() {
+std::optional<std::vector<std::uint8_t>> compact_fixture(bool dual = false) {
   mine_teleop::ControlCommand command;
   command.vehicle_id = "vehicle-001"; command.driver_id = "driver-001";
   command.session_id = "session-001"; command.control_token = "fixture";
@@ -106,9 +109,10 @@ std::optional<std::vector<std::uint8_t>> compact_fixture() {
   frame["intent_seq"] = 43; frame["intent_fresh"] = true; frame["intent_requires_fresh_input"] = false;
   frame["control_transport"] = mine_teleop::detail::ControlTransportStamp{
       2, 1, 42, mine_teleop::detail::ControlPath::DataChannel, "media-a", false}.to_json();
+  if (dual) frame["mock_dual_control"] = mine_teleop::detail::kMockDualControlCapability;
   frame["native_mac"] = mine_teleop::detail::transport_message_mac(
       frame, "01234567890123456789012345678901", false);
-  return mine_teleop::detail::encode_mock_compact_control(frame);
+  return mine_teleop::detail::encode_mock_compact_control(frame, dual);
 }
 }
 int main(int argc, char** argv) {
@@ -151,6 +155,15 @@ int main(int argc, char** argv) {
     while (!a.compact_received && std::chrono::steady_clock::now() < compact_deadline)
       std::this_thread::sleep_for(10ms);
     require(a.compact_received, "signed compact mock message did not survive DataChannel transport");
+    const auto compact_dual = compact_fixture(true);
+    require(compact_dual.has_value(), "compact dual fixture could not encode");
+    bool dual_queued = false;
+    const auto dual_deadline = std::chrono::steady_clock::now() + 3s;
+    while (!a.compact_dual_received && std::chrono::steady_clock::now() < dual_deadline) {
+      if (!dual_queued) dual_queued = courier.send_mock_compact(*compact_dual);
+      std::this_thread::sleep_for(10ms);
+    }
+    require(dual_queued && a.compact_dual_received, "signed compact dual message did not survive DataChannel transport");
 #if GST_CHECK_VERSION(1, 22, 0)
     const auto send_stats = courier.send_stats();
     require(send_stats.queued >= 1 && send_stats.unavailable >= 1 &&
@@ -242,6 +255,12 @@ int main(int argc, char** argv) {
     const auto deadline = std::chrono::steady_clock::now() + 3s;
     while (!a.compact_received && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(10ms);
     require(a.compact_received, "old GStreamer binary channel changed the signed mock message");
+    const auto compact_dual = compact_fixture(true); require(compact_dual.has_value(), "compact dual fixture could not encode");
+    auto* compact_dual_bytes = g_bytes_new(compact_dual->data(), compact_dual->size());
+    g_signal_emit_by_name(b.channel, "send-data", compact_dual_bytes); g_bytes_unref(compact_dual_bytes);
+    const auto dual_deadline = std::chrono::steady_clock::now() + 3s;
+    while (!a.compact_dual_received && std::chrono::steady_clock::now() < dual_deadline) std::this_thread::sleep_for(10ms);
+    require(a.compact_dual_received, "old GStreamer binary channel changed the signed compact dual message");
     std::cout << "PASS fail closed without early DataChannel observation\n";
 #endif
     return 0;
