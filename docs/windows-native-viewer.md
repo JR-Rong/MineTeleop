@@ -17,9 +17,12 @@ is not proof of remote containment: the test harness must verify the remote
 process, mock adapter, zero-speed configuration, CAN-down state and cellular
 route before starting. The profile retains neutral gear, zero speed, zero motor
 torque and zero steering limit; this mode is not a motion-control interface.
-Focus the main viewer or click a video panel. W/up requests mock throttle,
-A/left and D/right request mock steering, S/down/space requests service brake,
-and B requests hard brake. Brake ratios come from the acknowledged session
+Focus the main viewer or click a video panel. W/up and S/down request forward
+and reverse respectively, A/left and D/right request mock steering, space
+requests service brake, and B requests hard brake. A gear change is sent with
+zero traction and steering; the held direction is applied only after fresh
+vehicle telemetry confirms the requested gear at zero speed. Both direction
+keys together request no traction, and braking takes precedence. Brake ratios come from the acknowledged session
 profile; hard brake takes precedence. E or the mock emergency button latches
 an emergency request. The display distinguishes a request from fresh vehicle
 telemetry confirming the software latch; it does not prove physical execution.

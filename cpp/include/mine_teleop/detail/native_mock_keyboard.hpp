@@ -21,8 +21,8 @@ inline bool native_mock_clock_fresh(std::int64_t observed_ms, std::int64_t now_m
 // used by the isolated, zero-speed mock viewer; it cannot authorize motion.
 class NativeMockKeyboard {
  public:
-  struct Keys { bool forward{}, left{}, right{}, brake{}, hard_brake{}; };
-  struct Input { double throttle{}, steering{}, brake{}; };
+  struct Keys { bool forward{}, left{}, right{}, brake{}, hard_brake{}, reverse{}; };
+  struct Input { double throttle{}, steering{}, brake{}; char gear{'N'}; };
 
   // Match the confirmed vehicle profile rather than assuming a fixed pressure.
   // A changed profile invalidates held input until the operator releases it.
@@ -64,14 +64,14 @@ class NativeMockKeyboard {
     return heartbeat_alive_locked(now());
   }
 
-  Input sample(bool safety_ready, std::int64_t now_ms) {
+  Input sample(bool safety_ready, std::int64_t now_ms, char confirmed_gear = 'N') {
     std::lock_guard lock(mutex_);
-    return sample_locked(safety_ready, now_ms);
+    return sample_locked(safety_ready, now_ms, confirmed_gear);
   }
 
-  Input sample_now(bool safety_ready) {
+  Input sample_now(bool safety_ready, char confirmed_gear = 'N') {
     std::lock_guard lock(mutex_);
-    return sample_locked(safety_ready, now());
+    return sample_locked(safety_ready, now(), confirmed_gear);
   }
  private:
   static std::int64_t now() {
@@ -90,21 +90,26 @@ class NativeMockKeyboard {
         now_ms - observed_at_ms_ < 150;
   }
 
-  Input sample_locked(bool safety_ready, std::int64_t now_ms) {
+  Input sample_locked(bool safety_ready, std::int64_t now_ms, char confirmed_gear) {
     if (!safety_ready || !profile_ready_ || !focused_ || observed_at_ms_ <= 0 || now_ms < observed_at_ms_ ||
-        now_ms - observed_at_ms_ >= 150) {
+        now_ms - observed_at_ms_ >= 150 || (confirmed_gear != 'N' && confirmed_gear != 'D' && confirmed_gear != 'R')) {
       needs_release_ = true;
       return {};
     }
-    const bool any = keys_.forward || keys_.left || keys_.right || keys_.brake || keys_.hard_brake;
+    const bool any = keys_.forward || keys_.reverse || keys_.left || keys_.right || keys_.brake || keys_.hard_brake;
     if (needs_release_) {
       if (!any) needs_release_ = false;
       return {};
     }
-    // Braking wins over forward input. Opposing steering keys cancel out.
-    return {keys_.forward && !keys_.brake && !keys_.hard_brake ? 0.25 : 0.0,
+    // Ask for a gear change with no traction or steering, and wait for fresh
+    // vehicle telemetry to confirm it before applying the held direction.
+    const bool braking = keys_.brake || keys_.hard_brake;
+    const char requested = keys_.forward == keys_.reverse ? confirmed_gear : (keys_.forward ? 'D' : 'R');
+    if (!braking && requested != confirmed_gear) return {0.0, 0.0, 0.0, requested};
+    // Braking wins over traction. Opposing directions and steering cancel.
+    return {keys_.forward != keys_.reverse && !braking ? 0.25 : 0.0,
             keys_.left == keys_.right ? 0.0 : (keys_.left ? -0.25 : 0.25),
-            keys_.hard_brake ? hard_brake_ : (keys_.brake ? service_brake_ : 0.0)};
+            keys_.hard_brake ? hard_brake_ : (keys_.brake ? service_brake_ : 0.0), confirmed_gear};
   }
   std::mutex mutex_;
   Keys keys_{};

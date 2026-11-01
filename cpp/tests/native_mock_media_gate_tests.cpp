@@ -101,7 +101,7 @@ void test_mock_keyboard_rearms_only_after_release() {
   keyboard.observe(true, Keys{}, 100);
   require(keyboard.sample(true, 101).throttle == 0.0, "initial neutral did not arm");
   keyboard.observe(true, Keys{true, true, false, false}, 110);
-  auto input = keyboard.sample(true, 111);
+  auto input = keyboard.sample(true, 111, 'D');
   require(input.throttle == .25 && input.steering == -.25 && input.brake == 0.0,
           "foreground mock keys were not mapped");
   require(keyboard.sample(false, 112).throttle == 0.0, "safety loss did not neutralize input");
@@ -138,7 +138,51 @@ void test_mock_keyboard_rearms_only_after_release() {
   require(keyboard.sample(true, 291).throttle == 0.0, "focus recovery resumed a held key");
   keyboard.observe(true, Keys{}, 300); static_cast<void>(keyboard.sample(true, 301));
   keyboard.observe(true, Keys{true, false, false, false}, 310);
-  require(keyboard.sample(true, 311).throttle == .25, "released key could not be freshly pressed");
+  require(keyboard.sample(true, 311, 'D').throttle == .25, "released key could not be freshly pressed");
+}
+void test_mock_direction_combinations_require_gear_confirmation() {
+  using Keyboard = mine_teleop::detail::NativeMockKeyboard;
+  Keyboard keyboard;
+  keyboard.set_brake_profile(30, 80, 100);
+  keyboard.observe(true, {}, 100);
+  static_cast<void>(keyboard.sample(true, 100));
+  struct Case { Keyboard::Keys keys; char confirmed; char requested; double throttle, steering, brake; };
+  const Case cases[] = {
+      {{true, false, false, false, false, false}, 'D', 'D', .25, 0, 0},
+      {{false, false, false, false, false, true}, 'R', 'R', .25, 0, 0},
+      {{false, true, false, false, false, false}, 'N', 'N', 0, -.25, 0},
+      {{false, false, true, false, false, false}, 'N', 'N', 0, .25, 0},
+      {{true, true, false, false, false, false}, 'D', 'D', .25, -.25, 0},
+      {{true, false, true, false, false, false}, 'D', 'D', .25, .25, 0},
+      {{false, true, false, false, false, true}, 'R', 'R', .25, -.25, 0},
+      {{false, false, true, false, false, true}, 'R', 'R', .25, .25, 0},
+      {{false, false, false, true, false, false}, 'N', 'N', 0, 0, .3},
+  };
+  std::int64_t now = 110;
+  for (const auto& test : cases) {
+    keyboard.observe(true, test.keys, now);
+    const auto input = keyboard.sample(true, now, test.confirmed);
+    require(input.gear == test.requested && input.throttle == test.throttle &&
+        input.steering == test.steering && input.brake == test.brake, "mock directional combination changed");
+    ++now;
+  }
+  keyboard.observe(true, {false, true, false, false, false, true}, now++);
+  auto input = keyboard.sample(true, now, 'D');
+  require(input.gear == 'R' && input.throttle == 0 && input.steering == 0,
+      "reverse gear request applied input before telemetry confirmation");
+  input = keyboard.sample(true, now, 'R');
+  require(input.gear == 'R' && input.throttle == .25 && input.steering == -.25,
+      "confirmed reverse did not admit reverse-left input");
+  keyboard.observe(true, {true, false, false, true, false, false}, now++);
+  input = keyboard.sample(true, now, 'R');
+  require(input.gear == 'R' && input.throttle == 0 && input.brake == .3,
+      "brake failed to inhibit a concurrent gear change");
+  keyboard.observe(true, {true, false, false, false, false, true}, now++);
+  input = keyboard.sample(true, now, 'D');
+  require(input.gear == 'D' && input.throttle == 0, "opposing directions produced traction");
+  require(keyboard.sample(true, now, 'P').gear == 'N', "unsupported gear retained control input");
+  require(keyboard.sample(false, now, 'R').gear == 'N', "safety loss retained drive gear");
+  require(keyboard.sample(true, now, 'R').throttle == 0, "held key resumed after safety loss");
 }
 void test_live_clock_keyboard_and_media_guard() {
   using Clock = std::chrono::steady_clock;
@@ -151,7 +195,7 @@ void test_live_clock_keyboard_and_media_guard() {
   require(keyboard.heartbeat_alive_now(), "live keyboard heartbeat missing");
   static_cast<void>(keyboard.sample_now(true));
   keyboard.observe(true, Keys{true, false, false, false}, now());
-  require(keyboard.sample_now(true).throttle == .25, "live keyboard did not accept a fresh held key");
+  require(keyboard.sample_now(true, 'D').throttle == .25, "live keyboard did not accept a fresh held key");
   require(keyboard.sample_now(false).throttle == 0, "live keyboard did not revoke an unsafe held key");
   require(keyboard.sample_now(true).throttle == 0, "live keyboard resumed without a fresh release");
 
@@ -173,6 +217,6 @@ void test_live_clock_keyboard_and_media_guard() {
           "500 ms clock observation boundary changed");
 }
 }
-int main() { try { test_gate(); test_neutral_refresh_sequence(); test_profile_retry_stays_bounded_and_needs_live_guards(); test_dtls_header_trace_is_bounded_and_excludes_payloads(); test_mock_keyboard_rearms_only_after_release(); test_live_clock_keyboard_and_media_guard();
+int main() { try { test_gate(); test_neutral_refresh_sequence(); test_profile_retry_stays_bounded_and_needs_live_guards(); test_dtls_header_trace_is_bounded_and_excludes_payloads(); test_mock_keyboard_rearms_only_after_release(); test_mock_direction_combinations_require_gear_confirmation(); test_live_clock_keyboard_and_media_guard();
   std::cout << "PASS scoped mock media, input renewal, keyboard and clock guard\n"; return 0; }
 catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; } }

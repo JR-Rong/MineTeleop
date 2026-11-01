@@ -218,6 +218,7 @@ struct Window {
     // The sender independently checks its current clock before publication.
     std::atomic<bool> input_failed{false};
     std::atomic<std::int64_t> clock_observed_ms{0}, input_authorized_at_ms{0};
+    std::atomic<char> mock_confirmed_gear{'N'};
     // Clock health must not depend on a courier/bridge cycle completing. The
     // observation age is measured from the start of the actual snapshot, so a
     // blocked clock read cannot make old evidence look fresh.
@@ -297,13 +298,13 @@ struct Window {
               previous_guard = state;
             }
           }
-          const auto keyboard_input = keyboard.sample_now(ready && authorized && !mock_estop_requested.load());
+          const auto keyboard_input = keyboard.sample_now(ready && authorized && !mock_estop_requested.load(), mock_confirmed_gear.load());
           const auto current_epoch = epoch.load();
           const bool estop = mock_estop_requested.load();
           if (estop || ((ready || current_epoch != 0) && (ui_alive || !withdrawn))) {
             Json input{{"session_id", session_id}, {"session_generation", generation},
                 {"ui_instance_id", owner}, {"ui_control_epoch", current_epoch}, {"takeover", !estop && current_epoch == 0},
-                {"gear", "N"}, {"steering", keyboard_input.steering},
+                {"gear", std::string(1, keyboard_input.gear)}, {"steering", keyboard_input.steering},
                 {"throttle", keyboard_input.throttle}, {"brake", keyboard_input.brake},
                 {"estop", estop}, {"critical_video_ready", ready},
                 {"critical_video_sample_healthy", ready && video_health.sample_healthy},
@@ -457,12 +458,14 @@ struct Window {
       // The courier may have delivered newer telemetry after the loop's
       // initial timestamp. Compare against a clock read taken after delivery.
       const auto authorization_observed_ms = static_cast<std::int64_t>(bench_now_ms());
+      const auto telemetry_gear = telemetry.is_object() ? telemetry.value("gear", "") : std::string{};
       const bool authorized = !mock_estop_requested.load() && ready && profile_accepted && handshake_sent &&
           detail::native_mock_input_fresh(telemetry_at_ms, authorization_observed_ms) && telemetry.is_object() &&
           telemetry.value("safety_state", "") == "CONTROL_ACTIVE" &&
-          !telemetry.value("braking_wait", true) && telemetry.value("gear", "") == "N" &&
+          !telemetry.value("braking_wait", true) && (telemetry_gear == "N" || telemetry_gear == "D" || telemetry_gear == "R") &&
           telemetry.contains("speed_mps") && telemetry.at("speed_mps").is_number() &&
           telemetry.at("speed_mps").get<double>() == 0.0;
+      if (authorized) mock_confirmed_gear.store(telemetry_gear.front());
       input_authorized_at_ms.store(authorized ? authorization_observed_ms : 0);
       if (now >= next_mock_ui) {
         const auto native = status.at("native_control");
@@ -869,7 +872,7 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       app->start = control(hwnd, L"BUTTON", L"连接视频", BS_OWNERDRAW, 0, 0, 1, 1, 1);
       app->stop = control(hwnd, L"BUTTON", L"断开", BS_OWNERDRAW, 0, 0, 1, 1, 2);
       app->help = control(hwnd, L"STATIC", app->mock_control ?
-          L"仅限隔离 mock 台架，零车速\nW / ↑ 油门    A / D 转向\nS / 空格 缓刹    B 急刹\nE 急停" :
+          L"仅限隔离 mock 台架，零车速\nW / S 前后    A / D 转向\n空格 缓刹    B 急刹\nE 急停" :
           L"仅观看台架画面\n控制功能保持禁用", 0, 0, 0, 1, 1);
       if (app->mock_control) app->mock_info = control(hwnd, L"STATIC", app->mock_message.c_str(), 0, 0, 0, 1, 1);
       if (app->mock_control) app->mock_estop_button = control(hwnd, L"BUTTON", L"请求急停", BS_OWNERDRAW, 0, 0, 1, 1, 3);
@@ -997,7 +1000,7 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
           SetWindowTextW(app->mock_info, L"控制状态过期，请停止操作\n画面与校时状态未知");
         app->keyboard.observe(focused,
             {down('W') || down(VK_UP), down('A') || down(VK_LEFT), down('D') || down(VK_RIGHT),
-             down('S') || down(VK_DOWN) || down(VK_SPACE), down('B')}, static_cast<std::int64_t>(bench_now_ms()));
+             down(VK_SPACE), down('B'), down('S') || down(VK_DOWN)}, static_cast<std::int64_t>(bench_now_ms()));
         return 0;
       }
       if (wparam == 1 && app->running.load() && detail::viewer_observation_stale(
