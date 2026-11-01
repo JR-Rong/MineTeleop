@@ -230,6 +230,7 @@ struct Window {
   std::atomic<std::int64_t> last_mock_observation_ms{0};
   std::atomic<bool> mock_estop_requested{false};
   std::atomic<bool> mock_profile_needs_confirmation{false}, mock_profile_confirmation_requested{false};
+  std::atomic<bool> mock_profile_reconnect_required{false};
   std::atomic<bool> mock_ui_posted{false};
   detail::NativeMockKeyboard keyboard;
   std::mutex gamepad_mutex;
@@ -608,12 +609,13 @@ struct Window {
         const auto transport = status.at("native_control").at("control_transport");
         const bool negotiated = transport.value("epoch", 0) > 0 && !transport.value("selecting", true);
         const auto recovery_state = telemetry.is_object() ? telemetry.value("safety_state", "") : std::string{};
-        if (mock_profile_confirmation_requested.load() && mock_profile_needs_confirmation.load() &&
-            (recovery_state == "TIMEOUT_BRAKE" || recovery_state == "ESTOP" || recovery_state == "FAULT")) {
+        if (mock_profile_needs_confirmation.load() &&
+            (recovery_state == "TIMEOUT_BRAKE" || recovery_state == "ESTOP" || recovery_state == "FAULT") &&
+            !mock_profile_reconnect_required.exchange(true)) {
           mock_profile_confirmation_requested.store(false);
           report(L"车端处于超时制动或故障锁定；请断开会话并按安全流程重新连接，不能仅靠限幅确认恢复。");
         }
-        if (mock_profile_confirmation_requested.load() && mock_profile_needs_confirmation.load() &&
+        if (!mock_profile_reconnect_required.load() && mock_profile_confirmation_requested.load() && mock_profile_needs_confirmation.load() &&
             ready && negotiated && requested_profile && !mock_estop_requested.load() &&
             detail::native_mock_input_fresh(telemetry_at_ms, static_cast<std::int64_t>(bench_now_ms())) &&
             detail::native_mock_source_fresh(telemetry_source_ms,
@@ -1129,8 +1131,11 @@ struct Window {
                   case detail::ViewerPath::unknown: break;
                 }
               }
-              report((advancing ? L"渲染提交持续更新 · " : L"等待新画面或画面停滞 · ") + path +
-                  (mock_control ? L" · 隔离 mock，零速" : L" · 仅观看，控制禁用"));
+              if (mock_control && mock_profile_reconnect_required.load())
+                report(L"车端处于超时制动或故障锁定；请断开会话并按安全流程重新连接，不能仅靠限幅确认恢复。");
+              else
+                report((advancing ? L"渲染提交持续更新 · " : L"等待新画面或画面停滞 · ") + path +
+                    (mock_control ? L" · 隔离 mock，零速" : L" · 仅观看，控制禁用"));
               next_observation = Clock::now() + 1s;
             }
           }
@@ -1394,6 +1399,7 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       return 0;
     case WM_COMMAND:
       if (LOWORD(wparam) == 1 && app->running.load() && app->mock_profile_needs_confirmation.load()) {
+        if (app->mock_profile_reconnect_required.load()) return 0;
         app->keyboard.withdraw();
         app->mock_profile_confirmation_requested.store(true);
         EnableWindow(app->start, FALSE);
@@ -1418,6 +1424,7 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
           app->mock_estop_requested.store(false);
           app->mock_profile_needs_confirmation.store(false);
           app->mock_profile_confirmation_requested.store(false);
+          app->mock_profile_reconnect_required.store(false);
           auto secret = text_of(app->password);
           auto driver = utf8(text_of(app->driver_config)), vehicle = utf8(text_of(app->vehicle_config));
           auto requested_driver = utf8(detail::native_trim_identity(text_of(app->driver_id)));
@@ -1451,9 +1458,10 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       SetWindowTextW(app->status, app->message.c_str());
       { std::lock_guard selection_lock(app->selection_mutex);
         const bool confirm_profile = app->running.load() && app->mock_profile_needs_confirmation.load();
+        const bool reconnect_required = confirm_profile && app->mock_profile_reconnect_required.load();
         EnableWindow(app->start, !app->running.load() || (app->awaiting_selection && !app->selection_busy) ||
-            (confirm_profile && !app->mock_profile_confirmation_requested.load()));
-        if (confirm_profile) SetWindowTextW(app->start, L"重新确认限幅");
+            (confirm_profile && !reconnect_required && !app->mock_profile_confirmation_requested.load()));
+        if (confirm_profile) SetWindowTextW(app->start, reconnect_required ? L"请断开重连" : L"重新确认限幅");
         if (!app->running.load()) {
           ShowWindow(app->can_detail, SW_HIDE);
           for (const auto label : app->config_labels) ShowWindow(label, SW_SHOW);

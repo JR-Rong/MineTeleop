@@ -135,3 +135,39 @@ the sampled observations, while the logical control path alternated between
 DC and WSS. The failure does not justify relaxing the safety state or treating
 the accepted profile request as evidence of recovery. Raw evidence is retained
 under `ui-profile-01-4bf` in the local artifact directory.
+
+## Third 30-minute attempt
+
+Viewer `4bf10ce` ran 264.21 seconds before a control-link safety stop. All
+263 sampled observations retained the pinned direct UDP pair; the control
+path was DC for 259 and WSS for four observations. All nine input scenarios
+were covered, and 43 of 44 scheduled input windows matched an accepted
+vehicle command; the final unmatched window overlapped the stop. There was
+one video-not-ready sample and no clock-threshold violation. All accepted
+mock traction and steering values remained zero.
+
+In the failure window, the last accepted DC command arrived approximately
+540 ms before the vehicle reported its stop. Several WSS commands then
+arrived 264–466 ms after the sender timestamp, allowing for cross-host clock
+uncertainty; callback-to-control-mutex waits for those commands were at most
+1 ms. A one-second Windows-to-Wi-Fi-gateway probe timed out in the same
+window. This correlates with a disruption on a shared access path or in host
+scheduling, but cannot isolate its cause. The two decoded-frame callback
+intervals peaked at about 608 and 426 ms; decoded callback to GDI submission
+peaked at about 12.4 and 11.6 ms. These are not capture-to-display latency.
+Raw evidence is retained under `ui-long-03-4bf` in the local artifact directory.
+
+## Fourth 30-minute attempt
+
+Viewer `4bf10ce` ran 493.98 seconds before the harness observed a WSS control
+selection and stopped the run. The pinned direct UDP pair remained selected
+in all 491 observations; 490 sampled the DC logical path and one sampled WSS.
+All 82 scheduled input windows matched accepted mock commands, covering all
+nine scenarios. The once-per-second client observations missed the final
+stop, but the final render summary counted one and the vehicle recorded a
+`control_link` braking wait. The requested uninterrupted run therefore did
+not pass. The vehicle recorded DC commands up to approximately 2.1 seconds
+old; the Windows-to-gateway probe timed out approximately 1.8 seconds before
+the vehicle event. Clock uncertainty and the one-second probe interval limit
+attribution. Raw evidence is retained under `ui-long-04-4bf` in the local
+artifact directory.
