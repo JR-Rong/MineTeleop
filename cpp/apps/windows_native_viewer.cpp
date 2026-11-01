@@ -126,6 +126,10 @@ struct RenderSession {
 
 struct Window {
   HWND hwnd{}, driver_config{}, vehicle_config{}, password{}, status{}, start{}, stop{};
+  std::array<HWND, 3> config_labels{};
+  HWND help{};
+  HFONT font{}, title_font{}, small_font{};
+  HBRUSH background{}, surface{}, input_background{};
   std::array<HWND, 2> video{};
   std::mutex mutex;
   std::mutex render_mutex;
@@ -724,6 +728,41 @@ HWND control(HWND parent, const wchar_t* type, const wchar_t* caption, DWORD sty
       parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
 }
 
+void layout(Window& app, int width, int height) {
+  if (!app.video[0]) return;
+  constexpr int gap = 12, margin = 16, side_width = 300;
+  const int side_x = width - margin - side_width;
+  const int video_width = std::max(1, (side_x - 3 * margin) / 2);
+  const int video_height = std::max(1, height - 202);
+  MoveWindow(app.status, margin + 12, 78, width - 2 * margin - 24, 24, TRUE);
+  for (int i = 0; i < 2; ++i)
+    MoveWindow(app.video[i], margin + i * (video_width + gap), 162, video_width, video_height, TRUE);
+  const int left = side_x + 16, field_width = side_width - 32;
+  for (int i = 0; i < 3; ++i) {
+    MoveWindow(app.config_labels[i], left, 188 + i * 67, field_width, 20, TRUE);
+    HWND field = i == 0 ? app.driver_config : (i == 1 ? app.vehicle_config : app.password);
+    MoveWindow(field, left, 210 + i * 67, field_width, 28, TRUE);
+  }
+  MoveWindow(app.start, left, 414, (field_width - gap) / 2, 34, TRUE);
+  MoveWindow(app.stop, left + (field_width + gap) / 2, 414, (field_width - gap) / 2, 34, TRUE);
+  MoveWindow(app.help, left, 477, field_width, 70, TRUE);
+}
+
+void fill(HDC dc, int left, int top, int right, int bottom, HBRUSH brush) {
+  RECT rect{left, top, right, bottom};
+  FillRect(dc, &rect, brush);
+}
+
+void label(HDC dc, HFONT font, COLORREF color, int left, int top, int right, int bottom,
+           const wchar_t* text) {
+  const auto previous = SelectObject(dc, font);
+  SetTextColor(dc, color);
+  SetBkMode(dc, TRANSPARENT);
+  RECT rect{left, top, right, bottom};
+  DrawTextW(dc, text, -1, &rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+  SelectObject(dc, previous);
+}
+
 LRESULT CALLBACK panel_procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
   auto* app = reinterpret_cast<Window*>(GetWindowLongPtrW(GetParent(hwnd), GWLP_USERDATA));
   if (msg == WM_LBUTTONDOWN && app && app->mock_control) { SetFocus(app->hwnd); return 0; }
@@ -750,30 +789,90 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
   if (!app) return DefWindowProcW(hwnd, msg, wparam, lparam);
   switch (msg) {
     case WM_CREATE:
-      control(hwnd, L"STATIC", L"控制端配置", 0, 12, 14, 90, 22);
-      app->driver_config = control(hwnd, L"EDIT", L"configs/driver-console.dev.yaml", WS_BORDER | ES_AUTOHSCROLL, 102, 10, 430, 24);
-      control(hwnd, L"STATIC", L"车端台架配置", 0, 12, 46, 90, 22);
-      app->vehicle_config = control(hwnd, L"EDIT", L"configs/vehicle-agent.orin-cpu-bench.yaml", WS_BORDER | ES_AUTOHSCROLL, 102, 42, 430, 24);
-      control(hwnd, L"STATIC", L"驾驶员密码", 0, 12, 78, 90, 22);
-      app->password = control(hwnd, L"EDIT", L"", WS_BORDER | ES_PASSWORD | ES_AUTOHSCROLL, 102, 74, 230, 24);
-      app->start = control(hwnd, L"BUTTON", L"连接视频", BS_PUSHBUTTON, 345, 73, 88, 26, 1);
-      app->stop = control(hwnd, L"BUTTON", L"断开", BS_PUSHBUTTON, 444, 73, 88, 26, 2);
-      if (app->mock_control)
-        control(hwnd, L"STATIC", L"仅 mock：W/↑ 油门 · A/D 转向 · S/空格 制动", 0, 545, 78, 390, 22);
+      app->background = CreateSolidBrush(RGB(8, 16, 29));
+      app->surface = CreateSolidBrush(RGB(15, 25, 41));
+      app->input_background = CreateSolidBrush(RGB(17, 31, 50));
+      app->font = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+      app->title_font = CreateFontW(-21, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+      app->small_font = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+      app->config_labels[0] = control(hwnd, L"STATIC", L"控制端配置", 0, 0, 0, 1, 1);
+      app->driver_config = control(hwnd, L"EDIT", L"configs/driver-console.dev.yaml", WS_BORDER | ES_AUTOHSCROLL, 0, 0, 1, 1);
+      app->config_labels[1] = control(hwnd, L"STATIC", L"车端台架配置", 0, 0, 0, 1, 1);
+      app->vehicle_config = control(hwnd, L"EDIT", L"configs/vehicle-agent.orin-cpu-bench.yaml", WS_BORDER | ES_AUTOHSCROLL, 0, 0, 1, 1);
+      app->config_labels[2] = control(hwnd, L"STATIC", L"驾驶员密码", 0, 0, 0, 1, 1);
+      app->password = control(hwnd, L"EDIT", L"", WS_BORDER | ES_PASSWORD | ES_AUTOHSCROLL, 0, 0, 1, 1);
+      app->start = control(hwnd, L"BUTTON", L"连接视频", BS_OWNERDRAW, 0, 0, 1, 1, 1);
+      app->stop = control(hwnd, L"BUTTON", L"断开", BS_OWNERDRAW, 0, 0, 1, 1, 2);
+      app->help = control(hwnd, L"STATIC", app->mock_control ?
+          L"仅限隔离 mock 台架，零车速\nW / ↑ 油门    A / D 转向\nS / 空格 制动" :
+          L"仅观看台架画面\n控制功能保持禁用", 0, 0, 0, 1, 1);
       EnableWindow(app->stop, FALSE);
-      app->status = control(hwnd, L"STATIC", app->message.c_str(), 0, 12, 108, 900, 25);
-      app->video[0] = control(hwnd, L"MineTeleopNativePanel", L"", 0, 12, 140, 460, 300, 10);
-      app->video[1] = control(hwnd, L"MineTeleopNativePanel", L"", 0, 480, 140, 460, 300, 11);
+      if (app->mock_control) app->message = L"隔离 mock 控制台：等待连接和安全条件。";
+      app->status = control(hwnd, L"STATIC", app->message.c_str(), 0, 0, 0, 1, 1);
+      app->video[0] = control(hwnd, L"MineTeleopNativePanel", L"", 0, 0, 0, 1, 1, 10);
+      app->video[1] = control(hwnd, L"MineTeleopNativePanel", L"", 0, 0, 0, 1, 1, 11);
+      for (auto child = GetWindow(hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT))
+        SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(app->font), TRUE);
+      { RECT rect{}; GetClientRect(hwnd, &rect); layout(*app, rect.right, rect.bottom); }
       SetTimer(hwnd, 1, 1000, nullptr);
       if (app->mock_control) SetTimer(hwnd, 2, 50, nullptr);
       return 0;
     case WM_SIZE: {
       if (wparam == SIZE_MINIMIZED) { app->keyboard.withdraw(); app->suspend_render_health(); }
-      const int width = LOWORD(lparam), height = HIWORD(lparam);
-      const int panel_width = std::max(1, (width - 36) / 2), panel_height = std::max(1, height - 152);
-      MoveWindow(app->video[0], 12, 140, panel_width, panel_height, TRUE);
-      MoveWindow(app->video[1], 24 + panel_width, 140, panel_width, panel_height, TRUE);
+      layout(*app, LOWORD(lparam), HIWORD(lparam));
+      InvalidateRect(hwnd, nullptr, TRUE);
       return 0;
+    }
+    case WM_GETMINMAXINFO: {
+      auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
+      info->ptMinTrackSize = POINT{900, 640};
+      return 0;
+    }
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+      PAINTSTRUCT ps{}; auto* dc = BeginPaint(hwnd, &ps);
+      RECT rect{}; GetClientRect(hwnd, &rect);
+      fill(dc, 0, 0, rect.right, rect.bottom, app->background);
+      fill(dc, 16, 68, rect.right - 16, 111, app->input_background);
+      fill(dc, rect.right - 316, 124, rect.right - 16, rect.bottom - 16, app->surface);
+      label(dc, app->title_font, RGB(231, 237, 246), 16, 15, 300, 52, L"Mine Teleop 控制台");
+      label(dc, app->small_font, RGB(142, 160, 184), 300, 16, rect.right - 16, 52,
+          app->mock_control ? L"Windows 原生端  ·  隔离 mock 台架  ·  零车速" : L"Windows 原生端  ·  仅观看");
+      label(dc, app->font, RGB(231, 237, 246), 16, 123, rect.right - 330, 153, L"实时视频");
+      label(dc, app->font, RGB(231, 237, 246), rect.right - 300, 138, rect.right - 32, 168, L"连接与控制");
+      label(dc, app->small_font, RGB(142, 160, 184), rect.right - 300, 451, rect.right - 32, 474, L"键盘控制");
+      EndPaint(hwnd, &ps);
+      return 0;
+    }
+    case WM_CTLCOLORSTATIC: {
+      auto* dc = reinterpret_cast<HDC>(wparam);
+      const auto child = reinterpret_cast<HWND>(lparam);
+      const bool is_status = child == app->status;
+      SetTextColor(dc, is_status ? RGB(231, 237, 246) : RGB(142, 160, 184));
+      SetBkColor(dc, is_status ? RGB(17, 31, 50) : RGB(15, 25, 41));
+      return reinterpret_cast<LRESULT>(is_status ? app->input_background : app->surface);
+    }
+    case WM_CTLCOLOREDIT: {
+      auto* dc = reinterpret_cast<HDC>(wparam);
+      SetTextColor(dc, RGB(231, 237, 246)); SetBkColor(dc, RGB(17, 31, 50));
+      return reinterpret_cast<LRESULT>(app->input_background);
+    }
+    case WM_DRAWITEM: {
+      const auto* item = reinterpret_cast<DRAWITEMSTRUCT*>(lparam);
+      if (item->CtlID != 1 && item->CtlID != 2) return DefWindowProcW(hwnd, msg, wparam, lparam);
+      const bool enabled = !(item->itemState & ODS_DISABLED);
+      const COLORREF color = !enabled ? RGB(38, 54, 77) : item->CtlID == 1 ? RGB(14, 116, 144) : RGB(30, 47, 68);
+      const auto brush = CreateSolidBrush(color); FillRect(item->hDC, &item->rcItem, brush); DeleteObject(brush);
+      wchar_t caption[32]{}; GetWindowTextW(item->hwndItem, caption, 32);
+      SetBkMode(item->hDC, TRANSPARENT); SetTextColor(item->hDC, enabled ? RGB(231, 237, 246) : RGB(142, 160, 184));
+      const auto old = SelectObject(item->hDC, app->font);
+      RECT bounds = item->rcItem; DrawTextW(item->hDC, caption, -1, &bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+      SelectObject(item->hDC, old);
+      if (item->itemState & ODS_FOCUS) DrawFocusRect(item->hDC, &bounds);
+      return TRUE;
     }
     case WM_ACTIVATE:
       if (LOWORD(wparam) == WA_INACTIVE) { app->keyboard.withdraw(); app->suspend_render_health(); }
@@ -830,7 +929,10 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       if (app->worker.joinable()) { app->worker.request_stop(); app->worker.join(); }
       DestroyWindow(hwnd);
       return 0;
-    case WM_DESTROY: PostQuitMessage(0); return 0;
+    case WM_DESTROY:
+      DeleteObject(app->font); DeleteObject(app->title_font); DeleteObject(app->small_font);
+      DeleteObject(app->background); DeleteObject(app->surface); DeleteObject(app->input_background);
+      PostQuitMessage(0); return 0;
     default: return DefWindowProcW(hwnd, msg, wparam, lparam);
   }
 }
@@ -898,7 +1000,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
   if (!RegisterClassW(&klass)) return 1;
   const auto hwnd = CreateWindowExW(0, klass.lpszClassName,
       mock_control ? L"MineTeleop Windows 隔离 Mock 控制（零速）" : L"MineTeleop Windows 台架视频（仅观看）",
-      WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 980, 530, nullptr, nullptr, instance, &app);
+      WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 1100, 700, nullptr, nullptr, instance, &app);
   if (!hwnd) return 1;
   ShowWindow(hwnd, show); UpdateWindow(hwnd);
   MSG message{};
