@@ -6703,11 +6703,14 @@ void test_native_recovery_applies_at_vehicle_and_preserves_confirmed_profile() {
     input["brake"] = 0.0;
     expect(driver.update_control_intent(declare_native_input_video_sample(input)).value("accepted", false), "full neutral input rejected");
     deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (vehicle_pump.inspect([&] { return last_applied_intent != 4; }) && std::chrono::steady_clock::now() < deadline) {
+    const auto neutral_recovered = [&] { return vehicle_pump.inspect([&] {
+      return last_applied_intent == 4 && !service.control_braking_wait();
+    }); };
+    while (!neutral_recovered() && std::chrono::steady_clock::now() < deadline) {
       static_cast<void>(driver.update_control_intent(declare_native_input_video_sample(input)));
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    expect(vehicle_pump.inspect([&] { return last_applied_intent == 4 && !service.control_braking_wait(); }),
+    expect(neutral_recovered(),
         "full neutral never reached the recovered vehicle" + vehicle_diagnostic());
     input["intent_seq"] = 5;
     input["throttle"] = 0.2;
