@@ -101,6 +101,7 @@ struct RenderSession {
   struct Frame {
     std::string camera;
     std::uint64_t pts{};
+    double decoded_at_ms{};
     int width{}, height{};
     std::vector<std::uint8_t> pixels;
   };
@@ -109,12 +110,15 @@ struct RenderSession {
   std::array<std::uint64_t, 2> submissions{};
   std::array<std::optional<std::uint64_t>, 2> last_submitted{};
   std::array<double, 2> last_submission_ms{};
+  std::array<double, 2> last_decoded_ms{};
   std::array<Samples, 2> submission_gaps{};
+  std::array<Samples, 2> decoded_gaps{}, decoded_to_submission{};
   std::vector<std::string> cameras;
   std::shared_ptr<detail::NativeVideoHealth> health;
   std::array<HWND, 2> panels{};
 
   void accept(const std::string& camera, GstSample* sample) {
+    const auto decoded_at_ms = bench_now_ms();
     const auto it = std::find(cameras.begin(), cameras.end(), camera);
     if (it == cameras.end()) throw std::runtime_error("unmapped software frame");
     const auto index = static_cast<std::size_t>(it - cameras.begin());
@@ -131,6 +135,7 @@ struct RenderSession {
     try {
       auto frame = std::make_shared<Frame>();
       frame->camera = camera; frame->pts = GST_BUFFER_PTS(buffer);
+      frame->decoded_at_ms = decoded_at_ms;
       frame->width = static_cast<int>(GST_VIDEO_INFO_WIDTH(&info));
       frame->height = static_cast<int>(GST_VIDEO_INFO_HEIGHT(&info));
       const auto row = static_cast<std::size_t>(frame->width) * 4;
@@ -141,7 +146,10 @@ struct RenderSession {
       for (int y = 0; y < frame->height; ++y)
         std::memcpy(frame->pixels.data() + static_cast<std::size_t>(y) * row,
                     pixels + static_cast<std::size_t>(y) * static_cast<std::size_t>(stride), row);
-      { std::lock_guard lock(mutex); latest[index] = std::move(frame); }
+      { std::lock_guard lock(mutex);
+        if (last_decoded_ms[index] > 0) decoded_gaps[index].add(decoded_at_ms - last_decoded_ms[index]);
+        last_decoded_ms[index] = decoded_at_ms;
+        latest[index] = std::move(frame); }
       gst_video_frame_unmap(&mapped);
       InvalidateRect(panels[index], nullptr, FALSE);
     } catch (...) { gst_video_frame_unmap(&mapped); throw; }
@@ -173,6 +181,7 @@ struct RenderSession {
         if (!last_submitted[index] || frame->pts > *last_submitted[index]) {
           const auto submitted_at = bench_now_ms();
           if (last_submission_ms[index] > 0) submission_gaps[index].add(submitted_at - last_submission_ms[index]);
+          decoded_to_submission[index].add(submitted_at - frame->decoded_at_ms);
           last_submission_ms[index] = submitted_at;
           last_submitted[index] = frame->pts; ++submissions[index];
         }
@@ -761,10 +770,14 @@ struct Window {
     if (input_worker.joinable()) input_worker.join();
     flush_guard_trace();
     if (courier) courier->retire();
-    std::array<Samples, 2> gaps;
-    { std::lock_guard lock(render->mutex); gaps = render->submission_gaps; }
+    std::array<Samples, 2> gaps, decoded_gaps, submission_waits;
+    { std::lock_guard lock(render->mutex); gaps = render->submission_gaps;
+      decoded_gaps = render->decoded_gaps; submission_waits = render->decoded_to_submission; }
     const Json summary{{"event", "native_mock_render_summary"}, {"scope", "foreground GDI submission intervals, not capture-to-screen"},
-        {"streams", Json::array({gaps[0].json(), gaps[1].json()})}, {"safety_stop_episodes", safety_stop_episodes}};
+        {"streams", Json::array({gaps[0].json(), gaps[1].json()})},
+        {"decoded_callback_gaps", Json::array({decoded_gaps[0].json(), decoded_gaps[1].json()})},
+        {"decoded_callback_to_submission", Json::array({submission_waits[0].json(), submission_waits[1].json()})},
+        {"safety_stop_episodes", safety_stop_episodes}};
     std::fprintf(stderr, "%s\n", summary.dump().c_str()); std::fflush(stderr);
   }
 

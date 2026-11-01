@@ -100,6 +100,10 @@ Mock-only input trace batches also record the locally armed key mask and the
 intent sequence. Different key states receive different intent revisions even
 when zero limits produce identical commands; correlate those revisions with
 vehicle `receive_apply` records. The key mask is not sent to the vehicle.
+The render summary separates decoded-sample callback intervals, foreground
+submission intervals, and callback-to-submission time. These are local
+measurements; they do not establish capture-to-display or physical scan-out
+latency. Samples are bounded and an omitted count is reported.
 It also emits bounded transition records for focus, UI heartbeat, clock,
 video, remote media, direct path and input authorization. A null check means
 that an earlier guard short-circuited it; dropped records are counted. These

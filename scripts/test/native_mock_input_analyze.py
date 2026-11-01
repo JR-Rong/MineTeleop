@@ -7,6 +7,7 @@ must be checked independently. Input and injected windows use the Windows clock.
 import argparse
 import datetime as dt
 import json
+import re
 from collections import Counter
 from pathlib import Path
 
@@ -27,7 +28,10 @@ def records(path):
 
 
 def timestamp(value):
-    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    # PowerShell's round-trip format has seven fractional digits; Python 3.9
+    # accepts at most six. Truncation preserves the millisecond window used here.
+    normalized = re.sub(r"(\.\d{6})\d+(?=Z|[+-]\d\d:\d\d$)", r"\1", value)
+    parsed = dt.datetime.fromisoformat(normalized.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
         raise ValueError("test window timestamps must include a timezone")
     return int(parsed.timestamp() * 1000)
@@ -64,9 +68,10 @@ def analyze(metadata, viewer_records, vehicle_records):
         local = [entry for entry in inputs if entry.get("keys") == MASKS[scenario] and
                  start <= entry.get("wall_utc_ms", 0) <= end]
         matches = []
-        for entry in local:
-            for command in accepted.get(entry.get("intent_seq"), []):
-                if (command.get("requested_gear") == entry.get("gear") and
+        revisions = {(entry.get("intent_seq"), entry.get("gear")) for entry in local}
+        for intent_seq, gear in revisions:
+            for command in accepted.get(intent_seq, []):
+                if (command.get("requested_gear") == gear and
                         command.get("requested_throttle") == 0 and command.get("requested_steering") == 0 and
                         command.get("effective_throttle") == 0 and command.get("effective_steering") == 0 and
                         (scenario != "brake" or (command.get("requested_brake") or 0) > 0)):

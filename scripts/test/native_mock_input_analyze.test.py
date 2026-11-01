@@ -24,6 +24,8 @@ class InputEvidenceTest(unittest.TestCase):
     def test_matches_zero_limited_keys_to_vehicle_sequence(self):
         self.assertTrue(self.analyze()["all_windows_matched"])
         self.assertFalse(self.analyze()["all_nine_scenarios_covered"])
+        self.viewer[0]["records"].append(dict(self.viewer[0]["records"][0]))
+        self.assertEqual(self.analyze()["scenario_details"][0]["accepted_commands"], 1)
         self.command["intent_seq"] = 4
         self.assertFalse(self.analyze()["all_windows_matched"])
 
@@ -38,6 +40,9 @@ class InputEvidenceTest(unittest.TestCase):
         self.viewer[0]["dropped"] = 1
         with self.assertRaises(ValueError):
             self.analyze()
+
+    def test_powershell_seven_digit_utc_timestamp(self):
+        self.assertEqual(module.timestamp("2026-01-01T00:00:02.1234567Z"), 1767225602123)
 
     def test_brake_requires_a_brake_command(self):
         self.metadata["periodic_input"][0]["scenario"] = "brake"
