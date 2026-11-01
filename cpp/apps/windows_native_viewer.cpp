@@ -843,7 +843,8 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
           app->mock_control ? L"Windows 原生端  ·  隔离 mock 台架  ·  零车速" : L"Windows 原生端  ·  仅观看");
       label(dc, app->font, RGB(231, 237, 246), 16, 123, rect.right - 330, 153, L"实时视频");
       label(dc, app->font, RGB(231, 237, 246), rect.right - 300, 138, rect.right - 32, 168, L"连接与控制");
-      label(dc, app->small_font, RGB(142, 160, 184), rect.right - 300, 451, rect.right - 32, 474, L"键盘控制");
+      label(dc, app->small_font, RGB(142, 160, 184), rect.right - 300, 451, rect.right - 32, 474,
+          app->mock_control ? L"键盘控制" : L"操作说明");
       EndPaint(hwnd, &ps);
       return 0;
     }
@@ -920,7 +921,9 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       }
       if (wparam == 1 && app->running.load() && detail::viewer_observation_stale(
           static_cast<std::int64_t>(bench_now_ms()), app->last_observation_ms.load()))
-        SetWindowTextW(app->status, L"状态采样中断，画面可能停滞；仅观看，控制禁用。");
+        SetWindowTextW(app->status, app->mock_control ?
+            L"状态采样中断，画面可能停滞；请核验控制状态。" :
+            L"状态采样中断，画面可能停滞；仅观看，控制禁用。");
       return 0;
     case WM_CLOSE:
       KillTimer(hwnd, 1);
