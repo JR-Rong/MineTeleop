@@ -219,6 +219,8 @@ struct Window {
   std::wstring mock_message{L"控制：等待连接\n画面：等待\n校时：等待"};
   std::wstring can_detail_message{L"CAN 反馈未知"};
   std::array<std::wstring, 6> operator_values{L"—", L"—", L"—", L"—", L"—", L"—"};
+  std::array<std::wstring, 6> shown_operator_values{L"—", L"—", L"—", L"—", L"—", L"—"};
+  std::wstring shown_mock_message{L"控制：等待连接\n画面：等待\n校时：等待"};
   bool operator_display_stale{false};
   std::jthread worker;
   std::atomic<bool> running{false};
@@ -235,6 +237,20 @@ struct Window {
   bool mock_control{false};
   std::string mock_local_ip, mock_peer_ip, mock_ip_family;
 
+  // Called only on the UI thread. Unchanged text should not invalidate six
+  // controls at every telemetry tick while both video panels are painting.
+  void set_operator_value(std::size_t index, const std::wstring& value) {
+    if (operator_readouts[index] && shown_operator_values[index] != value) {
+      if (SetWindowTextW(operator_readouts[index], value.c_str())) shown_operator_values[index] = value;
+    }
+  }
+
+  void set_mock_message(const std::wstring& value) {
+    if (mock_info && shown_mock_message != value) {
+      if (SetWindowTextW(mock_info, value.c_str())) shown_mock_message = value;
+    }
+  }
+
   void clear_input_display() {
     { std::lock_guard lock(intent_display_mutex); intent_display.valid = false; }
     for (std::size_t i = 0; i < shown_keys.size(); ++i) {
@@ -242,7 +258,7 @@ struct Window {
       if (keycaps[i]) InvalidateRect(keycaps[i], nullptr, TRUE);
     }
     for (std::size_t i = 2; i < operator_readouts.size(); ++i)
-      if (operator_readouts[i]) SetWindowTextW(operator_readouts[i], L"—");
+      set_operator_value(i, L"—");
   }
 
   void suspend_render_health() {
@@ -1445,7 +1461,7 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
           (focus == hwnd || focus == app->video[0] || focus == app->video[1]);
       for (std::size_t i = 0; i < app->operator_readouts.size(); ++i) {
         const bool hidden = stale || (i >= 2 && (!input_focused || app->mock_estop_requested.load()));
-        SetWindowTextW(app->operator_readouts[i], hidden ? L"—" : app->operator_values[i].c_str());
+        app->set_operator_value(i, hidden ? L"—" : app->operator_values[i]);
       }
       app->operator_display_stale = stale;
       const auto details = stale ? std::wstring(L"CAN 反馈未知或遥测已过期") : app->can_detail_message;
@@ -1454,10 +1470,10 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         SetWindowTextW(app->can_detail, details.c_str());
         SendMessageW(app->can_detail, EM_LINESCROLL, 0, first_line);
       }
-      if (app->mock_info) SetWindowTextW(app->mock_info,
+      if (app->mock_info) app->set_mock_message(
           app->running.load() && app->last_mock_observation_ms.load() > 0 && !detail::native_mock_input_fresh(
               app->last_mock_observation_ms.load(), static_cast<std::int64_t>(bench_now_ms()))
-              ? L"控制状态过期，请停止操作\n画面与校时状态未知" : app->mock_message.c_str());
+              ? L"控制状态过期，请停止操作\n画面与校时状态未知" : app->mock_message);
       app->mock_ui_posted.store(false);
       return 0;
     }
@@ -1470,10 +1486,10 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         if (focused && down('E')) app->request_mock_estop();
         if (app->mock_info && app->running.load() && app->last_mock_observation_ms.load() > 0 &&
             !detail::native_mock_input_fresh(app->last_mock_observation_ms.load(), static_cast<std::int64_t>(bench_now_ms())))
-          SetWindowTextW(app->mock_info, L"控制状态过期，请停止操作\n画面与校时状态未知");
+          app->set_mock_message(L"控制状态过期，请停止操作\n画面与校时状态未知");
         if (!app->operator_display_stale && !detail::native_mock_input_fresh(
                 app->last_mock_observation_ms.load(), static_cast<std::int64_t>(bench_now_ms()))) {
-          for (const auto readout : app->operator_readouts) SetWindowTextW(readout, L"—");
+          for (std::size_t i = 0; i < app->operator_readouts.size(); ++i) app->set_operator_value(i, L"—");
           SetWindowTextW(app->can_detail, L"CAN 反馈未知或遥测已过期");
           app->operator_display_stale = true;
         }
@@ -1522,7 +1538,7 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             L"状态采样中断，画面可能停滞；仅观看，控制禁用。");
       if (wparam == 1 && app->mock_info && app->running.load() && detail::viewer_observation_stale(
           static_cast<std::int64_t>(bench_now_ms()), app->last_mock_observation_ms.load()))
-        SetWindowTextW(app->mock_info, L"控制状态过期，请停止操作\n画面与校时状态未知");
+        app->set_mock_message(L"控制状态过期，请停止操作\n画面与校时状态未知");
       return 0;
     case WM_CLOSE:
       KillTimer(hwnd, 1);
