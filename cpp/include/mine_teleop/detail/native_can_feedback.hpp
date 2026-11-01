@@ -33,6 +33,23 @@ inline std::wstring native_can_feedback_text(const nlohmann::json& feedback, boo
         !feedback.at(valid)[index].is_boolean() || !feedback.at(valid)[index].get<bool>()) return L"—";
     return format(feedback.at(name)[index], precision);
   };
+  const auto gear_label = [](const std::wstring& value) -> std::wstring {
+    if (value == L"1") return L"N";
+    if (value == L"2") return L"R";
+    if (value == L"3") return L"D";
+    return value == L"—" ? value : L"不支持(" + value + L")";
+  };
+  const auto switch_label = [](const std::wstring& value, const wchar_t* on, const wchar_t* off) -> std::wstring {
+    if (value == L"1") return on;
+    if (value == L"0") return off;
+    return value == L"—" ? value : L"异常(" + value + L")";
+  };
+  const auto parking_label = [](const std::wstring& value) -> std::wstring {
+    if (value == L"0") return L"保持";
+    if (value == L"1") return L"释放";
+    if (value == L"2") return L"已拉起";
+    return value == L"—" ? value : L"异常(" + value + L")";
+  };
   std::wostringstream out;
   out << L"CAN 反馈（有效且新鲜）";
   if (feedback.contains("max_feedback_age_ms") && feedback.at("max_feedback_age_ms").is_number() &&
@@ -40,13 +57,13 @@ inline std::wstring native_can_feedback_text(const nlohmann::json& feedback, boo
     out << L"  " << format(feedback.at("max_feedback_age_ms"), 0) << L" ms";
   out << L"\r\n"
       << L"车速 m/s：" << scalar("speed_mps", "speed_valid", 2)
-      << L"   挡位代码：" << scalar("gear", "gear_valid") << L"\r\n"
-      << L"挡位请求：" << scalar("driver_gear_request", "driver_gear_request_valid")
+      << L"   挡位：" << gear_label(scalar("gear", "gear_valid")) << L"\r\n"
+      << L"挡位请求：" << gear_label(scalar("driver_gear_request", "driver_gear_request_valid"))
       << L"   握手：" << scalar("handshake_status", "handshake_valid") << L"\r\n"
       << L"故障码：" << scalar("vmc_fault_code", "vmc_fault_code_valid")
       << L"   急停：" << scalar("emergency_switch", "gear_valid") << L"\r\n"
-      << L"驻车开关：" << scalar("parking_brake_switch", "parking_brake_switch_valid")
-      << L"   刹车踏板：" << scalar("brake_pedal_switch", "brake_pedal_switch_valid") << L"\r\n";
+      << L"驻车开关：" << switch_label(scalar("parking_brake_switch", "parking_brake_switch_valid"), L"已拉起", L"已松开")
+      << L"   刹车踏板：" << switch_label(scalar("brake_pedal_switch", "brake_pedal_switch_valid"), L"已踩下", L"已松开") << L"\r\n";
   for (std::size_t i = 0; i < 8; ++i)
     out << L"轮 " << i + 1 << L"：扭矩 " << array("motor_torque_nm", "motor_torque_valid", i, 1)
         << L" Nm，转速 " << array("motor_speed_rpm", "motor_speed_valid", i)
@@ -56,8 +73,8 @@ inline std::wstring native_can_feedback_text(const nlohmann::json& feedback, boo
   for (std::size_t i = 0; i < 4; ++i)
     out << L"转向 " << i + 1 << L"：" << array("steering_angle_deg", "steering_valid", i, 1)
         << L"°，模式 " << array("steering_mode", "steering_valid", i) << L"\r\n";
-  out << L"驻车状态：" << array("parking_brake_status", "parking_brake_valid", 0)
-      << L" / " << array("parking_brake_status", "parking_brake_valid", 1);
+  out << L"驻车状态：" << parking_label(array("parking_brake_status", "parking_brake_valid", 0))
+      << L" / " << parking_label(array("parking_brake_status", "parking_brake_valid", 1));
   return out.str();
 }
 

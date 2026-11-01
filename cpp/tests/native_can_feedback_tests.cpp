@@ -13,6 +13,9 @@ int main() {
     const auto fresh = native_can_feedback_text(input, true);
     if (fresh.find(L"12.30") == std::wstring::npos || fresh.find(L"45.6") == std::wstring::npos ||
         fresh.find(L"999") != std::wstring::npos) throw std::runtime_error("CAN field validity was not respected");
+    auto valid_gear = input; valid_gear["gear_valid"] = true; valid_gear["gear"] = 3;
+    if (native_can_feedback_text(valid_gear, true).find(L"D") == std::wstring::npos)
+      throw std::runtime_error("valid drive gear was not displayed");
     if (native_can_feedback_text(input, false).find(L"12.30") != std::wstring::npos)
       throw std::runtime_error("stale telemetry retained CAN values");
     auto unsupported = input; unsupported["supported"] = false;

@@ -193,7 +193,7 @@ struct Window {
   HBRUSH background{}, surface{}, input_background{};
   std::array<HWND, 2> video{};
   std::mutex mutex;
-  struct VehicleChoice { std::wstring label; bool eligible{}; std::string key; };
+  struct VehicleChoice { std::wstring label; bool eligible{}; std::string key; bool needs_approval{}; };
   std::mutex selection_mutex;
   std::condition_variable selection_ready;
   std::vector<VehicleChoice> vehicle_choices;
@@ -830,8 +830,10 @@ struct Window {
             const auto id = entry.at("vehicle_id").get<std::string>();
             const bool matches = id == vehicle.vehicle_id;
             const bool available = entry.value("online", false) && entry.value("controllable", false);
+            const bool approval = entry.value("mobile_approval_required", false);
             vehicle_choices.push_back({wide(id) + (matches ? L" · 台架配置匹配" : L" · 需对应台架配置") +
-                (available ? L" · 可连接" : L" · 不可连接"), matches && available, id});
+                (available ? L" · 可连接" : L" · 不可连接") + (approval ? L" · 需手机审批" : L""),
+                matches && available, id, approval});
           }
           selection_confirmed = false;
           selection_logs_requested = false;
@@ -842,6 +844,7 @@ struct Window {
         const auto authorized_choices = vehicle_choices;
         PostMessageW(hwnd, WM_APP + 3, 0, 0);
         report(L"请选择授权车辆；仅可连接与本地隔离台架配置匹配的车辆。");
+        bool needs_mobile_approval = false;
         {
           std::unique_lock lock(selection_mutex);
           while (!stop_token.stop_requested()) {
@@ -879,8 +882,8 @@ struct Window {
             }
             if (!selection_confirmed) continue;
             selection_confirmed = false;
-            if (!selection_log_mode) break;
-            if (selection_index >= vehicle_choices.size()) continue;
+            if (selection_index >= vehicle_choices.size()) { PostMessageW(hwnd, WM_APP + 3, 0, 0); continue; }
+            if (!selection_log_mode) { needs_mobile_approval = vehicle_choices[selection_index].needs_approval; break; }
             const auto log_key = vehicle_choices[selection_index].key;
             lock.unlock();
             try {
@@ -923,6 +926,7 @@ struct Window {
         }
         PostMessageW(hwnd, WM_APP + 4, 0, 0);
         phase = "connect";
+        report(needs_mobile_approval ? L"等待手机审批；可随时断开取消申请。" : L"正在建立授权会话。");
         const auto session = driver.connect(vehicle.vehicle_id, "windows-native-viewer");
         connected = true;
         const auto ice = driver.ice_servers().at("ice_servers");
