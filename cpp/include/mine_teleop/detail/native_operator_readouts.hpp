@@ -28,15 +28,14 @@ inline std::array<std::wstring, 6> native_operator_readouts(
     values[0] = number(*speed_mps * 3.6, L"%.1f km/h");
   if (actual_gear && (*actual_gear == 'N' || *actual_gear == 'D' || *actual_gear == 'R' || *actual_gear == 'P'))
     values[1] = std::wstring(1, static_cast<wchar_t>(*actual_gear));
-  if (!intent) return values;
-  if (intent->gear == 'N' || intent->gear == 'D' || intent->gear == 'R')
-    values[2] = std::wstring(1, static_cast<wchar_t>(intent->gear));
-  if (std::isfinite(intent->steering) && std::abs(intent->steering) <= 1)
-    values[3] = number(intent->steering, L"%.2f");
-  if (std::isfinite(intent->throttle) && intent->throttle >= 0 && intent->throttle <= 1)
-    values[4] = number(intent->throttle, L"%.2f");
-  if (std::isfinite(intent->brake) && intent->brake >= 0 && intent->brake <= 1)
-    values[5] = number(intent->brake, L"%.2f");
+  if (!intent || (intent->gear != 'N' && intent->gear != 'D' && intent->gear != 'R') ||
+      !std::isfinite(intent->steering) || std::abs(intent->steering) > 1 ||
+      !std::isfinite(intent->throttle) || intent->throttle < 0 || intent->throttle > 1 ||
+      !std::isfinite(intent->brake) || intent->brake < 0 || intent->brake > 1) return values;
+  values[2] = std::wstring(1, static_cast<wchar_t>(intent->gear));
+  values[3] = number(intent->steering, L"%.2f");
+  values[4] = number(intent->throttle, L"%.2f");
+  values[5] = number(intent->brake, L"%.2f");
   return values;
 }
 

@@ -24,6 +24,8 @@ int main() {
   const auto invalid = native_operator_readouts(std::numeric_limits<double>::infinity(), 'X',
       NativeOperatorIntent{'P', std::numeric_limits<double>::quiet_NaN(), -1, 2});
   for (const auto& value : invalid) if (value != L"\u2014") return EXIT_FAILURE;
+  const auto partial = native_operator_readouts(0.0, 'N', NativeOperatorIntent{'X', 0, .5, 0});
+  for (std::size_t i = 2; i < partial.size(); ++i) if (partial[i] != L"\u2014") return EXIT_FAILURE;
   if (native_trim_identity(L"\u00a0 driver-name \ufeff") != L"driver-name" ||
       !native_trim_identity(L"\u3000\n").empty() || native_trim_identity(L"a b") != L"a b") return EXIT_FAILURE;
   const auto tall = native_video_fit(960, 768, 360, 460);

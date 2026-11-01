@@ -171,6 +171,7 @@ struct Window {
   std::string mock_local_ip, mock_peer_ip, mock_ip_family;
 
   void clear_input_display() {
+    { std::lock_guard lock(intent_display_mutex); intent_display.valid = false; }
     for (std::size_t i = 0; i < shown_keys.size(); ++i) {
       shown_keys[i] = false;
       if (keycaps[i]) InvalidateRect(keycaps[i], nullptr, TRUE);
