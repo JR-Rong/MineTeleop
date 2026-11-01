@@ -197,6 +197,7 @@ struct Window {
     auto next_status = Clock::now();
     Json cached_status;
     Json telemetry;
+    std::optional<bool> last_authorization_diagnostic;
     std::int64_t telemetry_at_ms = 0, telemetry_source_ms = 0;
     std::uint64_t telemetry_seq = 0, safety_stop_episodes = 0, last_result_seq = 0;
     std::uint64_t telemetry_status_observed = 0;
@@ -471,6 +472,34 @@ struct Window {
           !telemetry.value("braking_wait", true) && (telemetry_gear == "N" || telemetry_gear == "D" || telemetry_gear == "R") &&
           telemetry.contains("speed_mps") && telemetry.at("speed_mps").is_number() &&
           telemetry.at("speed_mps").get<double>() == 0.0;
+      if (config.control_trace_commands &&
+          (!last_authorization_diagnostic || *last_authorization_diagnostic != authorized)) {
+        const bool object = telemetry.is_object();
+        const auto offset = sync.contains("offset_ms") && sync.at("offset_ms").is_number_integer()
+            ? sync.at("offset_ms").get<std::int64_t>() : std::int64_t{0};
+        const auto uncertainty = sync.contains("uncertainty_ms") && sync.at("uncertainty_ms").is_number_integer()
+            ? sync.at("uncertainty_ms").get<std::int64_t>() : std::int64_t{-1};
+        const bool active = object && telemetry.contains("safety_state") &&
+            telemetry.at("safety_state").is_string() && telemetry.at("safety_state") == "CONTROL_ACTIVE";
+        const bool braking = !object || !telemetry.contains("braking_wait") ||
+            !telemetry.at("braking_wait").is_boolean() || telemetry.at("braking_wait").get<bool>();
+        const Json diagnostic{{"event", "native_mock_authorization_change"},
+            {"monotonic_ms", authorization_observed_ms}, {"authorized", authorized},
+            {"ready", ready}, {"profile_accepted", profile_accepted}, {"handshake_sent", handshake_sent},
+            {"estop_requested", mock_estop_requested.load()}, {"telemetry_present", object},
+            {"telemetry_receipt_fresh", detail::native_mock_input_fresh(telemetry_at_ms, authorization_observed_ms)},
+            {"telemetry_source_fresh", detail::native_mock_source_fresh(telemetry_source_ms, wall_ms, offset, uncertainty)},
+            {"telemetry_age_ms", telemetry_at_ms ? Json(authorization_observed_ms - telemetry_at_ms) : Json(nullptr)},
+            {"telemetry_source_ms", telemetry_source_ms}, {"local_wall_ms", wall_ms},
+            {"clock_offset_ms", offset}, {"clock_uncertainty_ms", uncertainty},
+            {"control_active", active}, {"braking_wait", braking},
+            {"gear_valid", telemetry_gear == "N" || telemetry_gear == "D" || telemetry_gear == "R"},
+            {"zero_speed", object && telemetry.contains("speed_mps") && telemetry.at("speed_mps").is_number() &&
+                telemetry.at("speed_mps").get<double>() == 0.0}};
+        std::fprintf(stderr, "%s\n", diagnostic.dump().c_str());
+        std::fflush(stderr);
+        last_authorization_diagnostic = authorized;
+      }
       if (authorized) mock_confirmed_gear.store(telemetry_gear.front());
       input_authorized_at_ms.store(authorized ? authorization_observed_ms : 0);
       if (now >= next_mock_ui) {
