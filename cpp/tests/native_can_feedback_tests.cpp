@@ -4,6 +4,7 @@
 
 int main() {
   using mine_teleop::detail::native_can_feedback_text;
+  using mine_teleop::detail::native_feedback_confirmed_gear;
   using Json = nlohmann::json;
   try {
     const Json input{{"supported", true}, {"feedback_fresh", true},
@@ -24,6 +25,22 @@ int main() {
     auto stale = input; stale["feedback_fresh"] = false;
     if (native_can_feedback_text(stale, true).find(L"12.30") != std::wstring::npos)
       throw std::runtime_error("stale CAN retained values");
+    Json telemetry{{"gear", "R"}, {"can_feedback", {{"supported", false}}}};
+    if (native_feedback_confirmed_gear(telemetry) != 'R')
+      throw std::runtime_error("mock gear feedback was not admitted");
+    telemetry["can_feedback"] = valid_gear;
+    if (native_feedback_confirmed_gear(telemetry) != 'D')
+      throw std::runtime_error("fresh valid CAN gear was not selected over mock gear");
+    telemetry["can_feedback"]["feedback_fresh"] = false;
+    if (native_feedback_confirmed_gear(telemetry)) throw std::runtime_error("stale CAN gear admitted");
+    telemetry["can_feedback"]["feedback_fresh"] = true;
+    telemetry["can_feedback"]["gear_valid"] = false;
+    if (native_feedback_confirmed_gear(telemetry)) throw std::runtime_error("invalid CAN gear admitted");
+    telemetry["can_feedback"]["gear_valid"] = true;
+    telemetry["can_feedback"]["gear"] = "3";
+    if (native_feedback_confirmed_gear(telemetry)) throw std::runtime_error("malformed CAN gear admitted");
+    telemetry["can_feedback"] = {{"supported", nullptr}};
+    if (native_feedback_confirmed_gear(telemetry)) throw std::runtime_error("unknown CAN capability admitted");
     std::cout << "CAN validity and freshness checks passed\n";
     return 0;
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

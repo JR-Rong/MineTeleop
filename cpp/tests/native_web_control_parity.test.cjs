@@ -6,7 +6,8 @@ const {spawnSync} = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
-const {deriveControl} = require('../web/control_logic.js');
+const {deriveControl, createGearTransition, recordForwardedGearCommand,
+  telemetryConfirmsGearTransition, matchesGearChangeRejection} = require('../web/control_logic.js');
 
 const inputs = [];
 const profiles = [
@@ -74,3 +75,25 @@ padCases.forEach((p, i) => {
     assert(Math.abs(actual[index] - context.gamepadState[name]) < 1e-12, `${name} gamepad case ${i}`);
 });
 console.log(`matched ${padCases.length} cases against the shipped standard gamepad sampler`);
+
+const gearCases = [];
+for (const status of [9, 10, 11]) for (const forwarded of [false, true])
+  for (const actual of ['N', 'D', 'R']) for (const fresh of [false, true])
+    for (const rejection of [0, 20, 21]) gearCases.push({status, forwarded, actual, fresh, rejection});
+const gearInput = gearCases.map(x => [x.status, Number(x.forwarded), x.actual, Number(x.fresh), x.rejection].join(' ')).join('\n');
+const gearRun = spawnSync(process.argv[2], ['--gear-transition'], {input: gearInput, encoding: 'utf8'});
+assert.equal(gearRun.status, 0, gearRun.stderr);
+const gearResults = gearRun.stdout.trim().split('\n');
+assert.equal(gearResults.length, gearCases.length);
+gearCases.forEach((x, i) => {
+  let transition = createGearTransition('N', 'D', 10, 1);
+  if (x.forwarded) transition = recordForwardedGearCommand(transition, 1, 20, 'D');
+  const message = {event: 'vehicle_telemetry', control_status_seq: x.status, gear: x.actual,
+    can_feedback: x.fresh ? {supported: false} : {supported: true, feedback_fresh: false}};
+  const rejection = {issue_code: 'vcu_drive_gear_change_moving_or_stale',
+    control_status_seq: x.status, intent_seq: x.rejection};
+  const [confirmed, rejected] = gearResults[i].split(' ').map(Number);
+  assert.equal(Boolean(confirmed), telemetryConfirmsGearTransition(transition, message), `gear confirmation case ${i}`);
+  assert.equal(Boolean(rejected), matchesGearChangeRejection(transition, rejection, 'D'), `gear rejection case ${i}`);
+});
+console.log(`matched ${gearCases.length} cases against the shipped web gear transition logic`);

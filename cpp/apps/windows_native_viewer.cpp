@@ -5,6 +5,7 @@
 #include "mine_teleop/detail/native_mock_input_sequence.hpp"
 #include "mine_teleop/detail/native_mock_profile_retry.hpp"
 #include "mine_teleop/detail/native_mock_profile_state.hpp"
+#include "mine_teleop/detail/native_mock_gear_transition.hpp"
 #include "mine_teleop/detail/native_mock_keyboard.hpp"
 #include "mine_teleop/detail/native_can_feedback.hpp"
 #include "mine_teleop/detail/native_control_courier.hpp"
@@ -25,6 +26,7 @@
 #include <cstdio>
 #include <condition_variable>
 #include <fstream>
+#include <optional>
 #include <string_view>
 
 namespace {
@@ -231,6 +233,7 @@ struct Window {
   std::atomic<bool> mock_estop_requested{false};
   std::atomic<bool> mock_profile_needs_confirmation{false}, mock_profile_confirmation_requested{false};
   std::atomic<bool> mock_profile_reconnect_required{false};
+  std::atomic<bool> mock_gear_reconnect_required{false};
   std::atomic<bool> mock_ui_posted{false};
   detail::NativeMockKeyboard keyboard;
   std::mutex gamepad_mutex;
@@ -341,6 +344,9 @@ struct Window {
     std::atomic<bool> input_failed{false};
     std::atomic<std::int64_t> clock_observed_ms{0}, input_authorized_at_ms{0};
     std::atomic<char> mock_confirmed_gear{'N'};
+    std::atomic<char> mock_gear_rollback{0};
+    std::mutex gear_mutex;
+    detail::NativeMockGearTransition gear_transition;
     // Clock health must not depend on a courier/bridge cycle completing. The
     // observation age is measured from the start of the actual snapshot, so a
     // blocked clock read cannot make old evidence look fresh.
@@ -426,7 +432,8 @@ struct Window {
           const bool ready = ui_alive && clock_ok && remote_ready == 1 && video_health.ready && direct_ready == 1;
           const auto authorized_at = input_authorized_at_ms.load();
           const auto authorization_now_ms = static_cast<std::int64_t>(bench_now_ms());
-          const bool authorized = detail::native_mock_input_fresh(authorized_at, authorization_now_ms);
+          const bool authorized = detail::native_mock_input_fresh(authorized_at, authorization_now_ms) &&
+              !mock_gear_reconnect_required.load();
           if (config.control_trace_commands) {
             const GuardState state{focused, ui_alive, clock_ok, video_health.ready, video_health.sample_healthy,
                 authorized, ready, remote_ready, direct_ready, video_health.bad_revision, video_health.brake_revision};
@@ -437,7 +444,50 @@ struct Window {
               previous_guard = state;
             }
           }
-          const auto keyboard_input = keyboard.sample_now(ready && authorized && !mock_estop_requested.load(), mock_confirmed_gear.load());
+          const auto confirmed_gear = mock_confirmed_gear.load();
+          auto keyboard_input = keyboard.sample_now(ready && authorized && !mock_estop_requested.load(), confirmed_gear);
+          std::optional<std::uint64_t> gear_generation;
+          bool withdraw_gear_input = false;
+          const auto rollback = mock_gear_rollback.load();
+          {
+            std::lock_guard lock(gear_mutex);
+            if (!ready || !authorized || mock_estop_requested.load()) {
+              gear_transition.cancel();
+              mock_gear_rollback.store(0);
+            } else if (rollback) {
+              keyboard_input.gear = rollback;
+              keyboard_input.throttle = keyboard_input.steering = 0.0;
+              keyboard_input.key_mask = 0; keyboard_input.armed = false;
+              if (const auto pending = gear_transition.pending()) gear_generation = pending->generation;
+            } else if (keyboard_input.armed) {
+              auto pending = gear_transition.pending();
+              if (!pending && keyboard_input.gear != confirmed_gear) {
+                gear_generation = gear_transition.begin(confirmed_gear, keyboard_input.gear);
+                pending = gear_transition.pending();
+                if (!pending) { withdraw_gear_input = true; keyboard_input.gear = confirmed_gear; }
+              }
+              if (pending) {
+                gear_generation = pending->generation;
+                if (keyboard_input.gear != pending->to && (keyboard_input.key_mask & 3U))
+                  withdraw_gear_input = true;
+                keyboard_input.gear = pending->to;
+                keyboard_input.throttle = keyboard_input.steering = 0.0;
+              }
+            } else {
+              // An active session retains its confirmed gear while input is
+              // withdrawn; an unready session still uses the existing neutral.
+              if (const auto pending = gear_transition.pending()) {
+                keyboard_input.gear = pending->to;
+                keyboard_input.throttle = keyboard_input.steering = 0.0;
+                gear_generation = pending->generation;
+              } else keyboard_input.gear = confirmed_gear;
+            }
+          }
+          if (withdraw_gear_input) {
+            keyboard.withdraw();
+            keyboard_input.throttle = keyboard_input.steering = 0.0;
+            keyboard_input.key_mask = 0; keyboard_input.armed = false;
+          }
           const auto current_epoch = epoch.load();
           const bool estop = mock_estop_requested.load();
           if (estop || ((ready || current_epoch != 0) && (ui_alive || !withdrawn))) {
@@ -456,6 +506,10 @@ struct Window {
             input["intent_seq"] = input_sequence.next(input_identity);
             const auto result = driver.update_control_intent(input);
             if (!result.value("accepted", false)) throw std::runtime_error("mock input rejected");
+            if (gear_generation && result.contains("intent_seq") && result.at("intent_seq").is_number_unsigned()) {
+              std::lock_guard lock(gear_mutex);
+              gear_transition.forwarded(*gear_generation, result.at("intent_seq").get<std::uint64_t>(), keyboard_input.gear);
+            }
             if (config.control_trace_commands && keyboard_input.armed &&
                 (keyboard_input.key_mask != last_input_keys || now_ms - last_input_trace_at >= 1000)) {
               std::lock_guard lock(input_trace_mutex);
@@ -491,6 +545,62 @@ struct Window {
       const auto value = envelope.contains("status") && envelope.at("status").is_object() ? envelope.at("status") : envelope;
       if (!value.is_object() || value.value("session_id", "") != session_id ||
           value.value("vehicle_id", "") != vehicle.vehicle_id || value.value("driver_id", "") != config.driver_id) return;
+      const auto event = value.value("event", "");
+      const auto status_seq = value.contains("control_status_seq") && value.at("control_status_seq").is_number_unsigned()
+          ? value.at("control_status_seq").get<std::uint64_t>() : 0;
+      bool gear_status_new = false;
+      { std::lock_guard lock(gear_mutex); gear_status_new = gear_transition.observe_status(status_seq); }
+      if (gear_status_new && event == "control_command_rejected" &&
+          value.value("issue_code", "") == "vcu_drive_gear_change_moving_or_stale") {
+        const auto positive_seq = [&](const char* field) -> std::uint64_t {
+          return value.contains(field) && value.at(field).is_number_unsigned()
+              ? value.at(field).get<std::uint64_t>() : 0;
+        };
+        auto intent = positive_seq("intent_seq");
+        if (!intent) intent = positive_seq("command_seq");
+        bool matched = false;
+        {
+          std::lock_guard lock(gear_mutex);
+          const auto pending = gear_transition.pending();
+          matched = pending && !mock_gear_rollback.load() && gear_transition.reject(status_seq, intent) ==
+              detail::NativeMockGearTransition::Rejection::matched;
+          if (matched) {
+            mock_confirmed_gear.store(pending->from);
+          }
+          gear_transition.cancel();
+          if (matched) {
+            if (gear_transition.begin(pending->to, pending->from)) mock_gear_rollback.store(pending->from);
+            else matched = false;
+          }
+        }
+        keyboard.withdraw();
+        if (matched) report(L"车端拒绝换挡；已清除输入并请求回退，请释放后重新操作。");
+        else {
+          input_authorized_at_ms.store(0);
+          mock_gear_reconnect_required.store(true);
+          report(L"换挡拒绝无法关联，普通输入已冻结；请安全断开并重新连接。");
+        }
+      }
+      if (gear_status_new && event == "vehicle_telemetry" && value.contains("can_feedback") &&
+          value.at("can_feedback").is_object() && cached_status.is_object() &&
+          cached_status.contains("time_sync") && cached_status.at("time_sync").is_object()) {
+        const auto& clock = cached_status.at("time_sync");
+        const auto source = value.contains("sent_at_utc_ms") && value.at("sent_at_utc_ms").is_number_integer()
+            ? value.at("sent_at_utc_ms").get<std::int64_t>() : 0;
+        const auto wall = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        const bool fresh = clock.value("synchronized", false) &&
+            detail::native_mock_source_fresh(source, wall, clock.value("offset_ms", std::int64_t{0}),
+                clock.value("uncertainty_ms", std::int64_t{-1}));
+        const auto actual = detail::native_feedback_confirmed_gear(value);
+        if (fresh && actual) {
+          std::lock_guard lock(gear_mutex);
+          if (!gear_transition.pending() || gear_transition.confirm(status_seq, *actual, true)) {
+            mock_confirmed_gear.store(*actual);
+            if (mock_gear_rollback.load() == *actual) mock_gear_rollback.store(0);
+          }
+        }
+      }
       Json profile_status;
       if (value.value("event", "") == "session_control_profile_status") profile_status = value;
       else if (value.value("event", "") == "vehicle_telemetry" && value.contains("session_control_profile"))
@@ -668,7 +778,7 @@ struct Window {
       const auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::system_clock::now().time_since_epoch()).count();
       const auto telemetry_gear = telemetry.is_object() ? telemetry.value("gear", "") : std::string{};
-      const bool authorized = !mock_estop_requested.load() && ready && profile_accepted && handshake_sent &&
+      const bool authorized = !mock_estop_requested.load() && !mock_gear_reconnect_required.load() && ready && profile_accepted && handshake_sent &&
           detail::native_mock_input_fresh(telemetry_at_ms, authorization_observed_ms) && telemetry.is_object() &&
           detail::native_mock_source_fresh(telemetry_source_ms, wall_ms,
               sync.value("offset_ms", std::int64_t{0}), sync.value("uncertainty_ms", std::int64_t{-1})) &&
@@ -704,7 +814,6 @@ struct Window {
         std::fflush(stderr);
         last_authorization_diagnostic = authorized;
       }
-      if (authorized) mock_confirmed_gear.store(telemetry_gear.front());
       input_authorized_at_ms.store(authorized ? authorization_observed_ms : 0);
       if (now >= next_mock_ui) {
         const auto native = status.at("native_control");
@@ -1131,7 +1240,9 @@ struct Window {
                   case detail::ViewerPath::unknown: break;
                 }
               }
-              if (mock_control && mock_profile_reconnect_required.load())
+              if (mock_control && mock_gear_reconnect_required.load())
+                report(L"换挡拒绝无法关联，普通输入已冻结；请安全断开并重新连接。");
+              else if (mock_control && mock_profile_reconnect_required.load())
                 report(L"车端处于超时制动或故障锁定；请断开会话并按安全流程重新连接，不能仅靠限幅确认恢复。");
               else
                 report((advancing ? L"渲染提交持续更新 · " : L"等待新画面或画面停滞 · ") + path +
@@ -1425,6 +1536,7 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
           app->mock_profile_needs_confirmation.store(false);
           app->mock_profile_confirmation_requested.store(false);
           app->mock_profile_reconnect_required.store(false);
+          app->mock_gear_reconnect_required.store(false);
           auto secret = text_of(app->password);
           auto driver = utf8(text_of(app->driver_config)), vehicle = utf8(text_of(app->vehicle_config));
           auto requested_driver = utf8(detail::native_trim_identity(text_of(app->driver_id)));

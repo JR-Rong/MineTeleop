@@ -2,6 +2,7 @@
 #include "mine_teleop/detail/native_mock_input_sequence.hpp"
 #include "mine_teleop/detail/native_mock_profile_retry.hpp"
 #include "mine_teleop/detail/native_mock_profile_state.hpp"
+#include "mine_teleop/detail/native_mock_gear_transition.hpp"
 #include "mine_teleop/detail/native_mock_keyboard.hpp"
 #include "mine_teleop/detail/dtls_record_trace.hpp"
 #include <iostream>
@@ -91,6 +92,32 @@ void test_profile_requires_new_manual_confirmation_after_invalidation() {
   require(state.observe(8, 12, true) == State::Result::invalidated, "replaced profile remained authorized");
   require(state.begin(12, true), "second manual request refused");
   require(state.observe(9, 12, false) == State::Result::invalidated, "mismatched effective profile accepted");
+}
+void test_mock_gear_confirmation_requires_forwarded_intent_and_new_feedback() {
+  using Gear = mine_teleop::detail::NativeMockGearTransition;
+  Gear gear;
+  require(!gear.begin('N', 'D'), "gear transition lacked a status floor");
+  require(gear.observe_status(10), "initial status refused");
+  const auto generation = gear.begin('N', 'D');
+  require(generation && !gear.begin('N', 'R'), "overlapping gear transition accepted");
+  require(gear.observe_status(11) && !gear.confirm(11, 'D', true), "unforwarded gear confirmed");
+  gear.forwarded(*generation + 1, 20, 'D');
+  gear.forwarded(*generation, 20, 'R');
+  require(gear.observe_status(12) && !gear.confirm(12, 'D', true), "wrong generation or gear forwarded");
+  gear.forwarded(*generation, 21, 'D');
+  require(!gear.observe_status(12) && !gear.confirm(10, 'D', true), "stale gear status accepted");
+  require(gear.observe_status(13) && !gear.confirm(13, 'D', false), "stale or invalid feedback confirmed gear");
+  require(gear.observe_status(14) && !gear.confirm(14, 'R', true), "wrong gear confirmed transition");
+  require(gear.observe_status(15) && gear.confirm(15, 'D', true), "fresh matching gear did not confirm");
+  const auto next = gear.begin('D', 'R');
+  require(next && *next > *generation, "gear generation reused");
+  gear.forwarded(*next, 22, 'R');
+  require(gear.observe_status(16) && gear.reject(16, 21) == Gear::Rejection::unmatched,
+          "unrelated rejection was attributed to gear transition");
+  require(gear.observe_status(17) && gear.reject(17, 22) == Gear::Rejection::matched,
+          "matching gear rejection was not correlated");
+  gear.cancel();
+  require(!gear.pending(), "cancel retained pending gear");
 }
 void test_dtls_header_trace_is_bounded_and_excludes_payloads() {
   using namespace mine_teleop::detail;
@@ -292,6 +319,6 @@ void test_mock_gamepad_neutral_and_profile_limits() {
   require(input.throttle == 0 && input.steering == 0, "zero mock limits produced nonzero motion intent");
 }
 }
-int main() { try { test_gate(); test_neutral_refresh_sequence(); test_profile_retry_stays_bounded_and_needs_live_guards(); test_profile_requires_new_manual_confirmation_after_invalidation(); test_dtls_header_trace_is_bounded_and_excludes_payloads(); test_mock_keyboard_rearms_only_after_release(); test_mock_direction_combinations_require_gear_confirmation(); test_live_clock_keyboard_and_media_guard(); test_mock_gamepad_neutral_and_profile_limits();
+int main() { try { test_gate(); test_neutral_refresh_sequence(); test_profile_retry_stays_bounded_and_needs_live_guards(); test_profile_requires_new_manual_confirmation_after_invalidation(); test_mock_gear_confirmation_requires_forwarded_intent_and_new_feedback(); test_dtls_header_trace_is_bounded_and_excludes_payloads(); test_mock_keyboard_rearms_only_after_release(); test_mock_direction_combinations_require_gear_confirmation(); test_live_clock_keyboard_and_media_guard(); test_mock_gamepad_neutral_and_profile_limits();
   std::cout << "PASS scoped mock media, input renewal, keyboard and clock guard\n"; return 0; }
 catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; } }

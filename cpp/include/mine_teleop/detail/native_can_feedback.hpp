@@ -3,10 +3,37 @@
 #include <nlohmann/json.hpp>
 #include <cmath>
 #include <iomanip>
+#include <optional>
 #include <sstream>
 #include <string>
 
 namespace mine_teleop::detail {
+
+// Match the web gear confirmation contract: use fresh valid CAN feedback
+// when supported, otherwise use explicit mock telemetry only.
+inline std::optional<char> native_feedback_confirmed_gear(const nlohmann::json& telemetry) {
+  using Json = nlohmann::json;
+  if (!telemetry.is_object() || !telemetry.contains("can_feedback") || !telemetry.at("can_feedback").is_object())
+    return std::nullopt;
+  const auto& feedback = telemetry.at("can_feedback");
+  if (!feedback.contains("supported") || !feedback.at("supported").is_boolean()) return std::nullopt;
+  if (!feedback.at("supported").get<bool>()) {
+    if (!telemetry.contains("gear") || !telemetry.at("gear").is_string()) return std::nullopt;
+    const auto gear = telemetry.at("gear").get<std::string>();
+    if (gear == "N" || gear == "D" || gear == "R") return gear.front();
+    return std::nullopt;
+  }
+  const auto flag = [&](const char* key) {
+    return feedback.contains(key) && feedback.at(key).is_boolean() && feedback.at(key).get<bool>();
+  };
+  if (!flag("feedback_fresh") || !flag("gear_valid") || !feedback.contains("gear") ||
+      !feedback.at("gear").is_number_integer()) return std::nullopt;
+  const Json& gear = feedback.at("gear");
+  if (gear == 1) return 'N';
+  if (gear == 2) return 'R';
+  if (gear == 3) return 'D';
+  return std::nullopt;
+}
 
 // Missing, invalid and stale data is deliberately not presented as a value.
 inline std::wstring native_can_feedback_text(const nlohmann::json& feedback, bool telemetry_fresh) {

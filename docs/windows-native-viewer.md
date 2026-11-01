@@ -81,9 +81,12 @@ values use the acknowledged profile scaling, so that profile sends zero
 throttle and steering in this mock configuration. Directional key presses
 must therefore be verified separately from delivered motion values in a bench
 test; a zero value alone is not proof that a key was or was not pressed.
-Mock gear selection currently waits for fresh matching telemetry, but does not
-implement the web client's complete status-sequence-fenced transition and
-correlated rejection/rollback logic. It must not be treated as equivalent
+Mock gear selection uses a status-sequence floor and requires a locally
+accepted transition intent before fresh matching mock or valid CAN feedback
+can confirm a gear. A correlated rejection requests zero-motion rollback;
+an uncorrelated rejection freezes ordinary input until a new session. This
+is stricter than the web client's manual handshake recovery and does not yet
+implement all web VCU and stationary-evidence behavior. It is not equivalent
 production gear control.
 
 For the `b93bfff` UI build, a Windows smoke check opened the isolated mock

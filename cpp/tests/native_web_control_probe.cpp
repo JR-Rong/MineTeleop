@@ -1,10 +1,28 @@
 #include "mine_teleop/detail/native_web_control.hpp"
+#include "mine_teleop/detail/native_mock_gear_transition.hpp"
 #include <iomanip>
 #include <iostream>
 #include <string_view>
 
 int main(int argc, char** argv) {
   using Control = mine_teleop::detail::NativeWebControl;
+  if (argc == 2 && std::string_view(argv[1]) == "--gear-transition") {
+    using Gear = mine_teleop::detail::NativeMockGearTransition;
+    std::uint64_t status, rejection;
+    char actual;
+    bool forwarded, fresh;
+    while (std::cin >> status >> forwarded >> actual >> fresh >> rejection) {
+      Gear gear;
+      static_cast<void>(gear.observe_status(10));
+      const auto generation = gear.begin('N', 'D');
+      if (forwarded && generation) gear.forwarded(*generation, 20, 'D');
+      static_cast<void>(gear.observe_status(status));
+      const bool rejected = gear.reject(status, rejection) == Gear::Rejection::matched;
+      const bool confirmed = gear.confirm(status, actual, fresh);
+      std::cout << confirmed << ' ' << rejected << '\n';
+    }
+    return 0;
+  }
   if (argc == 2 && std::string_view(argv[1]) == "--standard-gamepad") {
     double axis, throttle, brake, center, range, deadzone;
     bool inverted;
