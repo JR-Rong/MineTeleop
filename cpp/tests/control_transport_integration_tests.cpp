@@ -938,7 +938,10 @@ void actual_feedback_selection_is_independent_and_rejects_retired_statuses() {
   }
   expect(ready, "actual native did not prefer healthy P2P feedback after return health recovered");
   const auto after = fixture.driver->status().at("native_control").at("control_transport");
-  expect(after.at("epoch") == before.at("epoch") && after.at("path") == "dc", "feedback switch changed ordinary command epoch/path");
+  expect(after.at("epoch") == before.at("epoch") && after.at("path") == "dc",
+      "feedback switch changed ordinary command epoch/path: before epoch=" + before.at("epoch").dump() +
+          " path=" + before.at("path").dump() + " after epoch=" + after.at("epoch").dump() +
+          " path=" + after.at("path").dump());
   auto request = fixture.scope(true);
   request["vehicle_statuses"] = Json::array({fixture.feedback_status(std::numeric_limits<std::uint64_t>::max(), old_feedback),
       fixture.feedback_status(2, fixture.feedback_fence.state())});
