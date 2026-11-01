@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
+#include <string_view>
 
 namespace {
 using namespace mine_teleop;
@@ -130,8 +131,8 @@ struct RenderSession {
 };
 
 struct Window {
-  HWND hwnd{}, driver_config{}, vehicle_config{}, password{}, status{}, start{}, stop{};
-  std::array<HWND, 3> config_labels{};
+  HWND hwnd{}, driver_config{}, vehicle_config{}, driver_id{}, password{}, status{}, start{}, stop{};
+  std::array<HWND, 4> config_labels{};
   std::array<HWND, 6> operator_labels{}, operator_readouts{};
   std::array<HWND, 6> keycaps{};
   std::array<bool, 6> shown_keys{};
@@ -655,7 +656,7 @@ struct Window {
     std::fprintf(stderr, "%s\n", summary.dump().c_str()); std::fflush(stderr);
   }
 
-  void connect(std::string driver_path, std::string vehicle_path, std::string secret,
+  void connect(std::string driver_path, std::string vehicle_path, std::string requested_driver, std::string secret,
                std::stop_token stop_token) {
     const char* phase = "configuration";
     { std::lock_guard lock(intent_display_mutex); intent_display.valid = false; }
@@ -691,12 +692,13 @@ struct Window {
       // diagnostics; ordinary receive-only viewing remains log-free.
       if (!mock_control || !config.control_trace_commands) config.browser_event_log_path.clear();
       DriverConsoleRuntime driver(config, vehicle.vehicle_id, secret);
-      std::fill(secret.begin(), secret.end(), '\0');
       bool connected = false;
       try {
         report(mock_control ? L"正在连接隔离 mock 台架；等待安全条件。" : L"正在登录并连接车端；仅观看，控制禁用。");
         phase = "login";
-        static_cast<void>(driver.login());
+        static_cast<void>(driver.login(secret, requested_driver));
+        if (!requested_driver.empty()) config.driver_id = requested_driver;
+        std::fill(secret.begin(), secret.end(), '\0');
         if (stop_token.stop_requested()) throw std::runtime_error("cancelled");
         phase = "connect";
         const auto session = driver.connect(vehicle.vehicle_id, "windows-native-viewer");
@@ -866,6 +868,7 @@ struct Window {
 
 HWND control(HWND parent, const wchar_t* type, const wchar_t* caption, DWORD style,
              int x, int y, int w, int h, int id = 0) {
+  if (std::wstring_view(type) == L"EDIT" || std::wstring_view(type) == L"BUTTON") style |= WS_TABSTOP;
   return CreateWindowExW(0, type, caption, WS_CHILD | WS_VISIBLE | style, x, y, w, h,
       parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
 }
@@ -887,24 +890,24 @@ void layout(Window& app, int width, int height) {
   for (int i = 0; i < 2; ++i)
     MoveWindow(app.video[i], margin + i * (video_width + gap), 210, video_width, video_height, TRUE);
   const int left = side_x + 16, field_width = side_width - 32;
-  for (int i = 0; i < 3; ++i) {
-    MoveWindow(app.config_labels[i], left, 188 + i * 55, field_width, 20, TRUE);
-    HWND field = i == 0 ? app.driver_config : (i == 1 ? app.vehicle_config : app.password);
-    MoveWindow(field, left, 210 + i * 55, field_width, 28, TRUE);
+  for (int i = 0; i < 4; ++i) {
+    MoveWindow(app.config_labels[i], left, 182 + i * 45, field_width, 18, TRUE);
+    HWND field = i == 0 ? app.driver_config : i == 1 ? app.vehicle_config : i == 2 ? app.driver_id : app.password;
+    MoveWindow(field, left, 200 + i * 45, field_width, 26, TRUE);
   }
-  MoveWindow(app.start, left, 365, (field_width - gap) / 2, 34, TRUE);
-  MoveWindow(app.stop, left + (field_width + gap) / 2, 365, (field_width - gap) / 2, 34, TRUE);
-  MoveWindow(app.help, left, 430, field_width, app.mock_control ? 20 : 70, TRUE);
+  MoveWindow(app.start, left, 385, (field_width - gap) / 2, 34, TRUE);
+  MoveWindow(app.stop, left + (field_width + gap) / 2, 385, (field_width - gap) / 2, 34, TRUE);
+  MoveWindow(app.help, left, 450, field_width, app.mock_control ? 20 : 70, TRUE);
   if (app.mock_control) {
     constexpr int key_width = 40, key_height = 25, key_gap = 4;
-    MoveWindow(app.keycaps[0], left + key_width + key_gap, 455, key_width, key_height, TRUE);
+    MoveWindow(app.keycaps[0], left + key_width + key_gap, 475, key_width, key_height, TRUE);
     for (int i = 1; i < 4; ++i)
-      MoveWindow(app.keycaps[i], left + (i - 1) * (key_width + key_gap), 484, key_width, key_height, TRUE);
-    MoveWindow(app.keycaps[4], left + 3 * (key_width + key_gap), 455, field_width - 3 * (key_width + key_gap), key_height, TRUE);
-    MoveWindow(app.keycaps[5], left + 3 * (key_width + key_gap), 484, field_width - 3 * (key_width + key_gap), key_height, TRUE);
+      MoveWindow(app.keycaps[i], left + (i - 1) * (key_width + key_gap), 504, key_width, key_height, TRUE);
+    MoveWindow(app.keycaps[4], left + 3 * (key_width + key_gap), 475, field_width - 3 * (key_width + key_gap), key_height, TRUE);
+    MoveWindow(app.keycaps[5], left + 3 * (key_width + key_gap), 504, field_width - 3 * (key_width + key_gap), key_height, TRUE);
   }
-  if (app.mock_estop_button) MoveWindow(app.mock_estop_button, left, 516, field_width, 32, TRUE);
-  if (app.mock_info) MoveWindow(app.mock_info, left, 558, field_width, 80, TRUE);
+  if (app.mock_estop_button) MoveWindow(app.mock_estop_button, left, 536, field_width, 30, TRUE);
+  if (app.mock_info) MoveWindow(app.mock_info, left, 570, field_width, 76, TRUE);
 }
 
 void fill(HDC dc, int left, int top, int right, int bottom, HBRUSH brush) {
@@ -961,7 +964,10 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       app->driver_config = control(hwnd, L"EDIT", L"configs/driver-console.dev.yaml", WS_BORDER | ES_AUTOHSCROLL, 0, 0, 1, 1);
       app->config_labels[1] = control(hwnd, L"STATIC", L"车端台架配置", 0, 0, 0, 1, 1);
       app->vehicle_config = control(hwnd, L"EDIT", L"configs/vehicle-agent.orin-cpu-bench.yaml", WS_BORDER | ES_AUTOHSCROLL, 0, 0, 1, 1);
-      app->config_labels[2] = control(hwnd, L"STATIC", L"驾驶员密码", 0, 0, 0, 1, 1);
+      app->config_labels[2] = control(hwnd, L"STATIC", L"驾驶员 ID（留空使用配置）", 0, 0, 0, 1, 1);
+      app->driver_id = control(hwnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 0, 0, 1, 1);
+      SendMessageW(app->driver_id, EM_SETLIMITTEXT, 128, 0);
+      app->config_labels[3] = control(hwnd, L"STATIC", L"驾驶员密码", 0, 0, 0, 1, 1);
       app->password = control(hwnd, L"EDIT", L"", WS_BORDER | ES_PASSWORD | ES_AUTOHSCROLL, 0, 0, 1, 1);
       app->start = control(hwnd, L"BUTTON", L"连接视频", BS_OWNERDRAW, 0, 0, 1, 1, 1);
       app->stop = control(hwnd, L"BUTTON", L"断开", BS_OWNERDRAW, 0, 0, 1, 1, 2);
@@ -1021,7 +1027,7 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
           app->mock_control ? L"Windows 原生端  ·  隔离 mock 台架  ·  零车速" : L"Windows 原生端  ·  仅观看");
       label(dc, app->font, RGB(231, 237, 246), 16, 180, rect.right - 330, 205, L"实时视频");
       label(dc, app->font, RGB(231, 237, 246), rect.right - 300, 138, rect.right - 32, 168, L"连接与控制");
-      label(dc, app->small_font, RGB(142, 160, 184), rect.right - 300, 401, rect.right - 32, 425,
+      label(dc, app->small_font, RGB(142, 160, 184), rect.right - 300, 421, rect.right - 32, 445,
           app->mock_control ? L"键盘控制" : L"操作说明");
       EndPaint(hwnd, &ps);
       return 0;
@@ -1077,14 +1083,15 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
           app->mock_estop_requested.store(false);
           auto secret = text_of(app->password);
           auto driver = utf8(text_of(app->driver_config)), vehicle = utf8(text_of(app->vehicle_config));
+          auto requested_driver = utf8(text_of(app->driver_id));
           auto encoded = utf8(secret);
           SecureZeroMemory(secret.data(), secret.size() * sizeof(wchar_t));
           SetWindowTextW(app->password, L"");
           if (encoded.empty()) throw std::runtime_error("password required");
           EnableWindow(app->start, FALSE); EnableWindow(app->stop, TRUE);
-          app->worker = std::jthread([app, driver = std::move(driver), vehicle = std::move(vehicle),
+          app->worker = std::jthread([app, driver = std::move(driver), vehicle = std::move(vehicle), requested_driver = std::move(requested_driver),
                                       encoded = std::move(encoded)](std::stop_token token) mutable {
-            app->connect(std::move(driver), std::move(vehicle), std::move(encoded), token);
+            app->connect(std::move(driver), std::move(vehicle), std::move(requested_driver), std::move(encoded), token);
           });
           if (app->mock_control) SetFocus(hwnd);
         } catch (...) { app->running = false; app->report(L"请输入有效的配置路径和密码。"); }
@@ -1240,6 +1247,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
   if (!hwnd) return 1;
   ShowWindow(hwnd, show); UpdateWindow(hwnd);
   MSG message{};
-  while (GetMessageW(&message, nullptr, 0, 0) > 0) { TranslateMessage(&message); DispatchMessageW(&message); }
+  while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+    const bool in_window = message.hwnd == hwnd || IsChild(hwnd, message.hwnd);
+    if (in_window && message.message == WM_KEYDOWN && message.wParam == VK_TAB) {
+      app.keyboard.withdraw(); app.clear_input_display();
+      const bool backwards = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+      if (const auto next = GetNextDlgTabItem(hwnd, GetFocus(), backwards)) SetFocus(next);
+      continue;
+    }
+    if (in_window && message.message == WM_KEYDOWN && message.wParam == VK_RETURN &&
+        GetFocus() == app.password && IsWindowEnabled(app.start)) {
+      SendMessageW(app.start, BM_CLICK, 0, 0);
+      continue;
+    }
+    TranslateMessage(&message); DispatchMessageW(&message);
+  }
   return static_cast<int>(message.wParam);
 }

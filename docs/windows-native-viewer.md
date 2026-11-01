@@ -90,6 +90,9 @@ From the artifact directory, run `./run-native-viewer.ps1 -GStreamerRoot
 runtime environment to the process, and starts the viewer. Use `-CheckOnly` to
 check dependencies without opening a window. Enter absolute paths in the two
 configuration fields, enter the driver password, and choose Connect.
+The optional driver ID field overrides the ID from the driver configuration;
+an empty field retains the configured ID. The existing runtime validates the
+identity and authenticates it with the supplied password.
 Disconnect closes the session; closing the window also requests disconnection.
 
 The vehicle YAML supplied to the viewer must describe one or two H.264 cameras,
