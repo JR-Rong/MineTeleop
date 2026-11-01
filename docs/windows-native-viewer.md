@@ -34,6 +34,16 @@ telemetry or control readiness is lost. Held keys must be released before a
 new press can take effect after a loss. There is no production emergency-stop
 input or authorization in this prototype.
 
+If the vehicle invalidates the confirmed session profile, the viewer withdraws
+input and keeps the session open. The operator must select “重新确认限幅”;
+the mock profile is sent only after the video, clock, direct path and fresh
+zero-speed telemetry gates are satisfied. A newer request and matching vehicle
+acknowledgement are required, and held inputs must be released before reuse.
+This confirmation does not bypass the vehicle's safety-stop recovery rules.
+If the vehicle reports a hard timeout, ESTOP or fault, the profile confirmation
+alone cannot restore control; the viewer tells the operator to disconnect and
+follow the safety procedure before reconnecting.
+
 The native status strip follows the web console's distinction between measured
 speed and gear and locally requested gear, steering, throttle and brake.
 Measured values require fresh vehicle telemetry, including its source time;

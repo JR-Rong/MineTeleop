@@ -607,6 +607,12 @@ struct Window {
         if (!courier->tick(current, io)) throw std::runtime_error("mock courier retired");
         const auto transport = status.at("native_control").at("control_transport");
         const bool negotiated = transport.value("epoch", 0) > 0 && !transport.value("selecting", true);
+        const auto recovery_state = telemetry.is_object() ? telemetry.value("safety_state", "") : std::string{};
+        if (mock_profile_confirmation_requested.load() && mock_profile_needs_confirmation.load() &&
+            (recovery_state == "TIMEOUT_BRAKE" || recovery_state == "ESTOP" || recovery_state == "FAULT")) {
+          mock_profile_confirmation_requested.store(false);
+          report(L"车端处于超时制动或故障锁定；请断开会话并按安全流程重新连接，不能仅靠限幅确认恢复。");
+        }
         if (mock_profile_confirmation_requested.load() && mock_profile_needs_confirmation.load() &&
             ready && negotiated && requested_profile && !mock_estop_requested.load() &&
             detail::native_mock_input_fresh(telemetry_at_ms, static_cast<std::int64_t>(bench_now_ms())) &&

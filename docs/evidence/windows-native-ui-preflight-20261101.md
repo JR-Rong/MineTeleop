@@ -122,3 +122,16 @@ peaked at 439 ms across the run, subject to cross-host clock uncertainty;
 callback-to-control-mutex wait peaked at 1 ms. These observations do not
 identify the responsible network segment or establish an uninterrupted pass.
 Raw evidence is retained under `ui-long-02-1d707` in the artifact directory.
+
+## Focus-loss and profile confirmation preflight
+
+With viewer `4bf10ce`, a deliberate focus loss withdrew input and produced a
+vehicle safety stop. The viewer stayed open and offered manual profile
+confirmation. The simulated operator selected it; the vehicle logged a new
+request, sequence 7, as accepted. It was then cleared while the vehicle was in
+`TIMEOUT_BRAKE`, and later commands were rejected as `session_profile_not_ready`.
+The test did not recover active control. Direct media remained selected in
+the sampled observations, while the logical control path alternated between
+DC and WSS. The failure does not justify relaxing the safety state or treating
+the accepted profile request as evidence of recovery. Raw evidence is retained
+under `ui-profile-01-4bf` in the local artifact directory.
