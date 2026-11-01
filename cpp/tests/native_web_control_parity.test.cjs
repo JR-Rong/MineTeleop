@@ -3,6 +3,9 @@
 // Compare the native implementation with the actual shipped web reducer.
 const assert = require('assert').strict;
 const {spawnSync} = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const vm = require('vm');
 const {deriveControl} = require('../web/control_logic.js');
 
 const inputs = [];
@@ -37,3 +40,37 @@ for (let i = 0; i < inputs.length; ++i) {
   assert.equal(Boolean(Number(estop)), expected.estop, `estop case ${i}`);
 }
 console.log(`matched ${inputs.length} cases against the shipped web reducer`);
+
+// Execute the actual browser sampler for standard-mapped gamepads. The fixture
+// supplies authority and a selected gear so this compares only calibration.
+const source = fs.readFileSync(path.join(__dirname, '../src/server.cpp'), 'utf8');
+const names = ['clamp', 'applyDeadzone', 'applyPedalDeadzone', 'axisValue', 'buttonValue', 'sampleGamepad'];
+const functions = names.map(name => {
+  const match = source.match(new RegExp(`^function ${name}\\(.*$`, 'm'));
+  assert(match, `missing shipped ${name} function`);
+  return match[0];
+}).join('\n');
+const padCases = [];
+for (const axis of [-1, -.5, -.05, 0, .1, .8, 1]) for (const throttle of [0, .04, .3, 1]) {
+  for (const inverted of [false, true]) padCases.push({axis, throttle, brake: .35, center: .1, range: .8, deadzone: .05, inverted});
+}
+const padInput = padCases.map(p => [p.axis, p.throttle, p.brake, p.center, p.range, p.deadzone, Number(p.inverted)].join(' ')).join('\n');
+const padRun = spawnSync(process.argv[2], ['--standard-gamepad'], {input: padInput, encoding: 'utf8'});
+assert.equal(padRun.status, 0, padRun.stderr);
+const padResults = padRun.stdout.trim().split('\n');
+assert.equal(padResults.length, padCases.length);
+padCases.forEach((p, i) => {
+  const buttons = Array.from({length: 8}, () => ({value: 0}));
+  buttons[6].value = p.brake; buttons[7].value = p.throttle;
+  const context = vm.createContext({gamepadConfig: {enabled: true, axis_deadzone: p.deadzone,
+      steering_inverted: p.inverted, estop_button: 0},
+    document: {hidden: false, hasFocus: () => true}, firstConnectedGamepad: () => ({mapping: 'standard', axes: [p.axis], buttons}),
+    calibration: {steeringCenter: p.center, steeringRange: p.range}, gamepadState: {},
+    renderControlState: () => {}, vcuEverReady: true, applyGamepadNeutralInterlock: () => {},
+    selectedGear: 'D', gamepadEstopPressedAt: 0});
+  vm.runInContext(`${functions}\nsampleGamepad();`, context);
+  const actual = padResults[i].split(' ').map(Number);
+  for (const [index, name] of ['steering', 'throttle', 'brake'].entries())
+    assert(Math.abs(actual[index] - context.gamepadState[name]) < 1e-12, `${name} gamepad case ${i}`);
+});
+console.log(`matched ${padCases.length} cases against the shipped standard gamepad sampler`);
