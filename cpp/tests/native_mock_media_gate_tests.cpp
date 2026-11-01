@@ -211,6 +211,12 @@ void test_live_clock_keyboard_and_media_guard() {
           "missing or future input observation was admitted");
   require(native_mock_input_fresh(1001, 1001) && native_mock_input_fresh(1001, 1200) &&
           !native_mock_input_fresh(1001, 1201), "200 ms input lease boundary changed");
+  using mine_teleop::detail::native_mock_source_fresh;
+  require(native_mock_source_fresh(1000, 1159, 0, 15) && !native_mock_source_fresh(1000, 1160, 0, 15) &&
+          native_mock_source_fresh(1040, 1000, 0, 15) && !native_mock_source_fresh(1041, 1000, 0, 15) &&
+          !native_mock_source_fresh(0, 1000, 0, 15) && !native_mock_source_fresh(1000, 1000, 0, 26) &&
+          !native_mock_source_fresh(1000, std::numeric_limits<std::int64_t>::max(), 1, 15),
+          "source timestamp freshness, clock uncertainty, or overflow boundary changed");
   using mine_teleop::detail::native_mock_clock_fresh;
   require(!native_mock_clock_fresh(0, 1000) && !native_mock_clock_fresh(1001, 1000) &&
           native_mock_clock_fresh(1001, 1500) && !native_mock_clock_fresh(1001, 1501),

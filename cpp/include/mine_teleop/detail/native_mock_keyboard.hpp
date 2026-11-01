@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <mutex>
+#include <limits>
 #include <stdexcept>
 
 namespace mine_teleop::detail {
@@ -15,6 +16,22 @@ inline bool native_mock_input_fresh(std::int64_t observed_ms, std::int64_t now_m
 
 inline bool native_mock_clock_fresh(std::int64_t observed_ms, std::int64_t now_ms) {
   return observed_ms > 0 && now_ms >= observed_ms && now_ms - observed_ms < 500;
+}
+
+// Both endpoints synchronize independently to the same signaling clock. Use
+// their combined uncertainty conservatively; receipt time alone cannot prove
+// a delayed gear report is current.
+inline bool native_mock_source_fresh(std::int64_t source_ms, std::int64_t wall_ms,
+                                     std::int64_t offset_ms, std::int64_t uncertainty_ms) {
+  if (source_ms <= 0 || wall_ms <= 0 || uncertainty_ms < 0 || uncertainty_ms > 25 ||
+      (offset_ms > 0 && wall_ms > std::numeric_limits<std::int64_t>::max() - offset_ms) ||
+      (offset_ms < 0 && wall_ms < std::numeric_limits<std::int64_t>::min() - offset_ms)) return false;
+  const auto now_ms = wall_ms + offset_ms;
+  if (now_ms <= 0) return false;
+  // The vehicle's existing admission gate caps its independent error at 25 ms.
+  const auto uncertainty = uncertainty_ms + 25;
+  if (source_ms > now_ms) return source_ms - now_ms <= uncertainty;
+  return now_ms - source_ms < 200 - uncertainty;
 }
 
 // The UI thread supplies a foreground keyboard heartbeat. This state is only

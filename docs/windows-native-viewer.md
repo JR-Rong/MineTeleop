@@ -20,8 +20,10 @@ torque and zero steering limit; this mode is not a motion-control interface.
 Focus the main viewer or click a video panel. W/up and S/down request forward
 and reverse respectively, A/left and D/right request mock steering, space
 requests service brake, and B requests hard brake. A gear change is sent with
-zero traction and steering; the held direction is applied only after fresh
-vehicle telemetry confirms the requested gear at zero speed. Both direction
+zero traction and steering; the held direction is applied only after vehicle
+telemetry confirms the requested gear at zero speed. Confirmation must be fresh
+both by local receipt time and by the vehicle's source timestamp, accounting
+for both endpoints' existing clock uncertainty limits. Both direction
 keys together request no traction, and braking takes precedence. Brake ratios come from the acknowledged session
 profile; hard brake takes precedence. E or the mock emergency button latches
 an emergency request. The display distinguishes a request from fresh vehicle

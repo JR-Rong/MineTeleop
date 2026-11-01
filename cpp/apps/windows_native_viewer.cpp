@@ -197,7 +197,7 @@ struct Window {
     auto next_status = Clock::now();
     Json cached_status;
     Json telemetry;
-    std::int64_t telemetry_at_ms = 0;
+    std::int64_t telemetry_at_ms = 0, telemetry_source_ms = 0;
     std::uint64_t telemetry_seq = 0, safety_stop_episodes = 0, last_result_seq = 0;
     std::uint64_t telemetry_status_observed = 0;
     std::uint64_t telemetry_wire_observed = 0, telemetry_wire_last_seq = 0;
@@ -354,6 +354,8 @@ struct Window {
         if (seq <= telemetry_seq || !value.contains("control_timing") || !value.at("control_timing").is_object()) return;
         telemetry_seq = seq;
         telemetry_at_ms = static_cast<std::int64_t>(bench_now_ms());
+        telemetry_source_ms = value.contains("sent_at_utc_ms") && value.at("sent_at_utc_ms").is_number_integer()
+            ? value.at("sent_at_utc_ms").get<std::int64_t>() : 0;
         const auto state = value.value("safety_state", "unknown");
         const bool braking = value.at("control_timing").value("control_braking_wait", true);
         if (state == "CONTROL_ACTIVE" && !braking) was_active = true;
@@ -458,9 +460,13 @@ struct Window {
       // The courier may have delivered newer telemetry after the loop's
       // initial timestamp. Compare against a clock read taken after delivery.
       const auto authorization_observed_ms = static_cast<std::int64_t>(bench_now_ms());
+      const auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch()).count();
       const auto telemetry_gear = telemetry.is_object() ? telemetry.value("gear", "") : std::string{};
       const bool authorized = !mock_estop_requested.load() && ready && profile_accepted && handshake_sent &&
           detail::native_mock_input_fresh(telemetry_at_ms, authorization_observed_ms) && telemetry.is_object() &&
+          detail::native_mock_source_fresh(telemetry_source_ms, wall_ms,
+              sync.value("offset_ms", std::int64_t{0}), sync.value("uncertainty_ms", std::int64_t{-1})) &&
           telemetry.value("safety_state", "") == "CONTROL_ACTIVE" &&
           !telemetry.value("braking_wait", true) && (telemetry_gear == "N" || telemetry_gear == "D" || telemetry_gear == "R") &&
           telemetry.contains("speed_mps") && telemetry.at("speed_mps").is_number() &&
