@@ -847,6 +847,7 @@ struct Window {
       const std::string_view detail = error.what();
       const char* category = detail.find("time synchronization uncertainty") != std::string_view::npos ? "clock_uncertainty" :
           detail.find("time sync") != std::string_view::npos ? "time_sync" :
+          detail.find("driver ID is required") != std::string_view::npos ? "invalid_driver_id" :
           detail.find("HTTP status 401") != std::string_view::npos ? "unauthorized" :
           detail.find("native view has no matching media pad") != std::string_view::npos ? "unmapped_pad" :
           detail.find("decode track pad link noformat") != std::string_view::npos ? "track_link_noformat" :
@@ -856,6 +857,8 @@ struct Window {
       std::fprintf(stderr, "native_viewer_failure phase=%s category=%s\n", phase, category);
       std::fill(secret.begin(), secret.end(), '\0');
       report(stop_token.stop_requested() ? L"已取消连接。" :
+          std::string_view(category) == "invalid_driver_id" ? L"驾驶员 ID 无效：不能包含空白字符。" :
+          std::string_view(category) == "unauthorized" ? L"登录失败：请检查驾驶员 ID 和密码。" :
           L"连接或视频失败。请检查配置、台架隔离、信令和 GStreamer 依赖。");
     }
     { std::lock_guard lock(render_mutex); render_session.reset(); }
@@ -969,7 +972,7 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       SendMessageW(app->driver_id, EM_SETLIMITTEXT, 128, 0);
       app->config_labels[3] = control(hwnd, L"STATIC", L"驾驶员密码", 0, 0, 0, 1, 1);
       app->password = control(hwnd, L"EDIT", L"", WS_BORDER | ES_PASSWORD | ES_AUTOHSCROLL, 0, 0, 1, 1);
-      app->start = control(hwnd, L"BUTTON", L"连接视频", BS_OWNERDRAW, 0, 0, 1, 1, 1);
+      app->start = control(hwnd, L"BUTTON", app->mock_control ? L"连接台架" : L"连接视频", BS_OWNERDRAW, 0, 0, 1, 1, 1);
       app->stop = control(hwnd, L"BUTTON", L"断开", BS_OWNERDRAW, 0, 0, 1, 1, 2);
       app->help = control(hwnd, L"STATIC", app->mock_control ?
           L"按键状态 · E 急停 · 非执行确认" :
@@ -1089,6 +1092,7 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
           SetWindowTextW(app->password, L"");
           if (encoded.empty()) throw std::runtime_error("password required");
           EnableWindow(app->start, FALSE); EnableWindow(app->stop, TRUE);
+          for (const auto field : {app->driver_config, app->vehicle_config, app->driver_id, app->password}) EnableWindow(field, FALSE);
           app->worker = std::jthread([app, driver = std::move(driver), vehicle = std::move(vehicle), requested_driver = std::move(requested_driver),
                                       encoded = std::move(encoded)](std::stop_token token) mutable {
             app->connect(std::move(driver), std::move(vehicle), std::move(requested_driver), std::move(encoded), token);
@@ -1105,6 +1109,8 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       SetWindowTextW(app->status, app->message.c_str());
       EnableWindow(app->start, !app->running.load());
       EnableWindow(app->stop, app->running.load());
+      for (const auto field : {app->driver_config, app->vehicle_config, app->driver_id, app->password})
+        EnableWindow(field, !app->running.load());
       if (app->mock_estop_button) EnableWindow(app->mock_estop_button, app->running.load());
       return 0;
     }
