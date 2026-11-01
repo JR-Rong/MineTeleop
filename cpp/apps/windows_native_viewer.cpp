@@ -551,6 +551,16 @@ struct Window {
       bool gear_status_new = false;
       { std::lock_guard lock(gear_mutex); gear_status_new = gear_transition.observe_status(status_seq); }
       if (gear_status_new && event == "control_command_rejected" &&
+          value.value("issue_code", "") == "control_input_rearm_required") {
+        {
+          std::lock_guard lock(gear_mutex);
+          gear_transition.cancel();
+          mock_gear_rollback.store(0);
+        }
+        keyboard.require_input_rearm();
+        report(L"控制命令短暂中断，输入已清除并保持当前挡位；请释放方向键后重新按下。");
+      }
+      if (gear_status_new && event == "control_command_rejected" &&
           value.value("issue_code", "") == "vcu_drive_gear_change_moving_or_stale") {
         const auto positive_seq = [&](const char* field) -> std::uint64_t {
           return value.contains(field) && value.at(field).is_number_unsigned()

@@ -53,6 +53,7 @@ class NativeMockKeyboard {
       throttle_limit_ = throttle; steering_limit_ = steering_deg; steering_scale_ = steering_scale_deg;
       needs_release_ = true;
       gamepad_needs_neutral_ = true;
+      preserve_brake_during_rearm_ = false;
     }
   }
 
@@ -73,6 +74,7 @@ class NativeMockKeyboard {
       profile_ready_ = true;
       needs_release_ = true;
       gamepad_needs_neutral_ = true;
+      preserve_brake_during_rearm_ = false;
     }
   }
 
@@ -94,6 +96,16 @@ class NativeMockKeyboard {
     gamepad_ = {};
     needs_release_ = true;
     gamepad_needs_neutral_ = true;
+    preserve_brake_during_rearm_ = false;
+  }
+
+  // A vehicle-requested input rearm keeps the UI heartbeat alive, preserves
+  // braking, and requires release before either input source can drive again.
+  void require_input_rearm() {
+    std::lock_guard lock(mutex_);
+    needs_release_ = true;
+    gamepad_needs_neutral_ = true;
+    preserve_brake_during_rearm_ = true;
   }
 
   bool heartbeat_alive(std::int64_t now_ms) {
@@ -127,7 +139,7 @@ class NativeMockKeyboard {
         (gamepad.connected && gamepad.index != gamepad_.index)) gamepad_needs_neutral_ = true;
     gamepad_ = focused_ ? gamepad : Gamepad{};
     observed_at_ms_ = focused_ ? now_ms : 0;
-    if (!focused_) { needs_release_ = true; gamepad_needs_neutral_ = true; }
+    if (!focused_) { needs_release_ = true; gamepad_needs_neutral_ = true; preserve_brake_during_rearm_ = false; }
   }
 
   bool heartbeat_alive_locked(std::int64_t now_ms) const {
@@ -140,19 +152,31 @@ class NativeMockKeyboard {
         now_ms - observed_at_ms_ >= 150 || (confirmed_gear != 'N' && confirmed_gear != 'D' && confirmed_gear != 'R')) {
       needs_release_ = true;
       gamepad_needs_neutral_ = true;
+      preserve_brake_during_rearm_ = false;
       return {};
     }
     const bool any = keys_.forward || keys_.reverse || keys_.left || keys_.right || keys_.brake || keys_.hard_brake;
     if (needs_release_) {
-      if (!any) needs_release_ = false;
-      return {};
+      const bool held = preserve_brake_during_rearm_
+          ? keys_.forward || keys_.reverse || keys_.left || keys_.right : any;
+      if (!held) needs_release_ = false;
+      if (!preserve_brake_during_rearm_) return {};
+      const auto safe = NativeWebControl::derive(
+          {false, false, false, false, keys_.brake, keys_.hard_brake},
+          {0.0, 0.0, gamepad_.connected ? gamepad_.brake : 0.0}, confirmed_gear,
+          {throttle_limit_, brake_available_ ? 1.0 : 0.0, service_brake_, hard_brake_, steering_limit_},
+          steering_scale_);
+      return {0.0, 0.0, safe.brake, confirmed_gear, 0, false};
     }
     NativeWebControl::Gamepad pad{};
     if (gamepad_.connected) {
       if (gamepad_needs_neutral_) {
-        if (gamepad_.throttle == 0 && gamepad_.brake == 0) gamepad_needs_neutral_ = false;
+        if (gamepad_.throttle == 0 && gamepad_.brake == 0) {
+          gamepad_needs_neutral_ = false;
+          preserve_brake_during_rearm_ = false;
+        } else if (preserve_brake_during_rearm_) pad.brake = gamepad_.brake;
       } else pad = {gamepad_.steering, gamepad_.throttle, gamepad_.brake};
-    }
+    } else preserve_brake_during_rearm_ = false;
     // Ask for a gear change with no traction or steering, and wait for fresh
     // vehicle telemetry to confirm it before applying the held direction.
     const bool braking = keys_.brake || keys_.hard_brake || pad.brake > 0;
@@ -177,6 +201,7 @@ class NativeMockKeyboard {
   bool focused_{false};
   bool needs_release_{true};
   bool gamepad_needs_neutral_{true};
+  bool preserve_brake_during_rearm_{false};
   bool profile_ready_{false};
   bool brake_available_{false};
   double service_brake_{0}, hard_brake_{0};

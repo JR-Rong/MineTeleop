@@ -200,6 +200,34 @@ void test_mock_keyboard_rearms_only_after_release() {
   keyboard.observe(true, Keys{true, false, false, false}, 310);
   require(keyboard.sample(true, 311, 'D').throttle == .25, "released key could not be freshly pressed");
 }
+void test_vehicle_rearm_withdraws_motion_and_preserves_brake() {
+  using Keyboard = mine_teleop::detail::NativeMockKeyboard;
+  Keyboard keyboard;
+  keyboard.set_brake_profile(30, 80, 100);
+  keyboard.set_control_limits(.25, 7.5, 30);
+  keyboard.observe(true, {}, {true, 0, 0, 0, 0}, 100);
+  static_cast<void>(keyboard.sample(true, 100, 'D'));
+  static_cast<void>(keyboard.sample(true, 100, 'D'));
+  keyboard.observe(true, {true, true, false, true}, {true, .5, .8, .6, 0}, 110);
+  keyboard.require_input_rearm();
+  auto safe = keyboard.sample(true, 111, 'D');
+  require(keyboard.heartbeat_alive(111) && !safe.armed && safe.gear == 'D' &&
+          safe.throttle == 0 && safe.steering == 0 && safe.brake == .6,
+          "vehicle rearm lost heartbeat, gear or brake, or retained motion");
+  require(keyboard.sample(true, 112, 'D').throttle == 0, "held input resumed during vehicle rearm");
+  keyboard.observe(true, {}, {true, .5, .8, .6, 0}, 113);
+  safe = keyboard.sample(true, 113, 'D');
+  require(safe.throttle == 0 && safe.steering == 0 && safe.brake == .6,
+          "release of keyboard bypassed held gamepad neutral or discarded brake");
+  safe = keyboard.sample(true, 114, 'D');
+  require(safe.throttle == 0 && safe.steering == 0 && safe.brake == .6,
+          "held gamepad bypassed neutral interlock after keyboard release");
+  keyboard.observe(true, {}, {true, 0, 0, 0, 0}, 115);
+  static_cast<void>(keyboard.sample(true, 115, 'D'));
+  keyboard.observe(true, {true, false, false, false}, {true, 0, 0, 0, 0}, 116);
+  require(keyboard.sample(true, 116, 'D').throttle == .25,
+          "fresh press remained blocked after both inputs released");
+}
 void test_mock_direction_combinations_require_gear_confirmation() {
   using Keyboard = mine_teleop::detail::NativeMockKeyboard;
   Keyboard keyboard;
@@ -325,6 +353,6 @@ void test_mock_gamepad_neutral_and_profile_limits() {
   require(input.throttle == 0 && input.steering == 0, "zero mock limits produced nonzero motion intent");
 }
 }
-int main() { try { test_gate(); test_neutral_refresh_sequence(); test_profile_retry_stays_bounded_and_needs_live_guards(); test_profile_requires_new_manual_confirmation_after_invalidation(); test_mock_gear_confirmation_requires_forwarded_intent_and_new_feedback(); test_dtls_header_trace_is_bounded_and_excludes_payloads(); test_mock_keyboard_rearms_only_after_release(); test_mock_direction_combinations_require_gear_confirmation(); test_live_clock_keyboard_and_media_guard(); test_mock_gamepad_neutral_and_profile_limits();
+int main() { try { test_gate(); test_neutral_refresh_sequence(); test_profile_retry_stays_bounded_and_needs_live_guards(); test_profile_requires_new_manual_confirmation_after_invalidation(); test_mock_gear_confirmation_requires_forwarded_intent_and_new_feedback(); test_dtls_header_trace_is_bounded_and_excludes_payloads(); test_mock_keyboard_rearms_only_after_release(); test_vehicle_rearm_withdraws_motion_and_preserves_brake(); test_mock_direction_combinations_require_gear_confirmation(); test_live_clock_keyboard_and_media_guard(); test_mock_gamepad_neutral_and_profile_limits();
   std::cout << "PASS scoped mock media, input renewal, keyboard and clock guard\n"; return 0; }
 catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; } }
