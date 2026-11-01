@@ -39,7 +39,7 @@ PRELUDE = r'''
 #include "mine_teleop/detail/ice_diagnostics.hpp"
 namespace detail { using mine_teleop::detail::ice_candidate_summary; using mine_teleop::detail::ice_direct_sdp; }
 using Json=nlohmann::json;
-namespace detail { constexpr std::string_view kControlTransportCapability = "native-control-transport-v1"; constexpr std::string_view kEmergencyStopCapability = "native-stop-only-v1"; constexpr std::string_view kFeedbackTransportCapability = "native-feedback-transport-v1"; constexpr std::string_view kMockCompactControl = "mock-compact-control-cbor-v1"; }
+namespace detail { constexpr std::string_view kControlTransportCapability = "native-control-transport-v1"; constexpr std::string_view kEmergencyStopCapability = "native-stop-only-v1"; constexpr std::string_view kFeedbackTransportCapability = "native-feedback-transport-v1"; constexpr std::string_view kMockCompactControl = "mock-compact-control-cbor-v1"; constexpr std::string_view kMockDualControlCapability = "mock-dual-control-v1"; }
 using guint=unsigned;using guint8=unsigned char;using gchar=char;using gpointer=void*;
 struct GstSDPMessage {std::string text;};
 struct GstWebRTCSessionDescription {GstSDPMessage* sdp;};
@@ -100,6 +100,8 @@ struct Impl {
 MEMBERS = r'''
   bool compact_enabled=false;
   bool mock_compact_control_enabled() const {return compact_enabled;}
+  bool dual_enabled=false;
+  bool mock_dual_control_enabled() const {return dual_enabled;}
   struct { struct { int experimental_direct_authority_max_ms=0; bool mock_control_diagnostic=false; } runtime; } config;
   void flush_control_status() {} // Control status has separate protocol/service coverage.
   void process_control_management(const Json&,const Json&) {}
@@ -154,12 +156,14 @@ void case_order() {
 #endif
 }
 void case_compact_offer() {
-  for (bool enabled : {false,true}) {
-    Impl impl;impl.compact_enabled=enabled;GstElement peer;activate(impl,peer);negotiate(impl,peer);
+  for (bool enabled : {false,true}) for (bool dual : {false,true}) {
+    Impl impl;impl.compact_enabled=enabled;impl.dual_enabled=dual;GstElement peer;activate(impl,peer);negotiate(impl,peer);
     complete(peer);impl.flush_outgoing_signals();
     expect(impl.signaling.sent.size()==1&&impl.signaling.sent[0].first=="webrtc_offer","mock offer missing");
     expect(impl.signaling.sent[0].second.value("mock_compact_control","")==
         (enabled?std::string(detail::kMockCompactControl):std::string{}),"mock capability advertisement mismatch");
+    expect(impl.signaling.sent[0].second.value("mock_dual_control","")==
+        (dual?std::string(detail::kMockDualControlCapability):std::string{}),"mock dual capability advertisement mismatch");
   }
 }
 void case_late_callbacks() {
