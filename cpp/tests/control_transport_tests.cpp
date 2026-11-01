@@ -203,6 +203,22 @@ void compact_mock_wire_preserves_the_signed_command() {
   const auto decoded = decode_mock_compact_control(*bytes, scope);
   expect(decoded && decoded->dump() == frame.dump() && verify_transport_message(*decoded, key, false),
       "compact mock command changed the signed bytes");
+  auto dual = frame;
+  dual["mock_dual_control"] = kMockDualControlCapability;
+  dual["native_mac"] = transport_message_mac(dual, key, false);
+  expect(!encode_mock_compact_control(dual), "legacy compact capability accepted dual extension");
+  const auto dual_bytes = encode_mock_compact_control(dual, true);
+  expect(dual_bytes && dual_bytes->size() < 150, "negotiated compact dual command did not fit the budget");
+  const auto dual_decoded = decode_mock_compact_control(*dual_bytes, scope);
+  expect(dual_decoded && dual_decoded->dump() == dual.dump() && verify_transport_message(*dual_decoded, key, false),
+      "compact dual command changed the signed bytes");
+  for (std::size_t i = 0; i < dual_bytes->size(); ++i) {
+    auto changed = *dual_bytes; changed[i] ^= 1;
+    const auto tampered = decode_mock_compact_control(changed, scope);
+    expect(!tampered || !verify_transport_message(*tampered, key, false), "tampered compact dual command was authenticated");
+  }
+  auto unknown_dual = dual; unknown_dual["mock_dual_control"] = "unknown";
+  expect(!encode_mock_compact_control(unknown_dual, true), "unknown dual capability accepted");
   for (std::size_t i = 0; i < bytes->size(); ++i) {
     auto forged = *bytes; forged[i] ^= 1;
     const auto tampered = decode_mock_compact_control(forged, scope);
@@ -215,6 +231,8 @@ void compact_mock_wire_preserves_the_signed_command() {
   expect(!decode_mock_compact_control(forged, scope), "truncated compact command was decoded");
   auto extra = frame; extra["unexpected_extension"] = 1;
   expect(!encode_mock_compact_control(extra), "unknown signed field was silently discarded");
+  extra = dual; extra["unexpected_extension"] = 1;
+  expect(!encode_mock_compact_control(extra, true), "compact dual wire silently discarded an unknown signed field");
   extra = frame; extra["control_transport"]["path"] = "wss";
   expect(!encode_mock_compact_control(extra), "compact wire accepted a non-direct command");
 }

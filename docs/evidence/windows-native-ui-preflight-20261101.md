@@ -171,3 +171,44 @@ old; the Windows-to-gateway probe timed out approximately 1.8 seconds before
 the vehicle event. Clock uncertainty and the one-second probe interval limit
 attribution. Raw evidence is retained under `ui-long-04-4bf` in the local
 artifact directory.
+
+## Fifth 30-minute attempt
+
+Viewer `a05fe67` ran 1,794.78 seconds, about five seconds short of the target,
+before a control-link safety stop. All 1,785 sampled observations retained
+the pinned direct UDP pair; 1,781 sampled DC control and four sampled WSS.
+Of 299 scheduled input windows, 298 matched accepted vehicle commands; the
+unmatched reverse window overlapped the failure. All nine scenarios were
+covered, all accepted mock traction and steering values were zero, and there
+was no clock-threshold violation. The gateway probe reported 355 ms near the
+stop. This run did not pass 30-minute acceptance. Raw evidence is retained
+under `ui-long-05-a05` in the local artifact directory.
+
+## Exact-head focus and control preflights
+
+In a deliberate focus-loss test with viewer `2abca39`, the vehicle entered
+hard timeout. The viewer kept ordinary input inhibited, disabled profile
+confirmation and continuously displayed the instruction to disconnect and
+follow the safety procedure. The vehicle recorded only its initial profile
+request. The injected stop is not a long-duration acceptance result.
+
+The first long attempt with this build ran 235.53 seconds before a control-link
+braking wait. All 234 observations retained the pinned direct pair, while the
+control path sampled DC 233 times and WSS once. All 39 input windows matched
+vehicle-accepted commands and covered the nine scenarios; all accepted mock
+traction and steering values were zero. This run did not pass 30-minute
+acceptance. Raw evidence is retained under `ui-profile-03-2ab` and
+`ui-long-06-2ab` in the local artifact directory.
+
+The next exact-head run lasted 793.35 seconds and recorded two control-link
+braking-wait events. All 132 input windows matched, and all 789 one-second
+observations retained the direct pair and DC logical path. Among accepted
+result records, 14,571 reported the DC copy arriving first and 640 reported
+the WSS mirror arriving first. The dual-carrier run therefore does not prove
+exclusive direct delivery. Evidence is under `ui-long-07-2ab`.
+
+An attempted compact-control comparison was stopped after confirming that it
+actually sent JSON. The dual-control signed extension was not representable by
+the original compact format, so the existing exact-reconstruction check safely
+fell back. That interrupted run is not a compact or 30-minute result; its
+records remain under `ui-compact-01-invalid`.

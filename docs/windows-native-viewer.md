@@ -110,6 +110,14 @@ video, input and clock gates remain required. The paths may share the same
 Wi-Fi and cellular links and cannot guarantee independence or bounded delay.
 This is an isolated experiment, not a production transport or safety claim.
 
+When the vehicle explicitly advertises the newer mock compact-dual capability,
+the native viewer can encode the signed dual-control extension in its compact
+DataChannel message. The vehicle reconstructs the exact original signed JSON
+before the existing MAC, session, sequence and freshness checks. With an older
+peer, an unknown extension or an unsupported format, the sender falls back to
+JSON. This capability is restricted to the existing isolated zero-speed mock;
+it does not alter the full telemetry format or authorize production use.
+
 With `logging.control_trace_commands` enabled, mock mode batches a bounded
 record of command sequence, local DataChannel enqueue start/end and outcome.
 The record contains no raw packet or credentials; local enqueue is not proof of

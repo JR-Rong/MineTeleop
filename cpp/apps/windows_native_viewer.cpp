@@ -305,7 +305,7 @@ struct Window {
                         const Json& session, const std::string& attempt,
                         const std::shared_ptr<RenderSession>& render,
                         const std::shared_ptr<detail::NativeMockMediaGate>& gate,
-                        bool compact_control, std::stop_token parent, std::stop_token stop) {
+                        bool compact_control, bool compact_dual, std::stop_token parent, std::stop_token stop) {
     const std::string session_id = session.at("session_id").get<std::string>();
     const auto generation = session.at("control_session_generation").get<std::uint64_t>();
     const std::string owner = "windows-native-mock";
@@ -702,7 +702,7 @@ struct Window {
             [&](const std::string& bytes) {
               const auto started = static_cast<std::int64_t>(bench_now_ms());
               const auto frame = Json::parse(bytes, nullptr, false);
-              const auto compact = compact_control ? detail::encode_mock_compact_control(frame) : std::nullopt;
+              const auto compact = compact_control ? detail::encode_mock_compact_control(frame, compact_dual) : std::nullopt;
               const bool queued = compact ? channel->send_mock_compact(*compact) : channel->send(bytes);
               if (config.control_trace_commands) {
                 if (frame.is_object() && frame.contains("seq") && frame.at("seq").is_number_unsigned()) {
@@ -1145,6 +1145,8 @@ struct Window {
               options.ice_route_mode = payload.value("ice_route_mode", "all");
               const bool compact_control = mock_control &&
                   payload.value("mock_compact_control", "") == detail::kMockCompactControl;
+              const bool compact_dual = compact_control &&
+                  payload.value("mock_compact_dual_control", "") == detail::kMockCompactDualControl;
               if (mock_control) {
                 options.local_addresses = {mock_local_ip};
                 options.remote_addresses = {mock_peer_ip};
@@ -1172,9 +1174,9 @@ struct Window {
                 mock_gate = std::make_shared<detail::NativeMockMediaGate>(
                     session.at("session_id").get<std::string>(), vehicle.vehicle_id, negotiation, render->cameras);
                 auto* target = receiver.get();
-                control_worker = std::jthread([this, &driver, target, vehicle, config, session, negotiation, render, compact_control,
+                control_worker = std::jthread([this, &driver, target, vehicle, config, session, negotiation, render, compact_control, compact_dual,
                                                 gate = mock_gate, stop_token](std::stop_token token) {
-                  try { run_mock_control(driver, *target, vehicle, config, session, negotiation, render, gate, compact_control, stop_token, token); }
+                  try { run_mock_control(driver, *target, vehicle, config, session, negotiation, render, gate, compact_control, compact_dual, stop_token, token); }
                   catch (const std::exception& error) {
                     const std::string_view detail = error.what();
                     const char* category = detail.find("mock input worker failed") != std::string_view::npos ? "input_worker" :

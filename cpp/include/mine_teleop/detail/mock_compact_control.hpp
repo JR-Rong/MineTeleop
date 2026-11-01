@@ -12,6 +12,7 @@
 
 namespace mine_teleop::detail {
 inline constexpr std::string_view kMockCompactControl = "mock-compact-control-cbor-v1";
+inline constexpr std::string_view kMockCompactDualControl = "mock-compact-dual-control-cbor-v2";
 inline bool isolated_mock_control_allowed(bool explicitly_enabled, std::string_view vehicle,
                                           std::string_view adapter, double max_speed_kph) {
   return explicitly_enabled && vehicle.starts_with("test_bench_") && adapter == "mock" && max_speed_kph == 0.0;
@@ -37,13 +38,13 @@ inline std::optional<Json> decode_mock_compact_control(std::span<const std::uint
     for (unsigned i : {4u, 5u, 6u}) if (!a.at(i).is_number_float()) return std::nullopt;
     if (!a.at(3).is_string()) return std::nullopt;
     const auto flags = a.at(7).get<std::uint64_t>();
-    if ((flags & ~std::uint64_t{0x7ff}) != 0 || (flags & 1) != 0) return std::nullopt;
+    if ((flags & ~std::uint64_t{0xfff}) != 0 || (flags & 1) != 0) return std::nullopt;
     const auto& mac = a.at(14).get_binary();
     if (mac.size() != 32) return std::nullopt;
     static constexpr char hex[] = "0123456789abcdef";
     std::string digest; digest.reserve(64);
     for (auto b : mac) { digest.push_back(hex[b >> 4]); digest.push_back(hex[b & 15]); }
-    return Json{{"protocol_version", a.at(0)}, {"vehicle_id", scope.vehicle}, {"driver_id", scope.driver},
+    Json result{{"protocol_version", a.at(0)}, {"vehicle_id", scope.vehicle}, {"driver_id", scope.driver},
         {"session_id", scope.session}, {"seq", a.at(1)}, {"sent_at_utc_ms", a.at(2)}, {"type", "control_command"},
         {"gear", a.at(3)}, {"steering", a.at(4)}, {"throttle", a.at(5)}, {"brake", a.at(6)},
         {"estop", false}, {"operator_active", bool(flags & (1 << 1))},
@@ -57,10 +58,12 @@ inline std::optional<Json> decode_mock_compact_control(std::span<const std::uint
             {"media_attempt", scope.attempt}, {"epoch", a.at(11)}, {"from_epoch", a.at(12)},
             {"min_command_seq", a.at(13)}, {"action", (flags & (1 << 10)) ? "select" : "command"}}},
         {"native_mac", digest}};
+    if (flags & (1 << 11)) result["mock_dual_control"] = kMockDualControlCapability;
+    return result;
   } catch (const Json::exception&) { return std::nullopt; }
 }
 
-inline std::optional<std::vector<std::uint8_t>> encode_mock_compact_control(const Json& j) {
+inline std::optional<std::vector<std::uint8_t>> encode_mock_compact_control(const Json& j, bool dual_capable = false) {
   try {
     if (!j.is_object() || j.at("type") != "control_command" || j.at("estop") != false ||
         j.at("control_transport").at("protocol").get<std::string>() != kControlTransportCapability ||
@@ -76,6 +79,11 @@ inline std::optional<std::vector<std::uint8_t>> encode_mock_compact_control(cons
         "intent_fresh", "intent_requires_fresh_input"};
     for (std::size_t i = 0; i < names.size(); ++i) if (j.at(names[i]).get<bool>()) flags |= std::uint64_t{1} << (i + 1);
     if (t.at("action") == "select") flags |= 1 << 10;
+    if (j.contains("mock_dual_control")) {
+      if (!dual_capable || !j.at("mock_dual_control").is_string() ||
+          j.at("mock_dual_control").get<std::string>() != kMockDualControlCapability) return std::nullopt;
+      flags |= 1 << 11;
+    }
     const auto text = j.at("native_mac").get<std::string>();
     if (text.size() != 64) return std::nullopt;
     const auto nibble = [](char c) -> int { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; };

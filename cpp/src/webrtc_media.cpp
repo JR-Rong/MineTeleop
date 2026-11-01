@@ -1262,6 +1262,7 @@ struct VehicleMediaRuntime::Impl {
          {"type", "offer"},
          {"control_transport_capability", self->signaling.transport_mac_key().size() >= 32 ? detail::kControlTransportCapability : std::string_view{}},
          {"mock_compact_control", self->mock_compact_control_enabled() ? detail::kMockCompactControl : std::string_view{}},
+         {"mock_compact_dual_control", self->mock_compact_control_enabled() ? detail::kMockCompactDualControl : std::string_view{}},
          {"mock_dual_control", self->mock_dual_control_enabled() ? detail::kMockDualControlCapability : std::string_view{}},
          {"emergency_stop_capability", self->config.runtime.experimental_direct_authority_max_ms > 0 && self->signaling.transport_mac_key().size() >= 32 ? detail::kEmergencyStopCapability : std::string_view{}},
          {"feedback_transport_capability", self->config.runtime.experimental_direct_authority_max_ms > 0 && self->signaling.transport_mac_key().size() >= 32 ? detail::kFeedbackTransportCapability : std::string_view{}},
