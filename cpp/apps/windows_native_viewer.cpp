@@ -8,6 +8,7 @@
 #include "mine_teleop/detail/native_control_courier.hpp"
 #include "mine_teleop/detail/mock_compact_control.hpp"
 #include "mine_teleop/detail/native_viewer_observation.hpp"
+#include "mine_teleop/detail/native_video_layout.hpp"
 #include <gst/video/video.h>
 #include <gio/gnetworking.h>
 #include <windows.h>
@@ -105,8 +106,10 @@ struct RenderSession {
       bitmap.bmiHeader.biPlanes = 1;
       bitmap.bmiHeader.biBitCount = 32;
       bitmap.bmiHeader.biCompression = BI_RGB;
-      const int result = StretchDIBits(dc, 0, 0, rect.right, rect.bottom, 0, 0, frame->width, frame->height,
-                                       frame->pixels.data(), &bitmap, DIB_RGB_COLORS, SRCCOPY);
+      const auto fitted = detail::native_video_fit(frame->width, frame->height, rect.right, rect.bottom);
+      FillRect(dc, &rect, reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+      const int result = fitted ? StretchDIBits(dc, fitted->x, fitted->y, fitted->width, fitted->height,
+          0, 0, frame->width, frame->height, frame->pixels.data(), &bitmap, DIB_RGB_COLORS, SRCCOPY) : 0;
       const bool visible = IsWindowVisible(parent) && !IsIconic(parent) && GetForegroundWindow() == parent;
       if (health) static_cast<void>(health->set_usable(frame->camera, 1, visible));
       if (result != 0 && result != static_cast<int>(GDI_ERROR) && GdiFlush() && visible) {
