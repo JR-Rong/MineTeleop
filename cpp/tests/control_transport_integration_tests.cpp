@@ -490,9 +490,12 @@ void mock_dual_control_survives_direct_packet_loss() {
   deadline = steady() + 2000;
   while (steady() < deadline) fixture.pump(true);
   state = fixture.driver->status().at("native_control").at("control_transport");
-  expect(fixture.dual_wss_applied > wss_before + 5 && state.value("mock_dual_control", false) &&
-      state.at("path") == "dc" && !state.value("selecting", true),
-      "signed vehicle results from WSS did not sustain dual control when DC copies were lost");
+  if (!(fixture.dual_wss_applied > wss_before + 5 && state.value("mock_dual_control", false) &&
+      state.at("path") == "dc" && !state.value("selecting", true)))
+    throw std::runtime_error("signed vehicle results from WSS did not sustain dual control when DC copies were lost: " +
+        Json{{"wss_applied_before", wss_before}, {"wss_applied_after", fixture.dual_wss_applied},
+             {"duplicates", fixture.dual_duplicates}, {"control_transport", state},
+             {"last_vehicle_rejection", fixture.first_vehicle_rejection}}.dump());
   const auto result_latency = fixture.driver->status().at("native_control").at("vehicle_result_latency");
   expect(result_latency.value("vehicle_received_path", "") == "wss",
       "logical DC publication mislabeled the WSS vehicle receipt");
