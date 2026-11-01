@@ -14,10 +14,12 @@
 #include <gst/video/video.h>
 #include <gio/gnetworking.h>
 #include <windows.h>
+#include <Xinput.h>
 #include <shellapi.h>
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
+#include <condition_variable>
 #include <string_view>
 
 namespace {
@@ -41,6 +43,43 @@ std::wstring text_of(HWND control) {
   GetWindowTextW(control, result.data(), count + 1);
   result.resize(static_cast<std::size_t>(count));
   return result;
+}
+
+std::wstring wide(const std::string& value) {
+  if (value.empty()) return {};
+  const int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+      static_cast<int>(value.size()), nullptr, 0);
+  if (count <= 0) throw std::runtime_error("invalid vehicle identity");
+  std::wstring result(static_cast<std::size_t>(count), L'\0');
+  if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+      static_cast<int>(value.size()), result.data(), count)) throw std::runtime_error("invalid vehicle identity");
+  return result;
+}
+
+// Load the Windows system implementation rather than accepting a DLL from the
+// working directory. Generic HID calibration is not supplied by XInput.
+DWORD xinput_state(DWORD index, XINPUT_STATE* state) {
+  using GetState = DWORD (WINAPI*)(DWORD, XINPUT_STATE*);
+  static const auto get_state = []() -> GetState {
+    for (const auto* dll : {L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll"}) {
+      if (const auto library = LoadLibraryExW(dll, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
+        if (const auto fn = GetProcAddress(library, "XInputGetState")) return reinterpret_cast<GetState>(fn);
+        FreeLibrary(library);
+      }
+    }
+    return nullptr;
+  }();
+  return get_state ? get_state(index, state) : ERROR_DEVICE_NOT_CONNECTED;
+}
+
+bool xinput_button(const XINPUT_GAMEPAD& pad, int index) {
+  constexpr std::array<WORD, 16> buttons{XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y,
+      XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_RIGHT_SHOULDER, 0, 0, XINPUT_GAMEPAD_BACK,
+      XINPUT_GAMEPAD_START, XINPUT_GAMEPAD_LEFT_THUMB, XINPUT_GAMEPAD_RIGHT_THUMB,
+      XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT};
+  if (index == 6) return pad.bLeftTrigger >= 128;
+  if (index == 7) return pad.bRightTrigger >= 128;
+  return index >= 0 && static_cast<std::size_t>(index) < buttons.size() && (pad.wButtons & buttons[index]) != 0;
 }
 
 void draw_empty_video(HDC dc, RECT rect, const wchar_t* message) {
@@ -141,7 +180,7 @@ struct RenderSession {
 };
 
 struct Window {
-  HWND hwnd{}, driver_config{}, vehicle_config{}, driver_id{}, password{}, status{}, start{}, stop{};
+  HWND hwnd{}, driver_config{}, vehicle_config{}, driver_id{}, password{}, status{}, start{}, stop{}, vehicle_list{};
   std::array<HWND, 4> config_labels{};
   std::array<HWND, 6> operator_labels{}, operator_readouts{};
   std::array<HWND, 6> keycaps{};
@@ -151,6 +190,11 @@ struct Window {
   HBRUSH background{}, surface{}, input_background{};
   std::array<HWND, 2> video{};
   std::mutex mutex;
+  struct VehicleChoice { std::wstring label; bool eligible{}; };
+  std::mutex selection_mutex;
+  std::condition_variable selection_ready;
+  std::vector<VehicleChoice> vehicle_choices;
+  bool awaiting_selection{}, selection_confirmed{};
   std::mutex intent_display_mutex;
   struct IntentDisplay { detail::NativeOperatorIntent input{}; std::int64_t observed_ms{}; bool valid{}; };
   IntentDisplay intent_display;
@@ -167,6 +211,11 @@ struct Window {
   std::atomic<bool> mock_estop_requested{false};
   std::atomic<bool> mock_ui_posted{false};
   detail::NativeMockKeyboard keyboard;
+  std::mutex gamepad_mutex;
+  GamepadConfig gamepad_config{.enabled = false};
+  int gamepad_estop_hold_ms{500};
+  std::int64_t gamepad_estop_since_ms{};
+  DWORD gamepad_index{XUSER_MAX_COUNT};
   bool mock_control{false};
   std::string mock_local_ip, mock_peer_ip, mock_ip_family;
 
@@ -386,6 +435,9 @@ struct Window {
           throw std::runtime_error("mock control profile changed");
         keyboard.set_brake_profile(requested_profile->service_brake_pressure_bar,
             requested_profile->hard_brake_pressure_bar, requested_profile->max_brake_pressure_bar);
+        // This isolated profile has a zero target speed and zero steering limit.
+        // The web client consequently sends zero on both normalized axes.
+        keyboard.set_control_limits(0.0, requested_profile->max_steering_angle_deg, 30.0);
         profile_accepted = true;
       }
       if (value.value("event", "") == "vehicle_telemetry") {
@@ -408,6 +460,8 @@ struct Window {
             {"last_valid_command_seq", value.at("control_timing").value("last_valid_command_seq", std::uint64_t{0})},
             {"stop_sequence", value.value("stop_sequence", std::uint64_t{0})},
             {"gear", value.value("gear", "")},
+            {"can_feedback", value.contains("can_feedback") && value.at("can_feedback").is_object()
+                ? value.at("can_feedback") : Json(nullptr)},
             {"speed_mps", value.contains("speed_mps") && value.at("speed_mps").is_number()
                 ? value.at("speed_mps") : Json(nullptr)}};
       }
@@ -569,6 +623,10 @@ struct Window {
         std::optional<char> actual_gear;
         const bool evidence_fresh = telemetry_fresh && detail::native_mock_source_fresh(telemetry_source_ms, wall_ms,
             sync.value("offset_ms", std::int64_t{0}), sync.value("uncertainty_ms", std::int64_t{-1}));
+        const auto feedback = telemetry_fresh ? telemetry.value("can_feedback", Json(nullptr)) : Json(nullptr);
+        const wchar_t* can_state = !evidence_fresh || !feedback.is_object() ? L"未知或已过期" :
+            !feedback.value("supported", false) ? L"台架不提供完整 CAN 反馈" :
+            !feedback.value("feedback_fresh", false) ? L"反馈过期" : L"反馈新鲜";
         if (evidence_fresh) {
           if (telemetry.contains("speed_mps") && telemetry.at("speed_mps").is_number())
             speed = telemetry.at("speed_mps").get<double>();
@@ -585,7 +643,8 @@ struct Window {
             L"\n画面：" + (video_health.ready && gate->ready_now() ? L"就绪" : L"未就绪") +
             L"  校时：" + (clock_ok ? std::wstring(L"±") + std::to_wstring(time_uncertainty) + L" ms" : L"不可用") +
             L"\n车端：" + (mock_estop_requested.load() && safety_state != "ESTOP" ? L"急停等待确认" : vehicle_state) +
-            L"\n结果：" + result_text, detail::native_operator_readouts(speed, actual_gear, shown_intent));
+            L"\n结果：" + result_text + L"\nCAN：" + can_state,
+            detail::native_operator_readouts(speed, actual_gear, shown_intent));
         next_mock_ui = now + 100ms;
       }
       if (now >= next_evidence) {
@@ -690,6 +749,7 @@ struct Window {
       }
       { std::lock_guard lock(render_mutex); render_session = render; }
       auto config = load_driver_config(driver_path);
+      { std::lock_guard lock(gamepad_mutex); gamepad_config = config.gamepad; gamepad_estop_hold_ms = config.estop_hold_ms; }
       if (mock_control && !config.signaling_url.starts_with("ws://127.0.0.1:"))
         throw std::runtime_error("mock control requires an isolated loopback signaling tunnel");
       config.receive_only = !mock_control;
@@ -711,6 +771,33 @@ struct Window {
         if (!requested_driver.empty()) config.driver_id = requested_driver;
         std::fill(secret.begin(), secret.end(), '\0');
         if (stop_token.stop_requested()) throw std::runtime_error("cancelled");
+        phase = "vehicles";
+        const auto catalog = driver.vehicles();
+        if (!catalog.is_object() || !catalog.contains("vehicles") || !catalog.at("vehicles").is_array())
+          throw std::runtime_error("invalid authorized vehicle catalog");
+        {
+          std::lock_guard lock(selection_mutex);
+          vehicle_choices.clear();
+          for (const auto& entry : catalog.at("vehicles")) {
+            if (!entry.is_object() || !entry.contains("vehicle_id") || !entry.at("vehicle_id").is_string()) continue;
+            const auto id = entry.at("vehicle_id").get<std::string>();
+            const bool matches = id == vehicle.vehicle_id;
+            const bool available = entry.value("online", false) && entry.value("controllable", false);
+            vehicle_choices.push_back({wide(id) + (matches ? L" · 台架配置匹配" : L" · 需对应台架配置") +
+                (available ? L" · 可连接" : L" · 不可连接"), matches && available});
+          }
+          selection_confirmed = false;
+          awaiting_selection = true;
+        }
+        PostMessageW(hwnd, WM_APP + 3, 0, 0);
+        report(L"请选择授权车辆；仅可连接与本地隔离台架配置匹配的车辆。");
+        {
+          std::unique_lock lock(selection_mutex);
+          while (!selection_confirmed && !stop_token.stop_requested()) selection_ready.wait_for(lock, 100ms);
+          awaiting_selection = false;
+          if (stop_token.stop_requested()) throw std::runtime_error("cancelled");
+        }
+        PostMessageW(hwnd, WM_APP + 4, 0, 0);
         phase = "connect";
         const auto session = driver.connect(vehicle.vehicle_id, "windows-native-viewer");
         connected = true;
@@ -911,6 +998,7 @@ void layout(Window& app, int width, int height) {
   }
   MoveWindow(app.start, left, 385, (field_width - gap) / 2, 34, TRUE);
   MoveWindow(app.stop, left + (field_width + gap) / 2, 385, (field_width - gap) / 2, 34, TRUE);
+  MoveWindow(app.vehicle_list, left, 422, field_width, 180, TRUE);
   MoveWindow(app.help, left, 450, field_width, app.mock_control ? 20 : 70, TRUE);
   if (app.mock_control) {
     constexpr int key_width = 40, key_height = 25, key_gap = 4;
@@ -921,7 +1009,7 @@ void layout(Window& app, int width, int height) {
     MoveWindow(app.keycaps[5], left + 3 * (key_width + key_gap), 504, field_width - 3 * (key_width + key_gap), key_height, TRUE);
   }
   if (app.mock_estop_button) MoveWindow(app.mock_estop_button, left, 536, field_width, 30, TRUE);
-  if (app.mock_info) MoveWindow(app.mock_info, left, 570, field_width, 76, TRUE);
+  if (app.mock_info) MoveWindow(app.mock_info, left, 570, field_width, 92, TRUE);
 }
 
 void fill(HDC dc, int left, int top, int right, int bottom, HBRUSH brush) {
@@ -985,6 +1073,8 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       app->password = control(hwnd, L"EDIT", L"", WS_BORDER | ES_PASSWORD | ES_AUTOHSCROLL, 0, 0, 1, 1);
       app->start = control(hwnd, L"BUTTON", app->mock_control ? L"连接台架" : L"连接视频", BS_OWNERDRAW, 0, 0, 1, 1, 1);
       app->stop = control(hwnd, L"BUTTON", L"断开", BS_OWNERDRAW, 0, 0, 1, 1, 2);
+      app->vehicle_list = control(hwnd, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 0, 1, 1, 4);
+      EnableWindow(app->vehicle_list, FALSE);
       app->help = control(hwnd, L"STATIC", app->mock_control ?
           L"按键状态 · E 急停 · 非执行确认" :
           L"仅观看台架画面\n控制功能保持禁用", 0, 0, 0, 1, 1);
@@ -1043,8 +1133,6 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
           app->mock_control ? L"Windows 原生端  ·  隔离 mock 台架  ·  零车速" : L"Windows 原生端  ·  仅观看");
       label(dc, app->font, RGB(231, 237, 246), 16, 180, rect.right - 330, 205, L"实时视频");
       label(dc, app->font, RGB(231, 237, 246), rect.right - 300, 138, rect.right - 32, 168, L"连接与控制");
-      label(dc, app->small_font, RGB(142, 160, 184), rect.right - 300, 421, rect.right - 32, 445,
-          app->mock_control ? L"键盘控制" : L"操作说明");
       EndPaint(hwnd, &ps);
       return 0;
     }
@@ -1093,7 +1181,18 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       else for (const auto panel : app->video) InvalidateRect(panel, nullptr, FALSE);
       return 0;
     case WM_COMMAND:
-      if (LOWORD(wparam) == 1 && !app->running.exchange(true)) {
+      if (LOWORD(wparam) == 1 && app->running.load()) {
+        const auto selected = SendMessageW(app->vehicle_list, CB_GETCURSEL, 0, 0);
+        bool valid = false;
+        {
+          std::lock_guard lock(app->selection_mutex);
+          valid = app->awaiting_selection && selected != CB_ERR &&
+              static_cast<std::size_t>(selected) < app->vehicle_choices.size() && app->vehicle_choices[static_cast<std::size_t>(selected)].eligible;
+          if (valid) app->selection_confirmed = true;
+        }
+        if (valid) { EnableWindow(app->start, FALSE); app->selection_ready.notify_one(); if (app->mock_control) SetFocus(hwnd); }
+        else app->report(L"请选择在线、可连接且与当前台架配置匹配的授权车辆。");
+      } else if (LOWORD(wparam) == 1 && !app->running.exchange(true)) {
         try {
           if (app->worker.joinable()) app->worker.join();
           app->mock_estop_requested.store(false);
@@ -1120,13 +1219,36 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     case WM_APP + 1: {
       std::lock_guard lock(app->mutex);
       SetWindowTextW(app->status, app->message.c_str());
-      EnableWindow(app->start, !app->running.load());
+      { std::lock_guard selection_lock(app->selection_mutex);
+        EnableWindow(app->start, !app->running.load() || app->awaiting_selection);
+        if (!app->running.load()) {
+          EnableWindow(app->vehicle_list, FALSE);
+          SetWindowTextW(app->start, app->mock_control ? L"连接台架" : L"连接视频");
+        }
+      }
       EnableWindow(app->stop, app->running.load());
       for (const auto field : {app->driver_config, app->vehicle_config, app->driver_id, app->password})
         EnableWindow(field, !app->running.load());
       if (app->mock_estop_button) EnableWindow(app->mock_estop_button, app->running.load());
       return 0;
     }
+    case WM_APP + 3: {
+      std::lock_guard lock(app->selection_mutex);
+      SendMessageW(app->vehicle_list, CB_RESETCONTENT, 0, 0);
+      int matching = -1;
+      for (std::size_t i = 0; i < app->vehicle_choices.size(); ++i) {
+        SendMessageW(app->vehicle_list, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(app->vehicle_choices[i].label.c_str()));
+        if (app->vehicle_choices[i].eligible) matching = static_cast<int>(i);
+      }
+      if (matching >= 0) SendMessageW(app->vehicle_list, CB_SETCURSEL, matching, 0);
+      EnableWindow(app->vehicle_list, TRUE); EnableWindow(app->start, TRUE);
+      SetWindowTextW(app->start, L"连接所选");
+      return 0;
+    }
+    case WM_APP + 4:
+      EnableWindow(app->vehicle_list, FALSE); EnableWindow(app->start, FALSE);
+      SetWindowTextW(app->start, app->mock_control ? L"连接台架" : L"连接视频");
+      return 0;
     case WM_APP + 2: {
       std::lock_guard lock(app->mutex);
       const bool stale = !app->running.load() || !detail::native_mock_input_fresh(
@@ -1164,6 +1286,31 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         const bool up = down('W') || down(VK_UP), left = down('A') || down(VK_LEFT);
         const bool right = down('D') || down(VK_RIGHT), reverse = down('S') || down(VK_DOWN);
         const bool brake = down(VK_SPACE), hard_brake = down('B');
+        detail::NativeMockKeyboard::Gamepad gamepad;
+        GamepadConfig gamepad_config;
+        int estop_hold_ms;
+        { std::lock_guard lock(app->gamepad_mutex); gamepad_config = app->gamepad_config; estop_hold_ms = app->gamepad_estop_hold_ms; }
+        XINPUT_STATE state{};
+        if (!focused || !gamepad_config.enabled || app->gamepad_index >= XUSER_MAX_COUNT ||
+            xinput_state(app->gamepad_index, &state) != ERROR_SUCCESS) {
+          app->gamepad_index = XUSER_MAX_COUNT;
+          if (focused && gamepad_config.enabled) for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) {
+            if (xinput_state(i, &state) == ERROR_SUCCESS) { app->gamepad_index = i; break; }
+          }
+        }
+        const auto now_ms = static_cast<std::int64_t>(bench_now_ms());
+        if (focused && app->gamepad_index < XUSER_MAX_COUNT) {
+          const auto& p = state.Gamepad;
+          const double axis = p.sThumbLX < 0 ? p.sThumbLX / 32768.0 : p.sThumbLX / 32767.0;
+          const auto values = detail::NativeWebControl::standard_gamepad(axis, p.bRightTrigger / 255.0,
+              p.bLeftTrigger / 255.0, gamepad_config.steering_center, gamepad_config.steering_range,
+              gamepad_config.axis_deadzone, gamepad_config.steering_inverted);
+          gamepad = {true, values.steering, values.throttle, values.brake, app->gamepad_index};
+          if (xinput_button(p, gamepad_config.estop_button)) {
+            if (!app->gamepad_estop_since_ms) app->gamepad_estop_since_ms = now_ms;
+            if (now_ms - app->gamepad_estop_since_ms >= estop_hold_ms) app->request_mock_estop();
+          } else app->gamepad_estop_since_ms = 0;
+        } else app->gamepad_estop_since_ms = 0;
         const std::array<bool, 6> displayed{focused && up, focused && left, focused && reverse,
                                             focused && right, focused && brake, focused && hard_brake};
         for (std::size_t i = 0; i < displayed.size(); ++i) {
@@ -1171,8 +1318,7 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             app->shown_keys[i] = displayed[i]; InvalidateRect(app->keycaps[i], nullptr, TRUE);
           }
         }
-        app->keyboard.observe(focused, {up, left, right, brake, hard_brake, reverse},
-            static_cast<std::int64_t>(bench_now_ms()));
+        app->keyboard.observe(focused, {up, left, right, brake, hard_brake, reverse}, gamepad, now_ms);
         return 0;
       }
       if (wparam == 1 && app->running.load() && detail::viewer_observation_stale(

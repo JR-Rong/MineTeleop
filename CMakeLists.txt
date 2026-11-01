@@ -466,6 +466,15 @@ if(MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
   target_link_libraries(mine-teleop-native-mock-media-gate-tests PRIVATE mine_teleop_runtime)
   mine_teleop_enable_warnings(mine-teleop-native-mock-media-gate-tests)
   add_test(NAME mine-teleop-native-mock-media-gate-tests COMMAND mine-teleop-native-mock-media-gate-tests)
+  find_program(MINE_TELEOP_PARITY_NODE_EXECUTABLE NAMES node nodejs)
+  if(MINE_TELEOP_PARITY_NODE_EXECUTABLE)
+    add_executable(mine-teleop-native-web-control-probe cpp/tests/native_web_control_probe.cpp)
+    target_include_directories(mine-teleop-native-web-control-probe PRIVATE cpp/include)
+    mine_teleop_enable_warnings(mine-teleop-native-web-control-probe)
+    add_test(NAME mine-teleop-native-web-control-parity
+      COMMAND ${MINE_TELEOP_PARITY_NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/native_web_control_parity.test.cjs
+              $<TARGET_FILE:mine-teleop-native-web-control-probe>)
+  endif()
 endif()
 
 if(MINE_TELEOP_BUILD_TESTS OR MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)

@@ -41,12 +41,26 @@ requested values require a fresh accepted local input and active authorization.
 Unknown or stale values display as `—`. Keyboard highlights describe local key
 state, not vehicle receipt or physical actuation, and clear on focus loss.
 
+After login the viewer presents the authorized vehicle catalog and requires an
+explicit selection. This bench prototype can connect only an online,
+controllable vehicle whose identity matches its validated local vehicle
+configuration. The server still independently authorizes the connection.
+
+Mock input supports standard XInput controllers in addition to the keyboard.
+It applies the configured standard-controller calibration and deadzone, and
+requires neutral pedals after focus, safety, profile or controller changes.
+Generic HID devices, interactive calibration and gamepad controls outside
+mock mode are not implemented. The displayed CAN indication reports missing,
+unsupported or stale feedback rather than treating mock data as physical CAN.
+
 The native viewer is not yet functionally equivalent to the web console. It
-connects to the one locally configured vehicle instead of presenting the full
-authorized vehicle list; it has no gamepad, complete CAN feedback, editable
-session profile, recording status or session-log export UI. Its control mode
-remains limited to the zero-speed isolated mock, and its fixed mock keyboard
-intent is not the web console's full profile-scaled input implementation.
+does not implement the web console's complete CAN feedback, editable session
+profile, recording status or session-log export UI. Its control mode remains
+limited to the zero-speed isolated mock. Keyboard and standard-gamepad control
+values use the acknowledged profile scaling, so that profile sends zero
+throttle and steering in this mock configuration. Directional key presses
+must therefore be verified separately from delivered motion values in a bench
+test; a zero value alone is not proof that a key was or was not pressed.
 
 For the `b93bfff` UI build, a Windows smoke check opened the isolated mock
 window without connecting a vehicle, checked four edit fields and Tab focus,

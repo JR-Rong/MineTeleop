@@ -6,6 +6,7 @@
 #include <mutex>
 #include <limits>
 #include <stdexcept>
+#include "mine_teleop/detail/native_web_control.hpp"
 
 namespace mine_teleop::detail {
 
@@ -39,7 +40,21 @@ inline bool native_mock_source_fresh(std::int64_t source_ms, std::int64_t wall_m
 class NativeMockKeyboard {
  public:
   struct Keys { bool forward{}, left{}, right{}, brake{}, hard_brake{}, reverse{}; };
+  struct Gamepad { bool connected{}; double steering{}, throttle{}, brake{}; unsigned index{}; };
   struct Input { double throttle{}, steering{}, brake{}; char gear{'N'}; };
+
+  void set_control_limits(double throttle, double steering_deg, double steering_scale_deg) {
+    if (!std::isfinite(throttle) || throttle < 0 || throttle > 1 ||
+        !std::isfinite(steering_deg) || steering_deg < 0 ||
+        !std::isfinite(steering_scale_deg) || steering_scale_deg <= 0)
+      throw std::invalid_argument("invalid confirmed control limits");
+    std::lock_guard lock(mutex_);
+    if (throttle_limit_ != throttle || steering_limit_ != steering_deg || steering_scale_ != steering_scale_deg) {
+      throttle_limit_ = throttle; steering_limit_ = steering_deg; steering_scale_ = steering_scale_deg;
+      needs_release_ = true;
+      gamepad_needs_neutral_ = true;
+    }
+  }
 
   // Match the confirmed vehicle profile rather than assuming a fixed pressure.
   // A changed profile invalidates held input until the operator releases it.
@@ -50,17 +65,25 @@ class NativeMockKeyboard {
     const double service_ratio = maximum > 0 ? service / maximum : 0;
     const double hard_ratio = maximum > 0 ? hard / maximum : 0;
     std::lock_guard lock(mutex_);
-    if (!profile_ready_ || service_ratio != service_brake_ || hard_ratio != hard_brake_) {
+    if (!profile_ready_ || service_ratio != service_brake_ || hard_ratio != hard_brake_ ||
+        (maximum > 0) != brake_available_) {
       service_brake_ = service_ratio;
       hard_brake_ = hard_ratio;
+      brake_available_ = maximum > 0;
       profile_ready_ = true;
       needs_release_ = true;
+      gamepad_needs_neutral_ = true;
     }
   }
 
   void observe(bool focused, Keys keys, std::int64_t now_ms) {
     std::lock_guard lock(mutex_);
-    observe_locked(focused, keys, now_ms);
+    observe_locked(focused, keys, {}, now_ms);
+  }
+
+  void observe(bool focused, Keys keys, Gamepad gamepad, std::int64_t now_ms) {
+    std::lock_guard lock(mutex_);
+    observe_locked(focused, keys, gamepad, now_ms);
   }
 
   void withdraw() {
@@ -68,7 +91,9 @@ class NativeMockKeyboard {
     focused_ = false;
     observed_at_ms_ = 0;
     keys_ = {};
+    gamepad_ = {};
     needs_release_ = true;
+    gamepad_needs_neutral_ = true;
   }
 
   bool heartbeat_alive(std::int64_t now_ms) {
@@ -95,11 +120,14 @@ class NativeMockKeyboard {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
   }
-  void observe_locked(bool focused, Keys keys, std::int64_t now_ms) {
+  void observe_locked(bool focused, Keys keys, Gamepad gamepad, std::int64_t now_ms) {
     focused_ = focused && now_ms > 0;
     keys_ = focused_ ? keys : Keys{};
+    if (!focused_ || gamepad.connected != gamepad_.connected ||
+        (gamepad.connected && gamepad.index != gamepad_.index)) gamepad_needs_neutral_ = true;
+    gamepad_ = focused_ ? gamepad : Gamepad{};
     observed_at_ms_ = focused_ ? now_ms : 0;
-    if (!focused_) needs_release_ = true;
+    if (!focused_) { needs_release_ = true; gamepad_needs_neutral_ = true; }
   }
 
   bool heartbeat_alive_locked(std::int64_t now_ms) const {
@@ -111,6 +139,7 @@ class NativeMockKeyboard {
     if (!safety_ready || !profile_ready_ || !focused_ || observed_at_ms_ <= 0 || now_ms < observed_at_ms_ ||
         now_ms - observed_at_ms_ >= 150 || (confirmed_gear != 'N' && confirmed_gear != 'D' && confirmed_gear != 'R')) {
       needs_release_ = true;
+      gamepad_needs_neutral_ = true;
       return {};
     }
     const bool any = keys_.forward || keys_.reverse || keys_.left || keys_.right || keys_.brake || keys_.hard_brake;
@@ -118,22 +147,37 @@ class NativeMockKeyboard {
       if (!any) needs_release_ = false;
       return {};
     }
+    NativeWebControl::Gamepad pad{};
+    if (gamepad_.connected) {
+      if (gamepad_needs_neutral_) {
+        if (gamepad_.throttle == 0 && gamepad_.brake == 0) gamepad_needs_neutral_ = false;
+      } else pad = {gamepad_.steering, gamepad_.throttle, gamepad_.brake};
+    }
     // Ask for a gear change with no traction or steering, and wait for fresh
     // vehicle telemetry to confirm it before applying the held direction.
-    const bool braking = keys_.brake || keys_.hard_brake;
-    const char requested = keys_.forward == keys_.reverse ? confirmed_gear : (keys_.forward ? 'D' : 'R');
+    const bool braking = keys_.brake || keys_.hard_brake || pad.brake > 0;
+    const char requested = keys_.forward != keys_.reverse ? (keys_.forward ? 'D' : 'R') :
+        (!keys_.forward && !keys_.reverse && pad.throttle > 0 && confirmed_gear == 'N' ? 'D' : confirmed_gear);
+    if (requested != confirmed_gear) gamepad_needs_neutral_ = true;
     if (!braking && requested != confirmed_gear) return {0.0, 0.0, 0.0, requested};
-    // Braking wins over traction. Opposing directions and steering cancel.
-    return {keys_.forward != keys_.reverse && !braking ? 0.25 : 0.0,
-            keys_.left == keys_.right ? 0.0 : (keys_.left ? -0.25 : 0.25),
-            keys_.hard_brake ? hard_brake_ : (keys_.brake ? service_brake_ : 0.0), confirmed_gear};
+    // The web contract scales both axes by the acknowledged effective profile.
+    // Normalized brake ratios are passed as pressures against a unit maximum.
+    const auto result = NativeWebControl::derive(
+        {keys_.forward, keys_.reverse, keys_.left, keys_.right, keys_.brake, keys_.hard_brake},
+        pad, confirmed_gear, {throttle_limit_, brake_available_ ? 1.0 : 0.0,
+            service_brake_, hard_brake_, steering_limit_}, steering_scale_);
+    return {result.throttle, result.steering, result.brake, result.gear};
   }
   std::mutex mutex_;
   Keys keys_{};
+  Gamepad gamepad_{};
   std::int64_t observed_at_ms_{};
   bool focused_{false};
   bool needs_release_{true};
+  bool gamepad_needs_neutral_{true};
   bool profile_ready_{false};
+  bool brake_available_{false};
   double service_brake_{0}, hard_brake_{0};
+  double throttle_limit_{0}, steering_limit_{0}, steering_scale_{30};
 };
 }  // namespace mine_teleop::detail

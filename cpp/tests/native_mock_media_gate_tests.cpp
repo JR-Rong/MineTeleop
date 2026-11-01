@@ -98,6 +98,7 @@ void test_mock_keyboard_rearms_only_after_release() {
   keyboard.observe(true, Keys{true, false, false, true}, 100);
   require(keyboard.sample(true, 101).brake == 0.0, "unconfirmed profile enabled input");
   keyboard.set_brake_profile(30, 80, 100);
+  keyboard.set_control_limits(.25, 7.5, 30);
   keyboard.observe(true, Keys{}, 100);
   require(keyboard.sample(true, 101).throttle == 0.0, "initial neutral did not arm");
   keyboard.observe(true, Keys{true, true, false, false}, 110);
@@ -144,6 +145,7 @@ void test_mock_direction_combinations_require_gear_confirmation() {
   using Keyboard = mine_teleop::detail::NativeMockKeyboard;
   Keyboard keyboard;
   keyboard.set_brake_profile(30, 80, 100);
+  keyboard.set_control_limits(.25, 7.5, 30);
   keyboard.observe(true, {}, 100);
   static_cast<void>(keyboard.sample(true, 100));
   struct Case { Keyboard::Keys keys; char confirmed; char requested; double throttle, steering, brake; };
@@ -191,6 +193,7 @@ void test_live_clock_keyboard_and_media_guard() {
   mine_teleop::detail::NativeMockKeyboard keyboard;
   using Keys = mine_teleop::detail::NativeMockKeyboard::Keys;
   keyboard.set_brake_profile(30, 80, 100);
+  keyboard.set_control_limits(.25, 7.5, 30);
   keyboard.observe(true, Keys{}, now());
   require(keyboard.heartbeat_alive_now(), "live keyboard heartbeat missing");
   static_cast<void>(keyboard.sample_now(true));
@@ -222,7 +225,47 @@ void test_live_clock_keyboard_and_media_guard() {
           native_mock_clock_fresh(1001, 1500) && !native_mock_clock_fresh(1001, 1501),
           "500 ms clock observation boundary changed");
 }
+
+void test_mock_gamepad_neutral_and_profile_limits() {
+  using Keyboard = mine_teleop::detail::NativeMockKeyboard;
+  Keyboard keyboard;
+  keyboard.set_brake_profile(30, 80, 100);
+  keyboard.set_control_limits(.25, 7.5, 30);
+  Keyboard::Gamepad pad{true, .5, .8, 0, 0};
+  keyboard.observe(true, {}, pad, 100);
+  require(keyboard.sample(true, 100, 'D').throttle == 0, "held gamepad armed on connect");
+  keyboard.observe(true, {}, {true, 0, 0, 0, 0}, 101);
+  static_cast<void>(keyboard.sample(true, 101, 'D'));
+  static_cast<void>(keyboard.sample(true, 101, 'D'));
+  keyboard.observe(true, {}, pad, 102);
+  auto input = keyboard.sample(true, 102, 'D');
+  require(std::abs(input.throttle - .2) < 1e-12 && std::abs(input.steering - .125) < 1e-12,
+          "gamepad axes did not use the confirmed profile");
+  require(keyboard.sample(false, 103, 'D').throttle == 0, "safety loss retained gamepad input");
+  require(keyboard.sample(true, 104, 'D').throttle == 0, "held gamepad resumed after safety recovery");
+  keyboard.observe(true, {}, {true, 0, 0, 0, 0}, 105);
+  static_cast<void>(keyboard.sample(true, 105, 'D'));
+  static_cast<void>(keyboard.sample(true, 105, 'D'));
+  keyboard.observe(true, {}, {true, 0, 0, .5, 0}, 106);
+  require(keyboard.sample(true, 106, 'D').brake == .5, "gamepad brake not forwarded");
+  keyboard.observe(true, {}, {true, .5, .8, 0, 1}, 107);
+  require(keyboard.sample(true, 107, 'D').throttle == 0, "replacement gamepad bypassed neutral interlock");
+  keyboard.observe(true, {}, {true, 0, 0, 0, 1}, 108);
+  static_cast<void>(keyboard.sample(true, 108, 'D'));
+  keyboard.observe(true, {}, {true, .5, .8, 0, 1}, 109);
+  require(keyboard.sample(true, 109, 'D').throttle > 0, "replacement gamepad did not rearm at neutral");
+  keyboard.set_brake_profile(20, 60, 100);
+  require(keyboard.sample(true, 110, 'D').throttle == 0 && keyboard.sample(true, 110, 'D').throttle == 0,
+          "held gamepad resumed after profile change");
+  keyboard.set_control_limits(0, 0, 30);
+  keyboard.observe(true, {}, {true, 0, 0, 0, 1}, 111);
+  static_cast<void>(keyboard.sample(true, 111, 'D'));
+  static_cast<void>(keyboard.sample(true, 111, 'D'));
+  keyboard.observe(true, {true, true, false, false, false, false}, {true, .5, .8, 0, 1}, 112);
+  input = keyboard.sample(true, 112, 'D');
+  require(input.throttle == 0 && input.steering == 0, "zero mock limits produced nonzero motion intent");
 }
-int main() { try { test_gate(); test_neutral_refresh_sequence(); test_profile_retry_stays_bounded_and_needs_live_guards(); test_dtls_header_trace_is_bounded_and_excludes_payloads(); test_mock_keyboard_rearms_only_after_release(); test_mock_direction_combinations_require_gear_confirmation(); test_live_clock_keyboard_and_media_guard();
+}
+int main() { try { test_gate(); test_neutral_refresh_sequence(); test_profile_retry_stays_bounded_and_needs_live_guards(); test_dtls_header_trace_is_bounded_and_excludes_payloads(); test_mock_keyboard_rearms_only_after_release(); test_mock_direction_combinations_require_gear_confirmation(); test_live_clock_keyboard_and_media_guard(); test_mock_gamepad_neutral_and_profile_limits();
   std::cout << "PASS scoped mock media, input renewal, keyboard and clock guard\n"; return 0; }
 catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; } }
