@@ -100,6 +100,8 @@ struct EarlyResult : Startup {
       const Json& message = Json::object(), bool mock_dual = false) {
     const std::uint64_t intent_seq = 9;
     const std::string current_attempt = "fixture-attempt";
+    const bool mock_dual_dc = mock_dual;
+    const bool mock_wss_dc = false;
 #include "control_early_result.inc"
     throw std::runtime_error("early rejection fixture unexpectedly passed its guard");
   }
