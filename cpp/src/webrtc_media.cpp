@@ -3637,7 +3637,11 @@ struct VehicleMediaRuntime::Impl {
             signaling.driver_id(),
             signaling.session_id(),
             signaling.control_token(),
-            create_vehicle_adapter(config));
+            create_vehicle_adapter(config),
+            // The watchdog ticks every 50 ms. Give the isolated dual-path
+            // mock a new vehicle snapshot on each tick instead of every other
+            // tick; the receiver's freshness and release gates stay intact.
+            mock_dual_control_enabled() ? 40 : 100);
         control_service->start(signaling.now_ms());
         // A critical camera can fail while a vendor adapter is synchronously
         // opening.  The latch is set before it waits for this mutex, so check
