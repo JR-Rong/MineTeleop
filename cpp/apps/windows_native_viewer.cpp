@@ -335,7 +335,7 @@ struct Window {
     std::mutex guard_mutex;
     std::vector<GuardEvent> guard_events;
     std::uint64_t guard_dropped = 0;
-    struct InputEvent { std::int64_t at; std::uint64_t intent_seq; unsigned keys; char gear; };
+    struct InputEvent { std::int64_t at, wall_ms; std::uint64_t intent_seq; unsigned keys; char gear; };
     std::mutex input_trace_mutex;
     std::vector<InputEvent> input_events;
     std::uint64_t input_trace_dropped = 0;
@@ -365,9 +365,9 @@ struct Window {
       { std::lock_guard lock(input_trace_mutex); inputs.swap(input_events); std::swap(dropped, input_trace_dropped); }
       if (!inputs.empty() || dropped) {
         Json input_records = Json::array();
-        for (const auto& event : inputs) input_records.push_back({{"monotonic_ms", event.at},
+        for (const auto& event : inputs) input_records.push_back({{"monotonic_ms", event.at}, {"wall_utc_ms", event.wall_ms},
             {"intent_seq", event.intent_seq}, {"keys", event.keys}, {"gear", std::string(1, event.gear)}});
-        std::fprintf(stderr, "%s\n", Json{{"event", "native_mock_input_batch"}, {"records", std::move(input_records)},
+        std::fprintf(stderr, "%s\n", Json{{"event", "native_mock_input_batch"}, {"session_id", session_id}, {"records", std::move(input_records)},
             {"dropped", dropped}}.dump().c_str());
       }
     };
@@ -425,7 +425,9 @@ struct Window {
             if (config.control_trace_commands && keyboard_input.armed &&
                 (keyboard_input.key_mask != last_input_keys || now_ms - last_input_trace_at >= 1000)) {
               std::lock_guard lock(input_trace_mutex);
-              if (input_events.size() < 128) input_events.push_back({now_ms,
+              const auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::system_clock::now().time_since_epoch()).count();
+              if (input_events.size() < 128) input_events.push_back({now_ms, wall_ms,
                   input.at("intent_seq").get<std::uint64_t>(), keyboard_input.key_mask, keyboard_input.gear});
               else ++input_trace_dropped;
               last_input_keys = keyboard_input.key_mask; last_input_trace_at = now_ms;
@@ -798,6 +800,11 @@ struct Window {
       // diagnostics; ordinary receive-only viewing remains log-free.
       if (!mock_control || !config.control_trace_commands) config.browser_event_log_path.clear();
       DriverConsoleRuntime driver(config, vehicle.vehicle_id, secret);
+      // Wake a pending mobile-approval request and retire control immediately
+      // when the operator disconnects or closes the window.
+      std::stop_callback on_stop(stop_token, [&driver] {
+        try { driver.prepare_shutdown(); } catch (...) {}
+      });
       bool connected = false;
       try {
         report(mock_control ? L"正在连接隔离 mock 台架；等待安全条件。" : L"正在登录并连接车端；仅观看，控制禁用。");
