@@ -117,7 +117,13 @@ void test_mock_gear_confirmation_requires_forwarded_intent_and_new_feedback() {
   require(gear.observe_status(17) && gear.reject(17, 22) == Gear::Rejection::matched,
           "matching gear rejection was not correlated");
   gear.cancel();
-  require(!gear.pending(), "cancel retained pending gear");
+  const auto rollback = gear.begin('R', 'D');
+  require(rollback && *rollback > *next, "rollback did not receive a new generation");
+  gear.forwarded(*next, 23, 'D');
+  require(gear.observe_status(18) && !gear.confirm(18, 'D', true), "retired generation confirmed rollback");
+  gear.forwarded(*rollback, 24, 'D');
+  require(gear.observe_status(19) && gear.confirm(19, 'D', true), "fresh rollback feedback not confirmed");
+  require(!gear.observe_status(9007199254740992ULL), "unsafe status sequence admitted");
 }
 void test_dtls_header_trace_is_bounded_and_excludes_payloads() {
   using namespace mine_teleop::detail;
