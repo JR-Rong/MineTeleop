@@ -7,6 +7,9 @@
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#if defined(__linux__)
+#include <sys/ioctl.h>
+#endif
 #include <unistd.h>
 
 #include <algorithm>
@@ -438,7 +441,27 @@ void test_bounded_persistent_http_framing() {
   if (!entered) release_slow.set_value();
   expect(entered, "slow HTTP handler did not start");
   raw_send_all(queued, "GET /old-input HTTP/1.1\r\nHost: localhost\r\n\r\n");
+  // send() only queues bytes locally. Wait for TCP to acknowledge them before
+  // releasing the handler, so this actually tests input already at the peer.
+  bool delivered_to_peer = false;
+  const auto delivery_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (std::chrono::steady_clock::now() < delivery_deadline) {
+#if defined(__APPLE__)
+    tcp_connection_info info{};
+    socklen_t info_size = sizeof(info);
+    delivered_to_peer = ::getsockopt(queued, IPPROTO_TCP, TCP_CONNECTION_INFO, &info, &info_size) == 0 &&
+        info.tcpi_snd_sbbytes == 0;
+#elif defined(__linux__)
+    int pending = -1;
+    delivered_to_peer = ::ioctl(queued, TIOCOUTQ, &pending) == 0 && pending == 0;
+#else
+    break;
+#endif
+    if (delivered_to_peer) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
   release_slow.set_value();
+  expect(delivered_to_peer, "queued HTTP request was not acknowledged while the handler was blocked");
   const auto slow_response = response(queued);
   // Input may arrive after the pre-response check but before the post-response
   // check. In that case the header says keep-alive even though the server must
@@ -5095,7 +5118,9 @@ void test_mac_runtime_uses_websocket_signaling() {
       "device_token",
       "vehicle-secret-1",
       "webrtc_offer",
-      {{"type", "offer"}, {"sdp", "v=0\r\n"}, {"media_tracks", mine_teleop::Json::array()}});
+      {{"type", "offer"}, {"sdp", "v=0\r\n"}, {"media_tracks", mine_teleop::Json::array()},
+       {"mock_compact_control", "mock-compact-control-cbor-v1"},
+       {"mock_compact_dual_control", "mock-compact-dual-control-cbor-v2"}});
   offer["connection_generation"] = vehicle_generation;
   static_cast<void>(http.post_json_response(base + "/signaling/" + session_id + "/messages", offer));
   const auto pushed = driver.poll_signaling();
@@ -5103,6 +5128,10 @@ void test_mac_runtime_uses_websocket_signaling() {
   expect(
       pushed.at("messages").at(0).value("type", "") == "webrtc_offer",
       "websocket push delivered the wrong signaling type");
+  const auto& offer_payload = pushed.at("messages").at(0).at("payload");
+  expect(offer_payload.value("mock_compact_control", "") == "mock-compact-control-cbor-v1" &&
+      offer_payload.value("mock_compact_dual_control", "") == "mock-compact-dual-control-cbor-v2",
+      "signaling did not preserve compact capability negotiation");
 
   const auto answer = driver.send_webrtc_answer({{"type", "answer"}, {"sdp", "v=0\r\n"}});
   expect(answer.value("transport", "") == "websocket", "Mac answer fell back to HTTP signaling");
