@@ -23,6 +23,7 @@ class InputEvidenceTest(unittest.TestCase):
 
     def test_matches_zero_limited_keys_to_vehicle_sequence(self):
         self.assertTrue(self.analyze()["all_windows_matched"])
+        self.assertFalse(self.analyze()["all_nine_scenarios_covered"])
         self.command["intent_seq"] = 4
         self.assertFalse(self.analyze()["all_windows_matched"])
 

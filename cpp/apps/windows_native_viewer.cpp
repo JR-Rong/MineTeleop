@@ -5,6 +5,7 @@
 #include "mine_teleop/detail/native_mock_input_sequence.hpp"
 #include "mine_teleop/detail/native_mock_profile_retry.hpp"
 #include "mine_teleop/detail/native_mock_keyboard.hpp"
+#include "mine_teleop/detail/native_can_feedback.hpp"
 #include "mine_teleop/detail/native_control_courier.hpp"
 #include "mine_teleop/detail/mock_compact_control.hpp"
 #include "mine_teleop/detail/native_viewer_observation.hpp"
@@ -182,7 +183,7 @@ struct RenderSession {
 };
 
 struct Window {
-  HWND hwnd{}, driver_config{}, vehicle_config{}, driver_id{}, password{}, status{}, start{}, stop{}, vehicle_list{}, logs_button{};
+  HWND hwnd{}, driver_config{}, vehicle_config{}, driver_id{}, password{}, status{}, start{}, stop{}, vehicle_list{}, logs_button{}, can_detail{};
   std::array<HWND, 4> config_labels{};
   std::array<HWND, 6> operator_labels{}, operator_readouts{};
   std::array<HWND, 6> keycaps{};
@@ -207,6 +208,7 @@ struct Window {
   std::shared_ptr<RenderSession> render_session;
   std::wstring message{L"仅观看台架：控制禁用。车端隔离须独立核验。"};
   std::wstring mock_message{L"控制：等待连接\n画面：等待\n校时：等待"};
+  std::wstring can_detail_message{L"CAN 反馈未知"};
   std::array<std::wstring, 6> operator_values{L"—", L"—", L"—", L"—", L"—", L"—"};
   bool operator_display_stale{false};
   std::jthread worker;
@@ -248,8 +250,10 @@ struct Window {
   }
 
   void report_mock(std::wstring value,
-                   std::array<std::wstring, 6> values = {L"—", L"—", L"—", L"—", L"—", L"—"}) {
-    { std::lock_guard lock(mutex); mock_message = std::move(value); operator_values = std::move(values); }
+                   std::array<std::wstring, 6> values = {L"—", L"—", L"—", L"—", L"—", L"—"},
+                   std::wstring can_details = L"CAN 反馈未知") {
+    { std::lock_guard lock(mutex); mock_message = std::move(value); operator_values = std::move(values);
+      can_detail_message = std::move(can_details); }
     last_mock_observation_ms = static_cast<std::int64_t>(bench_now_ms());
     if (!mock_ui_posted.exchange(true) && !PostMessageW(hwnd, WM_APP + 2, 0, 0))
       mock_ui_posted.store(false);
@@ -681,7 +685,8 @@ struct Window {
             L"\n车端：" + (mock_estop_requested.load() && safety_state != "ESTOP" ? L"急停等待确认" : vehicle_state) +
             L"\n结果：" + result_text + L"\nCAN：" + can_state +
             L"\n会话限幅：" + (profile_accepted ? L"零速 / 零转向 · 已确认" : L"等待确认"),
-            detail::native_operator_readouts(speed, actual_gear, shown_intent));
+            detail::native_operator_readouts(speed, actual_gear, shown_intent),
+            detail::native_can_feedback_text(feedback, evidence_fresh));
         next_mock_ui = now + 100ms;
       }
       if (now >= next_evidence) {
@@ -1119,6 +1124,7 @@ void layout(Window& app, int width, int height) {
   MoveWindow(app.stop, left + (field_width + gap) / 2, 385, (field_width - gap) / 2, 34, TRUE);
   MoveWindow(app.vehicle_list, left, 422, field_width - 80, 180, TRUE);
   MoveWindow(app.logs_button, left + field_width - 74, 422, 74, 26, TRUE);
+  MoveWindow(app.can_detail, left, 182, field_width, 190, TRUE);
   MoveWindow(app.help, left, 450, field_width, app.mock_control ? 20 : 70, TRUE);
   if (app.mock_control) {
     constexpr int key_width = 40, key_height = 25, key_gap = 4;
@@ -1197,6 +1203,9 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       EnableWindow(app->vehicle_list, FALSE);
       app->logs_button = control(hwnd, L"BUTTON", L"会话日志", BS_OWNERDRAW, 0, 0, 1, 1, 5);
       EnableWindow(app->logs_button, FALSE);
+      app->can_detail = control(hwnd, L"EDIT", L"CAN 反馈未知", WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+          0, 0, 1, 1);
+      ShowWindow(app->can_detail, SW_HIDE);
       app->help = control(hwnd, L"STATIC", app->mock_control ?
           L"按键状态 · E 急停 · 非执行确认" :
           L"仅观看台架画面\n控制功能保持禁用", 0, 0, 0, 1, 1);
@@ -1354,6 +1363,9 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       { std::lock_guard selection_lock(app->selection_mutex);
         EnableWindow(app->start, !app->running.load() || (app->awaiting_selection && !app->selection_busy));
         if (!app->running.load()) {
+          ShowWindow(app->can_detail, SW_HIDE);
+          for (const auto label : app->config_labels) ShowWindow(label, SW_SHOW);
+          for (const auto field : {app->driver_config, app->vehicle_config, app->driver_id, app->password}) ShowWindow(field, SW_SHOW);
           EnableWindow(app->vehicle_list, FALSE);
           EnableWindow(app->logs_button, FALSE);
           SetWindowTextW(app->start, app->mock_control ? L"连接台架" : L"连接视频");
@@ -1385,6 +1397,9 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     case WM_APP + 4:
       EnableWindow(app->vehicle_list, FALSE); EnableWindow(app->start, FALSE);
       EnableWindow(app->logs_button, FALSE);
+      for (const auto label : app->config_labels) ShowWindow(label, SW_HIDE);
+      for (const auto field : {app->driver_config, app->vehicle_config, app->driver_id, app->password}) ShowWindow(field, SW_HIDE);
+      ShowWindow(app->can_detail, SW_SHOW);
       SetWindowTextW(app->start, app->mock_control ? L"连接台架" : L"连接视频");
       return 0;
     case WM_APP + 5: {
@@ -1415,6 +1430,12 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         SetWindowTextW(app->operator_readouts[i], hidden ? L"—" : app->operator_values[i].c_str());
       }
       app->operator_display_stale = stale;
+      const auto details = stale ? std::wstring(L"CAN 反馈未知或遥测已过期") : app->can_detail_message;
+      if (text_of(app->can_detail) != details) {
+        const auto first_line = SendMessageW(app->can_detail, EM_GETFIRSTVISIBLELINE, 0, 0);
+        SetWindowTextW(app->can_detail, details.c_str());
+        SendMessageW(app->can_detail, EM_LINESCROLL, 0, first_line);
+      }
       if (app->mock_info) SetWindowTextW(app->mock_info,
           app->running.load() && app->last_mock_observation_ms.load() > 0 && !detail::native_mock_input_fresh(
               app->last_mock_observation_ms.load(), static_cast<std::int64_t>(bench_now_ms()))
@@ -1435,6 +1456,7 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         if (!app->operator_display_stale && !detail::native_mock_input_fresh(
                 app->last_mock_observation_ms.load(), static_cast<std::int64_t>(bench_now_ms()))) {
           for (const auto readout : app->operator_readouts) SetWindowTextW(readout, L"—");
+          SetWindowTextW(app->can_detail, L"CAN 反馈未知或遥测已过期");
           app->operator_display_stale = true;
         }
         const bool up = down('W') || down(VK_UP), left = down('A') || down(VK_LEFT);

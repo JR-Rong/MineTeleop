@@ -1,0 +1,64 @@
+#pragma once
+
+#include <nlohmann/json.hpp>
+#include <cmath>
+#include <iomanip>
+#include <sstream>
+#include <string>
+
+namespace mine_teleop::detail {
+
+// Missing, invalid and stale data is deliberately not presented as a value.
+inline std::wstring native_can_feedback_text(const nlohmann::json& feedback, bool telemetry_fresh) {
+  using Json = nlohmann::json;
+  const auto flag = [](const Json& value, const char* name) {
+    return value.is_object() && value.contains(name) && value.at(name).is_boolean() && value.at(name).get<bool>();
+  };
+  if (!telemetry_fresh || !feedback.is_object()) return L"CAN 反馈未知或遥测已过期";
+  if (!flag(feedback, "supported")) return L"车端桥接包不提供完整 CAN 反馈";
+  if (!flag(feedback, "feedback_fresh")) return L"CAN 反馈已过期";
+  const auto format = [](const Json& value, int precision) -> std::wstring {
+    if (!value.is_number()) return L"—";
+    const double number = value.get<double>();
+    if (!std::isfinite(number)) return L"—";
+    std::wostringstream out; out << std::fixed << std::setprecision(precision) << number;
+    return out.str();
+  };
+  const auto scalar = [&](const char* name, const char* valid, int precision = 0) {
+    return flag(feedback, valid) && feedback.contains(name) ? format(feedback.at(name), precision) : std::wstring(L"—");
+  };
+  const auto array = [&](const char* name, const char* valid, std::size_t index, int precision = 0) -> std::wstring {
+    if (!feedback.contains(name) || !feedback.at(name).is_array() || index >= feedback.at(name).size() ||
+        !feedback.contains(valid) || !feedback.at(valid).is_array() || index >= feedback.at(valid).size() ||
+        !feedback.at(valid)[index].is_boolean() || !feedback.at(valid)[index].get<bool>()) return L"—";
+    return format(feedback.at(name)[index], precision);
+  };
+  std::wostringstream out;
+  out << L"CAN 反馈（有效且新鲜）";
+  if (feedback.contains("max_feedback_age_ms") && feedback.at("max_feedback_age_ms").is_number() &&
+      feedback.at("max_feedback_age_ms").get<double>() >= 0)
+    out << L"  " << format(feedback.at("max_feedback_age_ms"), 0) << L" ms";
+  out << L"\r\n"
+      << L"车速 m/s：" << scalar("speed_mps", "speed_valid", 2)
+      << L"   挡位代码：" << scalar("gear", "gear_valid") << L"\r\n"
+      << L"挡位请求：" << scalar("driver_gear_request", "driver_gear_request_valid")
+      << L"   握手：" << scalar("handshake_status", "handshake_valid") << L"\r\n"
+      << L"故障码：" << scalar("vmc_fault_code", "vmc_fault_code_valid")
+      << L"   急停：" << scalar("emergency_switch", "gear_valid") << L"\r\n"
+      << L"驻车开关：" << scalar("parking_brake_switch", "parking_brake_switch_valid")
+      << L"   刹车踏板：" << scalar("brake_pedal_switch", "brake_pedal_switch_valid") << L"\r\n";
+  for (std::size_t i = 0; i < 8; ++i)
+    out << L"轮 " << i + 1 << L"：扭矩 " << array("motor_torque_nm", "motor_torque_valid", i, 1)
+        << L" Nm，转速 " << array("motor_speed_rpm", "motor_speed_valid", i)
+        << L" rpm，制动 " << array("brake_pressure_bar", "brake_valid", i, 1)
+        << L" bar，模式 M" << array("motor_mode", "motor_mode_valid", i)
+        << L" / B" << array("brake_mode", "brake_valid", i) << L"\r\n";
+  for (std::size_t i = 0; i < 4; ++i)
+    out << L"转向 " << i + 1 << L"：" << array("steering_angle_deg", "steering_valid", i, 1)
+        << L"°，模式 " << array("steering_mode", "steering_valid", i) << L"\r\n";
+  out << L"驻车状态：" << array("parking_brake_status", "parking_brake_valid", 0)
+      << L" / " << array("parking_brake_status", "parking_brake_valid", 1);
+  return out.str();
+}
+
+}  // namespace mine_teleop::detail

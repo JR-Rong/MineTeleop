@@ -50,8 +50,10 @@ Mock input supports standard XInput controllers in addition to the keyboard.
 It applies the configured standard-controller calibration and deadzone, and
 requires neutral pedals after focus, safety, profile or controller changes.
 Generic HID devices, interactive calibration and gamepad controls outside
-mock mode are not implemented. The displayed CAN indication reports missing,
-unsupported or stale feedback rather than treating mock data as physical CAN.
+mock mode are not implemented. A scrollable CAN panel shows valid, fresh
+feedback fields and reports missing, unsupported or stale feedback rather than
+treating mock data as physical CAN. Interacting with this panel removes input
+focus and the existing control interlock requires a fresh release afterwards.
 
 The login/vehicle-selection screen also offers an export for authorized,
 completed session logs through the existing driver runtime. It must run while
@@ -60,7 +62,7 @@ or unconfirmed recording completeness must not be interpreted as a complete
 recording. This native export flow has not yet been validated end to end.
 
 The native viewer is not yet functionally equivalent to the web console. It
-does not implement the web console's complete CAN feedback, editable session
+does not implement all of the web console's CAN presentation, editable session
 profile or recording status. Its control mode remains
 limited to the zero-speed isolated mock. Keyboard and standard-gamepad control
 values use the acknowledged profile scaling, so that profile sends zero

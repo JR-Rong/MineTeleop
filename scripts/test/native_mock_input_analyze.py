@@ -73,9 +73,10 @@ def analyze(metadata, viewer_records, vehicle_records):
                     matches.append(command)
         output.append({"scenario": scenario, "local_observations": len(local), "accepted_commands": len(matches),
                        "paths": dict(Counter(command.get("transport", "unknown") for command in matches))})
+    coverage = dict(Counter(item["scenario"] for item in output if item["accepted_commands"]))
     return {"session_id": session, "scenario_details": output,
             "all_windows_matched": bool(output) and all(item["accepted_commands"] for item in output),
-            "coverage": dict(Counter(item["scenario"] for item in output if item["accepted_commands"])),
+            "all_nine_scenarios_covered": set(coverage) == set(MASKS), "coverage": coverage,
             "scope": "mock input correlation only; not path, safety-stop, CAN or real-vehicle acceptance"}
 
 
