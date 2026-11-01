@@ -41,6 +41,20 @@ requested values require a fresh accepted local input and active authorization.
 Unknown or stale values display as `—`. Keyboard highlights describe local key
 state, not vehicle receipt or physical actuation, and clear on focus loss.
 
+The native viewer is not yet functionally equivalent to the web console. It
+connects to the one locally configured vehicle instead of presenting the full
+authorized vehicle list; it has no gamepad, complete CAN feedback, editable
+session profile, recording status or session-log export UI. Its control mode
+remains limited to the zero-speed isolated mock, and its fixed mock keyboard
+intent is not the web console's full profile-scaled input implementation.
+
+For the `b93bfff` UI build, a Windows smoke check opened the isolated mock
+window without connecting a vehicle, checked four edit fields and Tab focus,
+and inspected 1100×720 and 900×720 window captures. One minimum-size capture
+was blank; a repeat displayed the expected layout, so a transient capture or
+paint issue is not ruled out. The earlier 30-minute mock result used a different
+viewer build and does not validate this UI change under live video load.
+
 An additional dual-control experiment requires the vehicle process to set
 `MINE_TELEOP_MOCK_DUAL_CONTROL=1`; the vehicle advertises it only for a
 `test_bench_` identity, mock adapter and zero speed. The mock native viewer
