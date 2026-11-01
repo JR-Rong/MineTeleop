@@ -144,6 +144,7 @@ struct Window {
   std::atomic<std::int64_t> last_observation_ms{0};
   std::atomic<std::int64_t> last_mock_observation_ms{0};
   std::atomic<bool> mock_estop_requested{false};
+  std::atomic<bool> mock_ui_posted{false};
   detail::NativeMockKeyboard keyboard;
   bool mock_control{false};
   std::string mock_local_ip, mock_peer_ip, mock_ip_family;
@@ -164,7 +165,8 @@ struct Window {
   void report_mock(std::wstring value) {
     { std::lock_guard lock(mutex); mock_message = std::move(value); }
     last_mock_observation_ms = static_cast<std::int64_t>(bench_now_ms());
-    PostMessageW(hwnd, WM_APP + 2, 0, 0);
+    if (!mock_ui_posted.exchange(true) && !PostMessageW(hwnd, WM_APP + 2, 0, 0))
+      mock_ui_posted.store(false);
   }
 
   void request_mock_estop() {
@@ -191,6 +193,7 @@ struct Window {
     std::optional<SessionControlProfile> requested_profile;
     std::optional<Json> profile_request;
     auto next_evidence = Clock::now();
+    auto next_mock_ui = Clock::now();
     auto next_status = Clock::now();
     Json cached_status;
     Json telemetry;
@@ -461,6 +464,37 @@ struct Window {
           telemetry.contains("speed_mps") && telemetry.at("speed_mps").is_number() &&
           telemetry.at("speed_mps").get<double>() == 0.0;
       input_authorized_at_ms.store(authorized ? authorization_observed_ms : 0);
+      if (now >= next_mock_ui) {
+        const auto native = status.at("native_control");
+        const auto transport = native.at("control_transport");
+        const auto path = transport.value("path", "unknown");
+        const bool selecting = transport.value("selecting", true);
+        const auto control_path = selecting ? L"切换中" : transport.value("mock_dual_control", false) ? L"双路已发送" :
+            path == "dc" ? L"DataChannel" :
+            path == "wss" ? L"WSS 回退" : L"未知";
+        const auto time_uncertainty = sync.value("uncertainty_ms", -1);
+        const bool telemetry_fresh = detail::native_mock_input_fresh(telemetry_at_ms, authorization_observed_ms) && telemetry.is_object();
+        const auto safety_state = telemetry_fresh ? telemetry.value("safety_state", "") : std::string{};
+        const auto vehicle_state = safety_state == "ESTOP" ? L"急停锁存" : safety_state == "FAULT" ? L"故障" :
+            safety_state == "TIMEOUT_BRAKE" ? L"超时制动" : safety_state == "DEGRADED" ? L"降级" :
+            safety_state == "CONTROL_ACTIVE" && !telemetry.value("braking_wait", true) ? L"控制正常" : L"等待或未知";
+        const auto latest_result = native.value("vehicle_result_latency", Json(nullptr));
+        std::wstring result_text = L"等待车端结果";
+        if (latest_result.is_object() && latest_result.contains("result_age_ms") && latest_result.at("result_age_ms").is_number_integer() &&
+            latest_result.at("result_age_ms").get<std::int64_t>() >= 0 && latest_result.at("result_age_ms").get<std::int64_t>() < 500 &&
+            latest_result.contains("round_trip_ms") && latest_result.at("round_trip_ms").is_number_integer() &&
+            latest_result.at("round_trip_ms").get<std::int64_t>() >= 0 &&
+            latest_result.contains("accepted") && latest_result.at("accepted").is_boolean()) {
+          result_text = std::to_wstring(latest_result.at("round_trip_ms").get<std::int64_t>()) + L" ms · " +
+              (latest_result.at("accepted").get<bool>() ? L"软件接受" : L"已拒绝");
+        }
+        report_mock(std::wstring(L"控制：") + control_path + (authorized ? L" · 输入就绪" : L" · 输入禁止") +
+            L"\n画面：" + (video_health.ready && gate->ready_now() ? L"就绪" : L"未就绪") +
+            L"  校时：" + (clock_ok ? std::wstring(L"±") + std::to_wstring(time_uncertainty) + L" ms" : L"不可用") +
+            L"\n车端：" + (mock_estop_requested.load() && safety_state != "ESTOP" ? L"急停等待确认" : vehicle_state) +
+            L"\n结果：" + result_text);
+        next_mock_ui = now + 100ms;
+      }
       if (now >= next_evidence) {
         flush_dc_trace();
         flush_guard_trace();
@@ -483,24 +517,13 @@ struct Window {
         const auto transport = native.at("control_transport");
         const auto feedback = transport.value("feedback_transport", Json::object());
         const auto sends = channel->send_stats();
-        const auto path = transport.value("path", "unknown");
-        const bool selecting = transport.value("selecting", true);
-        const auto control_path = selecting ? L"切换中" : transport.value("mock_dual_control", false) ? L"双路已发送" :
-            path == "dc" ? L"DataChannel" :
-            path == "wss" ? L"WSS 回退" : L"未知";
-        const auto time_uncertainty = sync.value("uncertainty_ms", -1);
-        const bool estop_confirmed = mock_estop_requested.load() &&
-            detail::native_mock_input_fresh(telemetry_at_ms, authorization_observed_ms) &&
-            telemetry.is_object() && telemetry.value("safety_state", "") == "ESTOP";
-        report_mock(std::wstring(L"控制：") + control_path + (authorized ? L" · 输入就绪" : L" · 输入禁止") +
-            L"\n画面：" + (video_health.ready && gate->ready_now() ? L"关键画面就绪" : L"未就绪") +
-            L"\n校时：" + (clock_ok ? std::wstring(L"±") + std::to_wstring(time_uncertainty) + L" ms" : L"不可用") +
-            (mock_estop_requested.load() ? (estop_confirmed ? L"\n车端：急停锁存" : L"\n急停：等待车端确认") : L""));
         const Json evidence{{"event", "native_mock_observation"}, {"monotonic_ms", now_ms},
             {"video_ready", video_health.ready}, {"remote_media_ready", gate->ready(now_ms)},
             {"remote_media_reason", gate->reason(now_ms)},
             {"focused", focused}, {"clock_ready", clock_ok}, {"clock_uncertainty_ms", sync.value("uncertainty_ms", -1)},
             {"sctp_direct_udp", channel->direct_udp(mock_local_ip, mock_peer_ip)}, {"control_path", transport.value("path", "unknown")},
+            {"mock_dual_control", transport.value("mock_dual_control", false)},
+            {"mock_dual_last_vehicle_path", transport.value("mock_dual_last_vehicle_path", Json(nullptr))},
             {"control_selecting", transport.value("selecting", true)}, {"intent_fresh", native.value("intent_fresh", false)},
             {"control_failed_dc_trials", transport.value("failed_dc_trials", 0)},
             {"feedback_path", feedback.is_object() ? feedback.value("path", "unknown") : "unknown"},
@@ -956,9 +979,10 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     case WM_APP + 2: {
       std::lock_guard lock(app->mutex);
       if (app->mock_info) SetWindowTextW(app->mock_info,
-          app->running.load() && detail::viewer_observation_stale(
-              static_cast<std::int64_t>(bench_now_ms()), app->last_mock_observation_ms.load())
+          app->running.load() && app->last_mock_observation_ms.load() > 0 && !detail::native_mock_input_fresh(
+              app->last_mock_observation_ms.load(), static_cast<std::int64_t>(bench_now_ms()))
               ? L"控制状态过期，请停止操作\n画面与校时状态未知" : app->mock_message.c_str());
+      app->mock_ui_posted.store(false);
       return 0;
     }
     case WM_TIMER:
@@ -968,6 +992,9 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             GetForegroundWindow() == hwnd && (focus == hwnd || focus == app->video[0] || focus == app->video[1]);
         const auto down = [](int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; };
         if (focused && down('E')) app->request_mock_estop();
+        if (app->mock_info && app->running.load() && app->last_mock_observation_ms.load() > 0 &&
+            !detail::native_mock_input_fresh(app->last_mock_observation_ms.load(), static_cast<std::int64_t>(bench_now_ms())))
+          SetWindowTextW(app->mock_info, L"控制状态过期，请停止操作\n画面与校时状态未知");
         app->keyboard.observe(focused,
             {down('W') || down(VK_UP), down('A') || down(VK_LEFT), down('D') || down(VK_RIGHT),
              down('S') || down(VK_DOWN) || down(VK_SPACE), down('B')}, static_cast<std::int64_t>(bench_now_ms()));

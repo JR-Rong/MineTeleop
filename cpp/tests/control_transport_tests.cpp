@@ -149,6 +149,11 @@ void explicit_dc_mirror_races_remain_fenced() {
   auto old = command(6, 1151);
   expect(!check(disabled, old, ControlPath::Wss, 1151).admitted,
       "mirror revived a retired DC epoch");
+  auto stop = command(6, 1152); stop.estop = true;
+  expect(disabled.admit(stop, nullptr, ControlPath::Wss, "media-a", 1152, 100000, 200, true).admitted,
+      "WSS emergency was blocked by mirrored control");
+  expect(!check(disabled, old, ControlPath::DataChannel, 1153).admitted,
+      "delayed direct copy superseded the emergency sequence");
 }
 void mirror_ingress_ack_never_advances_active_ack() {
   NativeMirrorIngressAcks mirror;

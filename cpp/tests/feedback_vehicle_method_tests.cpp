@@ -94,13 +94,39 @@ struct EarlyResult : Startup {
     receive_apply_invoked = invoked;
   }
   void deliver(ControlCommand command, ControlMessageTransport transport, FakeChannel* channel, Json* native_feedback,
-      const Json& message = Json::object()) {
+      const Json& message = Json::object(), bool mock_dual = false) {
     const std::uint64_t intent_seq = 9;
     const std::string current_attempt = "fixture-attempt";
 #include "control_early_result.inc"
     throw std::runtime_error("early rejection fixture unexpectedly passed its guard");
   }
 };
+
+void mirrored_duplicate_is_not_published_or_applied() {
+  for (const bool first_dc : {false, true}) {
+    EarlyResult value;
+    expect(value.start_control_service(), "dual fixture failed to start mock service");
+    value.config.runtime.control_log_commands = true;
+    FakeChannel channel;
+    value.control_channel = &channel;
+    value.control_link_open = true;
+    value.control_transport_fence.reset(value.config.vehicle_id, "d", "s", "t");
+    ControlCommand command;
+    command.vehicle_id = value.config.vehicle_id; command.driver_id = "d"; command.session_id = "s";
+    command.control_token = "t"; command.seq = 42; command.sent_at_utc_ms = 1000;
+    const auto stamp = ControlTransportStamp{1, 0, 42, ControlPath::DataChannel, "fixture-attempt", true}.to_json();
+    expect(value.control_transport_fence.admit(command, &stamp,
+        first_dc ? ControlPath::DataChannel : ControlPath::Wss, "fixture-attempt", 1000, 2000, 200, true, false, true).admitted,
+        "first mirrored copy was not admitted");
+    Json feedback;
+    value.deliver(command, first_dc ? EarlyResult::ControlMessageTransport::NativeSignaling :
+        EarlyResult::ControlMessageTransport::DataChannel, &channel, &feedback, {{"control_transport", stamp}}, true);
+    expect(value.trace_reason == "mock_dual_duplicate" && value.rejected_control_commands == 0 &&
+        value.control_result_seq == 0 && value.wakeups == 0 && channel.sent.empty() && feedback.is_null() &&
+        !value.receive_apply_invoked && value.control_service->adapter_status().applied_command_count == 0,
+        "duplicate mirror produced a result, applied a command, or changed a rejection counter");
+  }
+}
 
 void transport_expiry_has_signed_reason_and_trace_without_apply() {
   for (const bool trace : {false, true}) for (const bool dc : {false, true}) for (const int offset : {-201, 201}) {
@@ -303,6 +329,6 @@ void raw_vcu_details_are_not_a_transport_wrapper() {
 }
 }
 int main() {
-  try { transport_expiry_has_signed_reason_and_trace_without_apply(); raw_vcu_details_are_not_a_transport_wrapper(); early_rejection_publishes_precise_signed_result(); cloud_only_startup_retains_all_safety_gates(); cloud_bootstrap_feedback_requires_live_authenticated_lease(); publish_all_four_independent_axes(); std::cout << "Actual vehicle feedback publisher: expiry rejection trace, raw/wrapped status ordering, early rejection reasons, four axes, real MAC and bounded snapshots passed; fake Gst send, no ABI/network proof\n"; }
+  try { mirrored_duplicate_is_not_published_or_applied(); transport_expiry_has_signed_reason_and_trace_without_apply(); raw_vcu_details_are_not_a_transport_wrapper(); early_rejection_publishes_precise_signed_result(); cloud_only_startup_retains_all_safety_gates(); cloud_bootstrap_feedback_requires_live_authenticated_lease(); publish_all_four_independent_axes(); std::cout << "Actual vehicle feedback publisher: duplicate suppression, expiry rejection trace, raw/wrapped status ordering, early rejection reasons, four axes, real MAC and bounded snapshots passed; fake Gst send, no ABI/network proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
