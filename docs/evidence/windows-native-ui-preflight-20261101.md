@@ -33,6 +33,14 @@ scheduling or rendering. They are local submission intervals, not physical
 camera-to-display latency. The later changes add decoded-callback and
 callback-to-submission measurements for a subsequent run.
 
+In the three seconds centered on the first formal stop, the vehicle rejected
+11 expired commands: one on DataChannel and ten on WSS. For those commands,
+sender-timestamp-to-callback estimates ranged from 220 to 339 ms; these are
+cross-host estimates subject to clock uncertainty. The maximum measured
+vehicle callback-to-control-mutex wait in that interval was 1 ms. This does
+not identify whether the preceding delay occurred in Windows scheduling,
+either network path, or vehicle scheduling before the callback.
+
 The separate Windows and Orin startup clock probes reported uncertainties of
 14 ms and 19 ms respectively; these are individual preflight samples, not a
 guarantee throughout a session. No physical gamepad was connected. Raw logs

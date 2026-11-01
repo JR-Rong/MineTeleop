@@ -65,10 +65,10 @@ class NativeMockKeyboard {
     const double service_ratio = maximum > 0 ? service / maximum : 0;
     const double hard_ratio = maximum > 0 ? hard / maximum : 0;
     std::lock_guard lock(mutex_);
-    if (!profile_ready_ || service_ratio != service_brake_ || hard_ratio != hard_brake_ ||
-        (maximum > 0) != brake_available_) {
+    if (!profile_ready_ || service != service_pressure_ || hard != hard_pressure_ || maximum != maximum_pressure_) {
       service_brake_ = service_ratio;
       hard_brake_ = hard_ratio;
+      service_pressure_ = service; hard_pressure_ = hard; maximum_pressure_ = maximum;
       brake_available_ = maximum > 0;
       profile_ready_ = true;
       needs_release_ = true;
@@ -180,6 +180,7 @@ class NativeMockKeyboard {
   bool profile_ready_{false};
   bool brake_available_{false};
   double service_brake_{0}, hard_brake_{0};
+  double service_pressure_{0}, hard_pressure_{0}, maximum_pressure_{0};
   double throttle_limit_{0}, steering_limit_{0}, steering_scale_{30};
 };
 }  // namespace mine_teleop::detail

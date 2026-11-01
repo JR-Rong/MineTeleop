@@ -123,6 +123,9 @@ void test_mock_keyboard_rearms_only_after_release() {
   require(input.throttle == 0.0 && input.brake == .8, "hard brake did not override service brake and throttle");
   keyboard.set_brake_profile(30, 80, 100);
   require(keyboard.sample(true, 134).brake == .8, "identical profile unexpectedly invalidated held input");
+  keyboard.set_brake_profile(60, 160, 200);
+  require(keyboard.sample(true, 134).brake == 0.0, "scaled pressure change retained held input");
+  keyboard.observe(true, Keys{}, 134); static_cast<void>(keyboard.sample(true, 134));
   keyboard.set_brake_profile(20, 60, 100);
   require(keyboard.sample(true, 135).brake == 0.0, "changed profile retained held input");
   keyboard.observe(true, Keys{}, 136); static_cast<void>(keyboard.sample(true, 137));
