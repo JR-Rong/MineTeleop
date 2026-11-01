@@ -39,7 +39,7 @@ PRELUDE = r'''
 #include "mine_teleop/detail/ice_diagnostics.hpp"
 namespace detail { using mine_teleop::detail::ice_candidate_summary; using mine_teleop::detail::ice_direct_sdp; }
 using Json=nlohmann::json;
-namespace detail { constexpr std::string_view kControlTransportCapability = "native-control-transport-v1"; constexpr std::string_view kEmergencyStopCapability = "native-stop-only-v1"; constexpr std::string_view kFeedbackTransportCapability = "native-feedback-transport-v1"; constexpr std::string_view kMockCompactControl = "mock-compact-control-cbor-v1"; constexpr std::string_view kMockCompactDualControl = "mock-compact-dual-control-cbor-v2"; constexpr std::string_view kMockDualControlCapability = "mock-dual-control-v1"; }
+namespace detail { constexpr std::string_view kControlTransportCapability = "native-control-transport-v1"; constexpr std::string_view kEmergencyStopCapability = "native-stop-only-v1"; constexpr std::string_view kFeedbackTransportCapability = "native-feedback-transport-v1"; constexpr std::string_view kMockCompactControl = "mock-compact-control-cbor-v1"; constexpr std::string_view kMockCompactDualControl = "mock-compact-dual-control-cbor-v2"; constexpr std::string_view kMockDualControlCapability = "mock-dual-control-v1"; constexpr std::string_view kMockWssDcMirrorCapability = "mock-wss-dc-mirror-v1"; }
 using guint=unsigned;using guint8=unsigned char;using gchar=char;using gpointer=void*;
 struct GstSDPMessage {std::string text;};
 struct GstWebRTCSessionDescription {GstSDPMessage* sdp;};
@@ -166,6 +166,8 @@ void case_compact_offer() {
         (enabled?std::string(detail::kMockCompactDualControl):std::string{}),"mock compact dual capability advertisement mismatch");
     expect(impl.signaling.sent[0].second.value("mock_dual_control","")==
         (dual?std::string(detail::kMockDualControlCapability):std::string{}),"mock dual capability advertisement mismatch");
+    expect(impl.signaling.sent[0].second.value("mock_wss_dc_mirror","")==
+        (dual?std::string(detail::kMockWssDcMirrorCapability):std::string{}),"mock WSS/DC mirror capability advertisement mismatch");
   }
 }
 void case_late_callbacks() {

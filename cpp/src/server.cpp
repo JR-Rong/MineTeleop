@@ -5558,6 +5558,7 @@ void DriverConsoleRuntime::reset_native_control_state() {
     control_sequence_ = 0;
     control_transport_vehicle_capable_ = false;
     mock_dual_control_vehicle_capable_ = false;
+    mock_wss_dc_mirror_vehicle_capable_ = false;
     emergency_stop_vehicle_capable_ = false; feedback_transport_vehicle_capable_ = false;
     control_transport_mac_key_.clear();
     ++control_session_generation_;
@@ -5918,7 +5919,7 @@ Json DriverConsoleRuntime::control_transport_bridge(const Json& input, const Htt
   const auto handler_entered = monotonic_now_ms();
   std::string session, vehicle, driver, attempt, owner;
   std::uint64_t ui_epoch = 0;
-  bool capable = false, feedback_capable = false;
+  bool capable = false, feedback_capable = false, wss_dc_mirror_capable = false;
   {
     std::lock_guard update_lock(native_control_update_mutex_);
     std::lock_guard lock(mutex_);
@@ -5932,6 +5933,9 @@ Json DriverConsoleRuntime::control_transport_bridge(const Json& input, const Htt
       throw Conflict("transport bridge belongs to a retired page", "control_transport_owner_mismatch");
     session = session_id_; vehicle = vehicle_id_; driver = driver_id(); attempt = media_scope_id_;
     capable = control_transport_vehicle_capable_ && control_transport_mac_key_.size() >= 32;
+    wss_dc_mirror_capable = detail::mock_dual_sender_allowed(config_.mock_dual_control,
+        config_.enable_experimental_direct_authority, vehicle, mock_dual_control_vehicle_capable_, capable) &&
+        mock_wss_dc_mirror_vehicle_capable_;
     feedback_capable = config_.enable_experimental_direct_authority && feedback_transport_vehicle_capable_;
   }
   if (!input.at("dc_ready").is_boolean()) throw std::invalid_argument("dc_ready must be boolean");
@@ -5986,7 +5990,9 @@ Json DriverConsoleRuntime::control_transport_bridge(const Json& input, const Htt
   // failure detection; it never extends the vehicle's timestamp limit.
   const auto age = now - control_transport_latest_dc_at_ms_;
   const auto allowance = detail::kNativeBridgePublicationMaxAgeMs;
-  if (control_transport_dc_ready_ && control_transport_sender_.owns_dc_publication(control_transport_latest_dc_) && age >= 0 && age < allowance &&
+  const bool wss_dc_mirror = wss_dc_mirror_capable &&
+      control_transport_sender_.owns_wss_dc_mirror(control_transport_latest_dc_, attempt);
+  if (control_transport_dc_ready_ && (control_transport_sender_.owns_dc_publication(control_transport_latest_dc_) || wss_dc_mirror) && age >= 0 && age < allowance &&
       control_transport_latest_dc_.value("seq", std::uint64_t{0}) > last_seen &&
       control_transport_latest_dc_.value("bridge_owner", "") == owner &&
       control_transport_latest_dc_.value("bridge_ui_epoch", std::uint64_t{0}) == ui_epoch) {
@@ -6000,6 +6006,7 @@ Json DriverConsoleRuntime::control_transport_bridge(const Json& input, const Htt
   std::sort(statuses.begin(), statuses.end(), [](const Json& left, const Json& right) {
     return left.at("control_status_seq").get<std::uint64_t>() < right.at("control_status_seq").get<std::uint64_t>(); });
   return {{"protocol", detail::kControlTransportCapability}, {"enabled", capable && control_transport_cloud_capable_},
+      {"wss_dc_mirror_enabled", wss_dc_mirror},
       {"transport", control_transport_sender_.status()}, {"feedback_transport", feedback_transport_sender_.status()}, {"statuses", std::move(statuses)}, {"frame_json", frame.is_object() ? Json(frame.dump()) : Json(nullptr)}, {"frame", std::move(frame)},
       {"valid_for_ms", age >= 0 && age < allowance ? allowance - age : 0}};
 }
@@ -6255,6 +6262,7 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
   Json trace_record;
   std::int64_t socket_lock_acquired_ms = 0, socket_lock_released_ms = 0;
   bool vehicle_transport_capable = false, vehicle_stop_capable = false, vehicle_mock_dual_capable = false;
+  bool vehicle_mock_wss_dc_capable = false;
   std::string current_media_attempt, transport_signing_key;
   {
     std::lock_guard update_lock(native_control_update_mutex_);
@@ -6281,6 +6289,7 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
       sequence = ++control_sequence_;
       vehicle_transport_capable = control_transport_vehicle_capable_ && control_transport_mac_key_.size() >= 32;
       vehicle_mock_dual_capable = mock_dual_control_vehicle_capable_;
+      vehicle_mock_wss_dc_capable = mock_wss_dc_mirror_vehicle_capable_;
       transport_signing_key = control_transport_mac_key_;
       vehicle_stop_capable = emergency_stop_vehicle_capable_;
       current_media_attempt = media_scope_id_;
@@ -6656,7 +6665,17 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
       const bool mock_dual = detail::mock_dual_sender_allowed(config_.mock_dual_control,
           config_.enable_experimental_direct_authority, vehicle, vehicle_mock_dual_capable, vehicle_transport_capable) &&
           control_transport_sender_.path() == detail::ControlPath::DataChannel;
+      const bool mock_wss_dc = detail::mock_dual_sender_allowed(config_.mock_dual_control,
+          config_.enable_experimental_direct_authority, vehicle, vehicle_mock_dual_capable, vehicle_transport_capable) &&
+          vehicle_mock_wss_dc_capable && !current_media_attempt.empty() && control_transport_dc_ready_ &&
+          control_transport_sender_.negotiated() && control_transport_sender_.path() == detail::ControlPath::Wss &&
+          !control_transport_sender_.selecting() &&
+          !command.estop;
       if (mock_dual) envelope["payload"]["mock_dual_control"] = detail::kMockDualControlCapability;
+      if (mock_wss_dc) {
+        envelope["payload"]["mock_wss_dc_mirror"] = detail::kMockWssDcMirrorCapability;
+        envelope["payload"]["mock_wss_dc_attempt"] = current_media_attempt;
+      }
       if (envelope.at("payload").contains("control_transport") || envelope.at("payload").contains("feedback_request"))
         envelope["payload"]["native_mac"] = detail::transport_message_mac(envelope.at("payload"), transport_signing_key, false);
       if (emergency_payload.is_object()) envelope["payload"] = emergency_payload; // Exact same signed bytes on both carriers.
@@ -6726,6 +6745,16 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
           return false;
         }
         if (native_control_trace_) trace_record["send_io"] = control_signaling_websocket_->last_send_diagnostics();
+        if (mock_wss_dc) {
+          // The WSS epoch is already confirmed. Publish the exact signed
+          // command on the scoped DC as an additional carrier, without
+          // creating another sequence, extending freshness or selecting DC.
+          control_transport_latest_dc_ = envelope.at("payload");
+          control_transport_latest_dc_["bridge_owner"] = sample.owner_ui_instance_id;
+          control_transport_latest_dc_["bridge_ui_epoch"] = sample.ui_control_epoch;
+          control_transport_latest_dc_at_ms_ = send_started_monotonic_ms;
+          if (native_control_trace_) trace_record["mock_wss_dc_published"] = true;
+        }
       }
       send_completed_at_utc_ms = clock_.now_ms();
       send_completed_monotonic_ms = monotonic_now_ms();
@@ -7876,6 +7905,7 @@ Json DriverConsoleRuntime::poll_signaling() {
       media_scope_legacy_allowed_ = payload.value("legacy_bootstrap_allowed", media_offer_count_ == 1);
       control_transport_vehicle_capable_ = payload.value("control_transport_capability", "") == detail::kControlTransportCapability;
       mock_dual_control_vehicle_capable_ = payload.value("mock_dual_control", "") == detail::kMockDualControlCapability;
+      mock_wss_dc_mirror_vehicle_capable_ = payload.value("mock_wss_dc_mirror", "") == detail::kMockWssDcMirrorCapability;
       emergency_stop_vehicle_capable_ = payload.value("emergency_stop_capability", "") == detail::kEmergencyStopCapability;
       feedback_transport_vehicle_capable_ = payload.value("feedback_transport_capability", "") == detail::kFeedbackTransportCapability;
     }

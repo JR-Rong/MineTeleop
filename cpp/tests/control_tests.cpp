@@ -5120,7 +5120,8 @@ void test_mac_runtime_uses_websocket_signaling() {
       "webrtc_offer",
       {{"type", "offer"}, {"sdp", "v=0\r\n"}, {"media_tracks", mine_teleop::Json::array()},
        {"mock_compact_control", "mock-compact-control-cbor-v1"},
-       {"mock_compact_dual_control", "mock-compact-dual-control-cbor-v2"}});
+       {"mock_compact_dual_control", "mock-compact-dual-control-cbor-v2"},
+       {"mock_wss_dc_mirror", "mock-wss-dc-mirror-v1"}});
   offer["connection_generation"] = vehicle_generation;
   static_cast<void>(http.post_json_response(base + "/signaling/" + session_id + "/messages", offer));
   const auto pushed = driver.poll_signaling();
@@ -5130,7 +5131,8 @@ void test_mac_runtime_uses_websocket_signaling() {
       "websocket push delivered the wrong signaling type");
   const auto& offer_payload = pushed.at("messages").at(0).at("payload");
   expect(offer_payload.value("mock_compact_control", "") == "mock-compact-control-cbor-v1" &&
-      offer_payload.value("mock_compact_dual_control", "") == "mock-compact-dual-control-cbor-v2",
+      offer_payload.value("mock_compact_dual_control", "") == "mock-compact-dual-control-cbor-v2" &&
+      offer_payload.value("mock_wss_dc_mirror", "") == "mock-wss-dc-mirror-v1",
       "signaling did not preserve compact capability negotiation");
 
   const auto answer = driver.send_webrtc_answer({{"type", "answer"}, {"sdp", "v=0\r\n"}});

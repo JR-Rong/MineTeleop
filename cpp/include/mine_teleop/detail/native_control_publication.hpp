@@ -23,7 +23,8 @@ struct NativeCourierScope {
 // must serialize take, the channel send and retirement against scope changes.
 class NativeControlPublication {
  public:
-  explicit NativeControlPublication(NativeCourierScope scope) : scope_(std::move(scope)) {
+  explicit NativeControlPublication(NativeCourierScope scope, bool allow_wss_dc_mirror = false)
+      : scope_(std::move(scope)), allow_wss_dc_mirror_(allow_wss_dc_mirror) {
     if (scope_.media.session.empty() || scope_.media.generation == 0 || scope_.media.attempt.empty() ||
         scope_.owner.empty() || scope_.owner_epoch == 0) throw std::invalid_argument("invalid courier scope");
   }
@@ -48,8 +49,13 @@ class NativeControlPublication {
           frame.value("session_id", "") != scope_.media.session ||
           !frame.contains("control_transport") || !frame.at("control_transport").is_object()) return std::nullopt;
       const auto& transport = frame.at("control_transport");
-      if (transport.value("protocol", "") != kControlTransportCapability || transport.value("path", "") != "dc" ||
-          transport.value("media_attempt", "") != scope_.media.attempt ||
+      const bool direct = transport.value("path", "") == "dc" &&
+          transport.value("media_attempt", "") == scope_.media.attempt;
+      const bool mirror = allow_wss_dc_mirror_ && response.value("wss_dc_mirror_enabled", false) &&
+          transport.value("path", "") == "wss" && transport.value("action", "") == "command" &&
+          frame.value("mock_wss_dc_mirror", "") == kMockWssDcMirrorCapability &&
+          frame.value("mock_wss_dc_attempt", "") == scope_.media.attempt;
+      if (transport.value("protocol", "") != kControlTransportCapability || (!direct && !mirror) ||
           !response.contains("frame_json") || !response.at("frame_json").is_string()) return std::nullopt;
       const auto bytes = response.at("frame_json").get<std::string>();
       if (bytes.empty() || bytes.size() > 64 * 1024 || bytes.find('\0') != std::string::npos ||
@@ -61,6 +67,7 @@ class NativeControlPublication {
   [[nodiscard]] std::uint64_t last_seen() const { return last_seen_; }
  private:
   const NativeCourierScope scope_;
+  const bool allow_wss_dc_mirror_;
   std::uint64_t last_seen_{};
   bool retired_{};
 };

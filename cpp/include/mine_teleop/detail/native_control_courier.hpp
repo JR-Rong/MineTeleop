@@ -24,8 +24,8 @@ class NativeControlCourier {
     std::function<bool(const std::string&)> send;
     std::function<void(const Json&)> status;
   };
-  explicit NativeControlCourier(NativeCourierScope scope)
-      : scope_(std::move(scope)), publication_(scope_) {}
+  explicit NativeControlCourier(NativeCourierScope scope, bool allow_wss_dc_mirror = false)
+      : scope_(std::move(scope)), publication_(scope_, allow_wss_dc_mirror) {}
 
   bool tick(const NativeCourierScope& current, const Io& io) {
     if (retired_) return false;

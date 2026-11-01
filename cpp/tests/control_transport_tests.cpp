@@ -173,6 +173,47 @@ void mirror_ingress_ack_never_advances_active_ack() {
   mirror.reset();
   expect(!mirror.consume(2) && mirror.can_send(), "retired mirror identities survived reset");
 }
+void wss_owned_dc_mirror_preserves_epoch_and_freshness() {
+  Json identity{{"mock_wss_dc_mirror", kMockWssDcMirrorCapability}, {"mock_wss_dc_attempt", "media-a"},
+      {"control_transport", {{"path", "wss"}}}, {"estop", false}};
+  expect(mock_wss_dc_mirror_allowed(true, "media-a", identity) &&
+      !mock_wss_dc_mirror_allowed(false, "media-a", identity) &&
+      !mock_wss_dc_mirror_allowed(true, "media-b", identity) &&
+      !mock_wss_dc_mirror_allowed(true, "", identity), "mock WSS mirror escaped its negotiated attempt");
+  auto bad = identity; bad["estop"] = true;
+  expect(!mock_wss_dc_mirror_allowed(true, "media-a", bad), "ordinary mirror accepted emergency input");
+  bad = identity; bad["control_transport"]["path"] = "dc";
+  expect(!mock_wss_dc_mirror_allowed(true, "media-a", bad), "ordinary mirror accepted the wrong logical path");
+  const std::string key = "01234567890123456789012345678901";
+  identity["native_mac"] = transport_message_mac(identity, key, false);
+  expect(verify_transport_message(identity, key, false), "mock WSS mirror signature failed");
+  identity["mock_wss_dc_attempt"] = "media-b";
+  expect(!verify_transport_message(identity, key, false), "mock WSS mirror attempt was not signed");
+  auto value = fence();
+  auto select = stamp(1, 0, ControlPath::Wss, 1);
+  auto first = command(1, 1000);
+  expect(!value.admit(first, &select, ControlPath::DataChannel, "media-a", 1000, 100000, 200,
+      true, false, false, true).admitted, "DC mirror selected a WSS epoch");
+  expect(value.admit(first, &select, ControlPath::Wss, "media-a", 1000, 100000, 200, true).changed,
+      "WSS selection did not establish its own epoch");
+  auto wire = stamp(1, 0, ControlPath::Wss, 1, false);
+  auto next = command(2, 1050);
+  expect(!value.admit(next, &wire, ControlPath::DataChannel, "media-a", 1050, 100000, 200, true).admitted,
+      "unnegotiated DC mirror was admitted");
+  expect(!value.admit(next, &wire, ControlPath::DataChannel, "media-a", 1251, 100000, 200,
+      true, false, false, true).admitted, "expired DC mirror bypassed freshness");
+  expect(!value.admit(next, &wire, ControlPath::DataChannel, "media-a", 1050, 100000, 200,
+      false, false, false, true).admitted, "DC mirror bypassed cloud authority");
+  expect(value.admit(next, &wire, ControlPath::DataChannel, "media-a", 1050, 100000, 200,
+      true, false, false, true).admitted, "fresh negotiated DC mirror was not admitted");
+  expect(!value.admit(next, &wire, ControlPath::Wss, "media-a", 1051, 100000, 200, true).admitted,
+      "WSS duplicate was applied after the DC copy");
+  auto new_epoch = stamp(2, 1, ControlPath::DataChannel, 3);
+  expect(value.admit(command(3, 1100), &new_epoch, ControlPath::DataChannel, "media-a", 1100,
+      100000, 200, true).changed, "new direct selection failed");
+  expect(!value.admit(command(4, 1101), &wire, ControlPath::DataChannel, "media-a", 1101,
+      100000, 200, true, false, false, true).admitted, "mirror revived a retired WSS epoch");
+}
 Json payload(std::uint64_t seq, std::int64_t now) {
   auto value = command(seq, now).to_json(); value["intent_seq"] = seq + 100;
   value["intent_fresh"] = true; return value;
@@ -235,6 +276,9 @@ void compact_mock_wire_preserves_the_signed_command() {
   expect(!encode_mock_compact_control(extra, true), "compact dual wire silently discarded an unknown signed field");
   extra = frame; extra["control_transport"]["path"] = "wss";
   expect(!encode_mock_compact_control(extra), "compact wire accepted a non-direct command");
+  extra["mock_wss_dc_mirror"] = kMockWssDcMirrorCapability;
+  extra["mock_wss_dc_attempt"] = "media-a";
+  expect(!encode_mock_compact_control(extra, true), "WSS-owned mirror lost its signed extension in compact encoding");
 }
 void late_dc_results_withdraw_publication_in_result_handler() {
   DriverConfig config; config.driver_id = "driver-001"; config.signaling_url = "http://127.0.0.1:1";
@@ -582,7 +626,7 @@ int main() {
     mock_idle_reprobe_is_fenced_fresh_and_once_per_attempt();
     mock_idle_reprobe_requires_all_fresh_neutral_guards();
     confirmed_profile_permits_only_one_new_bounded_dc_budget();
-    version_scope_and_expiry(); single_receiver_epoch_replay_and_emergency(); explicit_dc_mirror_races_remain_fenced(); mirror_ingress_ack_never_advances_active_ack(); exact_result_and_neutral_qualification();
+    version_scope_and_expiry(); single_receiver_epoch_replay_and_emergency(); explicit_dc_mirror_races_remain_fenced(); mirror_ingress_ack_never_advances_active_ack(); wss_owned_dc_mirror_preserves_epoch_and_freshness(); exact_result_and_neutral_qualification();
     slower_dc_and_lost_selection(); cloud_ingress_without_vehicle_result_can_only_start_a_neutral_trial(); healthy_proven_p2p_is_preferred_to_a_faster_cloud_backup(); signatures_bind_native_bytes_and_vehicle_results(); private_signing_material_is_not_public_session_state(); bounded_status_rejects_unsupported_kinds_and_scope_mismatch(); real_service_switch_does_not_disable_watchdog();
     std::cout << "19 control transport cases passed; real common safety service, no sockets\n";
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

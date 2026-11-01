@@ -597,8 +597,9 @@ if(MINE_TELEOP_BUILD_TESTS OR MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
   mine_teleop_enable_warnings(mine-teleop-control-transport-integration-tests)
   add_test(NAME mine-teleop-control-transport-integration-tests COMMAND mine-teleop-control-transport-integration-tests)
   add_test(NAME mine-teleop-mock-dual-control-integration-tests COMMAND mine-teleop-control-transport-integration-tests --mock-dual-only)
+  add_test(NAME mine-teleop-mock-wss-dc-integration-tests COMMAND mine-teleop-control-transport-integration-tests --mock-wss-dc-only)
   add_test(NAME mine-teleop-native-mock-estop-integration-tests COMMAND mine-teleop-control-transport-integration-tests --mock-estop-only)
-  set_tests_properties(mine-teleop-mock-dual-control-integration-tests mine-teleop-native-mock-estop-integration-tests
+  set_tests_properties(mine-teleop-mock-dual-control-integration-tests mine-teleop-mock-wss-dc-integration-tests mine-teleop-native-mock-estop-integration-tests
     PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 30)
   add_test(NAME mine-teleop-product-direct-integration-tests COMMAND mine-teleop-control-transport-integration-tests --product-only)
   set_tests_properties(mine-teleop-product-direct-integration-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 30)

@@ -1264,6 +1264,7 @@ struct VehicleMediaRuntime::Impl {
          {"mock_compact_control", self->mock_compact_control_enabled() ? detail::kMockCompactControl : std::string_view{}},
          {"mock_compact_dual_control", self->mock_compact_control_enabled() ? detail::kMockCompactDualControl : std::string_view{}},
          {"mock_dual_control", self->mock_dual_control_enabled() ? detail::kMockDualControlCapability : std::string_view{}},
+         {"mock_wss_dc_mirror", self->mock_dual_control_enabled() ? detail::kMockWssDcMirrorCapability : std::string_view{}},
          {"emergency_stop_capability", self->config.runtime.experimental_direct_authority_max_ms > 0 && self->signaling.transport_mac_key().size() >= 32 ? detail::kEmergencyStopCapability : std::string_view{}},
          {"feedback_transport_capability", self->config.runtime.experimental_direct_authority_max_ms > 0 && self->signaling.transport_mac_key().size() >= 32 ? detail::kFeedbackTransportCapability : std::string_view{}},
          {"sdp", text == nullptr ? "" : text},
@@ -1675,12 +1676,14 @@ struct VehicleMediaRuntime::Impl {
         throw std::invalid_argument("control result authority mismatch");
       if ((message.contains("control_transport") || message.contains("emergency_stop") || message.contains("feedback_request")) && !detail::verify_transport_message(message, signaling.transport_mac_key(), false))
         throw std::invalid_argument("native control authentication failed");
-      const bool mock_dual = mock_dual_control_enabled() &&
+      const bool mock_dual_dc = mock_dual_control_enabled() &&
           message.value("mock_dual_control", "") == detail::kMockDualControlCapability &&
           message.contains("control_transport") &&
           message.at("control_transport").value("path", "") == "dc" && !command.estop;
       std::string current_attempt;
       { std::lock_guard scope_lock(media_signal_state->mutex); current_attempt = media_signal_state->negotiation_id; }
+      const bool mock_wss_dc = detail::mock_wss_dc_mirror_allowed(mock_dual_control_enabled(), current_attempt, message);
+      const bool mock_dual = mock_dual_dc || mock_wss_dc;
       Json result_message = {{"event", "vehicle_control_result"}, {"protocol", detail::kControlTransportCapability},
           {"session_id", command.session_id}, {"vehicle_id", command.vehicle_id}, {"driver_id", command.driver_id},
           {"command_seq", command.seq}, {"intent_seq", intent_seq}, {"accepted", false},
@@ -1959,7 +1962,8 @@ struct VehicleMediaRuntime::Impl {
             current_attempt, signaling.now_ms(), signaling.control_lease_expiry(), config.control.max_command_gap_ms,
             direct_authority.configured() ? direct_authority.valid(steady_now_ms()) :
                 (native_control_websocket_connected.load() && native_control_transport_cloud_capable.load()), verified_stop_only,
-            mock_dual && control_link_open && control_channel);
+            mock_dual_dc && control_link_open && control_channel,
+            mock_wss_dc && control_link_open && control_channel);
         result_message["reason"] = decision.reason;
         result_message["transport_admitted"] = decision.admitted;
         result_message["transport_selected"] = decision.admitted && message.contains("control_transport") &&

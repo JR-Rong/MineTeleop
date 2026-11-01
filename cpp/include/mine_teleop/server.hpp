@@ -633,6 +633,7 @@ class DriverConsoleRuntime {
   bool control_transport_cloud_capable_{false};
   bool control_transport_vehicle_capable_{false}; // mutex_
   bool mock_dual_control_vehicle_capable_{false}; // mutex_
+  bool mock_wss_dc_mirror_vehicle_capable_{false}; // mutex_
   bool emergency_stop_vehicle_capable_{false}; // mutex_
   bool feedback_transport_vehicle_capable_{false}; // mutex_
   detail::FeedbackTransportSender feedback_transport_sender_; // existing transport mutex

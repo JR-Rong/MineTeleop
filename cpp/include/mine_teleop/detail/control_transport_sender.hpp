@@ -39,6 +39,17 @@ class ControlTransportSender {
         wire.value("epoch", std::uint64_t{0}) == stamp_.epoch &&
         wire.value("media_attempt", "") == stamp_.media_attempt;
   }
+  [[nodiscard]] bool owns_wss_dc_mirror(const Json& payload, std::string_view attempt) const {
+    if (path() != ControlPath::Wss || selecting_ || attempt.empty() || !payload.is_object() ||
+        !payload.contains("control_transport") || payload.value("mock_wss_dc_mirror", "") != kMockWssDcMirrorCapability ||
+        payload.value("mock_wss_dc_attempt", "") != attempt) return false;
+    const auto& wire = payload.at("control_transport");
+    return wire.is_object() && wire.value("path", "") == "wss" && wire.value("action", "") == "command" &&
+        wire.value("epoch", std::uint64_t{0}) == stamp_.epoch &&
+        wire.value("from_epoch", std::uint64_t{0}) == stamp_.from_epoch &&
+        wire.value("min_command_seq", std::uint64_t{0}) == stamp_.min_command_seq &&
+        wire.value("media_attempt", "") == stamp_.media_attempt;
+  }
   [[nodiscard]] bool negotiated() const { return stamp_.epoch != 0; }
   [[nodiscard]] bool selecting() const { return selecting_; }
   [[nodiscard]] bool holding_motion() const { return selecting_ || qualifying_; }

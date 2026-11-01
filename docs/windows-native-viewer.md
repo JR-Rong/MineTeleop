@@ -106,7 +106,12 @@ An additional dual-control experiment requires the vehicle process to set
 `MINE_TELEOP_MOCK_DUAL_CONTROL=1`; the vehicle advertises it only for a
 `test_bench_` identity, mock adapter and zero speed. The mock native viewer
 then sends the same authenticated, sequenced command via its DC and the cloud
-WSS path. The receiver admits the first fresh copy and rejects duplicates and
+WSS path while the logical control path is DC. With the separately negotiated
+`mock-wss-dc-mirror-v1` capability, a confirmed WSS epoch may also send the
+same signed command over the current DataChannel. The mirror cannot select an
+epoch, extend freshness or replace cloud authority, and is published only after
+the WSS send succeeds. Older peers retain WSS-only behavior after fallback.
+The receiver admits the first fresh copy and rejects duplicates and
 older commands without reapplying them or refreshing safety; an ingress ACK is
 not vehicle receipt. While the cloud authority is live, the same bounded
 vehicle telemetry snapshot is also offered over WSS; duplicate or delayed

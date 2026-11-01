@@ -301,3 +301,47 @@ showed more than 100 ms between probes, up to approximately 304 ms after clock
 offset correction. No packet-socket drops or missing kernel timestamps were
 reported. These encrypted records cannot be mapped to individual control
 commands. This attempt failed acceptance. Evidence: `ui-compact-06-bb`.
+
+The next `bb514d0` attempt ended at 1,609.65 seconds with one vehicle
+`control_link` braking wait. All 268 input windows matched and covered all
+nine scenarios. The pinned direct pair remained present in all 1,602 sampled
+observations; one sampled WSS as the logical path. Accepted results reported
+30,449 direct copies and 839 WSS mirrors first. Application-result RTT
+p50/p95/p99/max was 40/54/62/348 ms. Around the braking event, 169 selected
+outbound DTLS records matched kernel arrivals, with eight over 100 ms and a
+maximum of about 305 ms after clock offset correction. The application DTLS
+trace recorded two drops across the run, so it is not complete evidence of
+every packet; the packet-socket capture reported zero drops. This attempt
+also failed acceptance. Evidence: `ui-compact-07-bb`.
+
+Another `bb514d0` attempt ended at 252.73 seconds with one vehicle
+`control_link` braking wait. Forty-one of 42 input windows matched; one
+forward-right window did not, although all nine scenarios had at least one
+match. The direct pair remained present in all 252 observations and four
+sampled the WSS logical path. Application-result RTT p50/p95/p99/max was
+48/66/73/1913 ms. The scoped Orin runtime did not terminate within the test
+runner's eight-second shutdown grace and the runner killed its own process;
+CAN remained down and the next run independently checked camera availability.
+This attempt failed acceptance. Evidence: `ui-compact-08-bb`.
+
+The next `bb514d0` attempt ended at 870.82 seconds with one vehicle
+`control_link` braking wait. All 145 input windows matched and covered all
+nine scenarios. All 867 client observations showed the pinned direct pair
+and the DC logical control path; the vehicle event nevertheless invalidated
+the acceptance window. Accepted results reported 16,488 direct copies and
+394 WSS mirrors first. Application-result RTT p50/p95/p99/max was
+40/53/61/440 ms. This attempt failed acceptance. Evidence: `ui-compact-09-bb`.
+
+Input-window matches in the runs above mean that the native key mask was
+observed locally and an accepted vehicle command carried the corresponding
+intent sequence. The isolated profile fixes both speed and steering limits at
+zero, so the actual transmitted traction and steering values are zero. These
+matches do not prove that the vehicle received nonzero directional commands;
+brake values remain testable under the mock profile. The zero limits are not
+relaxed for this experiment.
+
+The following `bb514d0` attempt stopped after 390.37 seconds with one vehicle
+`control_link` braking wait. It also used the zero-speed, zero-steering profile;
+the accepted requests carried zero traction and steering, while brake requests
+were present. It did not complete the requested window. Evidence:
+`ui-compact-10-bb`.

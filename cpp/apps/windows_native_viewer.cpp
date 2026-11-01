@@ -305,7 +305,8 @@ struct Window {
                         const Json& session, const std::string& attempt,
                         const std::shared_ptr<RenderSession>& render,
                         const std::shared_ptr<detail::NativeMockMediaGate>& gate,
-                        bool compact_control, bool compact_dual, std::stop_token parent, std::stop_token stop) {
+                        bool compact_control, bool compact_dual, bool wss_dc_mirror,
+                        std::stop_token parent, std::stop_token stop) {
     const std::string session_id = session.at("session_id").get<std::string>();
     const auto generation = session.at("control_session_generation").get<std::uint64_t>();
     const std::string owner = "windows-native-mock";
@@ -691,7 +692,7 @@ struct Window {
         while (channel->pop()) {}
       } else {
         const detail::NativeCourierScope current{{session_id, generation, attempt}, owner, current_epoch};
-        if (!courier) courier = std::make_unique<detail::NativeControlCourier>(current);
+        if (!courier) courier = std::make_unique<detail::NativeControlCourier>(current, wss_dc_mirror);
         detail::NativeControlCourier::Io io{
             [&] {
               auto bytes = channel->pop();
@@ -1157,6 +1158,8 @@ struct Window {
                   payload.value("mock_compact_control", "") == detail::kMockCompactControl;
               const bool compact_dual = compact_control &&
                   payload.value("mock_compact_dual_control", "") == detail::kMockCompactDualControl;
+              const bool wss_dc_mirror = mock_control &&
+                  payload.value("mock_wss_dc_mirror", "") == detail::kMockWssDcMirrorCapability;
               if (mock_control) {
                 options.local_addresses = {mock_local_ip};
                 options.remote_addresses = {mock_peer_ip};
@@ -1184,9 +1187,9 @@ struct Window {
                 mock_gate = std::make_shared<detail::NativeMockMediaGate>(
                     session.at("session_id").get<std::string>(), vehicle.vehicle_id, negotiation, render->cameras);
                 auto* target = receiver.get();
-                control_worker = std::jthread([this, &driver, target, vehicle, config, session, negotiation, render, compact_control, compact_dual,
+                control_worker = std::jthread([this, &driver, target, vehicle, config, session, negotiation, render, compact_control, compact_dual, wss_dc_mirror,
                                                 gate = mock_gate, stop_token](std::stop_token token) {
-                  try { run_mock_control(driver, *target, vehicle, config, session, negotiation, render, gate, compact_control, compact_dual, stop_token, token); }
+                  try { run_mock_control(driver, *target, vehicle, config, session, negotiation, render, gate, compact_control, compact_dual, wss_dc_mirror, stop_token, token); }
                   catch (const std::exception& error) {
                     const std::string_view detail = error.what();
                     const char* category = detail.find("mock input worker failed") != std::string_view::npos ? "input_worker" :
