@@ -66,6 +66,7 @@ struct Startup {
   Startup() { config.runtime.control_enabled = true; config.vehicle_adapter.type = "mock"; static_cast<void>(control_recovery_latch->enter_session("s")); }
   ~Startup() { if (control_service) control_service->close(); }
   bool critical_cameras_ready() const { return cameras_ready; }
+  bool mock_dual_control_enabled() const { return false; }
   std::string_view recovery_inhibition_issue() const { return "fixture_inhibited"; }
   void invalidate_native_control_trusted_gear_locked() {}
   template<class... Args> void emit_diagnostic(Args&&...) {}
