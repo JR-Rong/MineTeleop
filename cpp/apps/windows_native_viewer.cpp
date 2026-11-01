@@ -9,6 +9,7 @@
 #include "mine_teleop/detail/mock_compact_control.hpp"
 #include "mine_teleop/detail/native_viewer_observation.hpp"
 #include "mine_teleop/detail/native_operator_readouts.hpp"
+#include "mine_teleop/detail/native_identity_input.hpp"
 #include "mine_teleop/detail/native_video_layout.hpp"
 #include <gst/video/video.h>
 #include <gio/gnetworking.h>
@@ -40,6 +41,15 @@ std::wstring text_of(HWND control) {
   GetWindowTextW(control, result.data(), count + 1);
   result.resize(static_cast<std::size_t>(count));
   return result;
+}
+
+void draw_empty_video(HDC dc, RECT rect, const wchar_t* message) {
+  FillRect(dc, &rect, reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+  SetBkMode(dc, TRANSPARENT);
+  SetTextColor(dc, RGB(142, 160, 184));
+  const auto previous = SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
+  DrawTextW(dc, message, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+  SelectObject(dc, previous);
 }
 
 // Each panel retains only the newest decoded frame. The video-health signal is
@@ -125,7 +135,7 @@ struct RenderSession {
           last_submitted[index] = frame->pts; ++submissions[index];
         }
       }
-    } else if (dc) FillRect(dc, &rect, reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+    } else if (dc) draw_empty_video(dc, rect, L"等待相机画面");
     EndPaint(panel, &ps);
   }
 };
@@ -938,7 +948,7 @@ LRESULT CALLBACK panel_procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
     const auto id = GetDlgCtrlID(hwnd);
     if (render && id >= 10 && id <= 11) render->paint(static_cast<std::size_t>(id - 10), hwnd, app->hwnd);
     else { PAINTSTRUCT ps{}; auto* dc = BeginPaint(hwnd, &ps); RECT rect{}; GetClientRect(hwnd, &rect);
-      if (dc) FillRect(dc, &rect, reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH))); EndPaint(hwnd, &ps); }
+      if (dc) draw_empty_video(dc, rect, id == 10 ? L"视频 1 · 等待连接" : L"视频 2 · 等待连接"); EndPaint(hwnd, &ps); }
     return 0;
   }
   return DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -999,8 +1009,10 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       app->video[1] = control(hwnd, L"MineTeleopNativePanel", L"", 0, 0, 0, 1, 1, 11);
       for (auto child = GetWindow(hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT))
         SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(app->font), TRUE);
-      for (const auto value : app->operator_readouts)
-        SendMessageW(value, WM_SETFONT, reinterpret_cast<WPARAM>(app->title_font), TRUE);
+      for (const auto title : app->config_labels)
+        SendMessageW(title, WM_SETFONT, reinterpret_cast<WPARAM>(app->small_font), TRUE);
+      for (const auto title : app->operator_labels)
+        SendMessageW(title, WM_SETFONT, reinterpret_cast<WPARAM>(app->small_font), TRUE);
       if (app->mock_control) SendMessageW(app->help, WM_SETFONT, reinterpret_cast<WPARAM>(app->small_font), TRUE);
       { RECT rect{}; GetClientRect(hwnd, &rect); layout(*app, rect.right, rect.bottom); }
       SetTimer(hwnd, 1, 1000, nullptr);
@@ -1086,7 +1098,7 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
           app->mock_estop_requested.store(false);
           auto secret = text_of(app->password);
           auto driver = utf8(text_of(app->driver_config)), vehicle = utf8(text_of(app->vehicle_config));
-          auto requested_driver = utf8(text_of(app->driver_id));
+          auto requested_driver = utf8(detail::native_trim_identity(text_of(app->driver_id)));
           auto encoded = utf8(secret);
           SecureZeroMemory(secret.data(), secret.size() * sizeof(wchar_t));
           SetWindowTextW(app->password, L"");

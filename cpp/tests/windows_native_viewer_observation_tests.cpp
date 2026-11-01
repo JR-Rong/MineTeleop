@@ -1,5 +1,6 @@
 #include "mine_teleop/detail/native_viewer_observation.hpp"
 #include "mine_teleop/detail/native_operator_readouts.hpp"
+#include "mine_teleop/detail/native_identity_input.hpp"
 #include "mine_teleop/detail/native_video_layout.hpp"
 #include <cstdlib>
 #include <limits>
@@ -23,6 +24,8 @@ int main() {
   const auto invalid = native_operator_readouts(std::numeric_limits<double>::infinity(), 'X',
       NativeOperatorIntent{'P', std::numeric_limits<double>::quiet_NaN(), -1, 2});
   for (const auto& value : invalid) if (value != L"\u2014") return EXIT_FAILURE;
+  if (native_trim_identity(L"\u00a0 driver-name \ufeff") != L"driver-name" ||
+      !native_trim_identity(L"\u3000\n").empty() || native_trim_identity(L"a b") != L"a b") return EXIT_FAILURE;
   const auto tall = native_video_fit(960, 768, 360, 460);
   const auto wide = native_video_fit(960, 768, 1000, 300);
   if (!tall || tall->x != 0 || tall->y != 86 || tall->width != 360 || tall->height != 288 ||
