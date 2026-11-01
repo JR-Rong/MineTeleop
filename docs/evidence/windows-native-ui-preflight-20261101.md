@@ -212,3 +212,92 @@ actually sent JSON. The dual-control signed extension was not representable by
 the original compact format, so the existing exact-reconstruction check safely
 fell back. That interrupted run is not a compact or 30-minute result; its
 records remain under `ui-compact-01-invalid`.
+
+## Negotiated compact dual-control attempts
+
+With the dual-control extension explicitly negotiated, the vehicle and viewer
+at product commit `2e92f73` used compact control messages, usually 76–78
+bytes rather than approximately 963–966 bytes for the previous JSON payload.
+Full telemetry remained enabled. A separate 18.7-second compatibility run with
+the newer vehicle and older viewer fell back to JSON and had no observed
+vehicle braking event; this short run does not establish long-run reliability.
+
+The first compact run ended at 1,225.02 seconds with one vehicle
+`control_link` braking wait. All 204 scheduled input windows matched accepted
+zero-limited mock commands, and all nine scenarios were covered. All 1,219
+client observations retained the pinned direct UDP pair, but two sampled the
+WSS logical control path. Accepted result records reported 23,149 direct
+copies and 605 WSS mirrors arriving first. The application-result RTT was
+40/55/65/423 ms at p50/p95/p99/max. The last accepted command aged to 502 ms;
+nearby direct and WSS copies arrived late, with some rejected as expired. A
+gateway ICMP probe timed out near the event. Neither the probe nor this timing
+isolates the delayed segment. The run did not meet 30-minute acceptance.
+Evidence: `ui-compact-02-2e` in the local artifact directory.
+
+The second compact run ended at 432.07 seconds with one vehicle
+`control_link` braking wait. All 72 input windows matched, with eight of each
+scenario. All 430 client observations retained the direct pair; one sampled
+WSS as the logical control path. The sender-to-vehicle callback delta reached
+580 ms, subject to the two hosts' clock uncertainty. No gateway probes timed
+out in this run; their one-second spacing cannot rule out a shorter disruption.
+The run did not meet 30-minute acceptance. Evidence: `ui-compact-03-2e`.
+
+The viewer subsequently added handling for the vehicle's authenticated
+`control_input_rearm_required` status, preserving the confirmed gear and
+braking while requiring direction and gamepad input to return to neutral. The
+two runs above used the earlier viewer and do not validate this change. Unit
+tests cover the release and braking interlocks; a new Windows/Orin run is
+required to evaluate the revised build.
+
+The revised viewer `bb514d0` ran for 1,309.93 seconds before one vehicle
+`control_link` braking wait, so this attempt also failed the requested
+30-minute acceptance. All 218 input windows matched and covered all nine
+scenarios. All 1,303 client observations retained the pinned direct UDP pair;
+one sampled the WSS logical path. Accepted result records contained 24,016
+direct copies and 1,443 WSS mirrors arriving first, plus two WSS results
+without a reported receiving path. Application-result RTT p50/p95/p99/max was
+40/53/61/342 ms. Accepted traction and steering remained zero.
+
+The vehicle had just accepted a fresh command when it reported the braking
+wait, so its snapshot does not establish a 500 ms gap immediately before the
+event. Earlier packets in that period had arrived in repeated bursts, with
+some control commands rejected as expired. In a roughly 3.5-second window
+around the event, 181 matching outbound DTLS headers were found at the Windows
+GStreamer `nicesink` probe and Orin kernel receive capture; 14 differed by
+over 100 ms, with a maximum of about 344 ms after applying measured clock
+offsets. The two clock uncertainty bounds and the probe placement limit that
+comparison. Encrypted DTLS record identities cannot identify which records
+contained control commands. Capture reported no packet-socket drops or missing
+kernel timestamps; the application trace reported no dropped DTLS records.
+Windows gateway probes near the event were 142–143 ms, while Orin-to-cloud
+probes were approximately 21–25 ms. These observations narrow the delayed
+path to the span between the Windows sender probe and Orin kernel for those
+records, but do not isolate a particular host, wireless link or carrier.
+Evidence: `ui-compact-04-bb` in the local artifact directory.
+
+A repeat of `bb514d0` ended at 1,212.56 seconds with one vehicle
+`control_link` braking wait, and therefore also failed acceptance. All 202
+input windows matched and covered all nine scenarios. The pinned direct pair
+was present in all 1,206 observations; one sampled WSS as the logical control
+path. Accepted results reported 22,397 DC copies and 1,134 WSS mirrors first;
+application-result RTT p50/p95/p99/max was 41/61/64/457 ms. At the vehicle
+event, the last valid command had aged 526 ms.
+
+Within the roughly 3.5-second event window, 46 of 52 outbound DTLS records
+were matched to Orin kernel arrivals; ten matched records differed by more
+than 100 ms, up to about 443 ms after applying clock offsets. No packet-socket
+drops or missing kernel timestamps were reported, but six sender records did
+not match, so that gap cannot be classified from this capture alone. The
+endpoints' clock uncertainty and encrypted payload boundary remain relevant.
+Evidence: `ui-compact-05-bb` in the local artifact directory.
+
+A further `bb514d0` attempt ended at 420.74 seconds, with two vehicle
+`control_link` braking waits. All 70 input windows matched and covered all
+nine scenarios; the direct pair remained selected in all 419 observations,
+three of which sampled the WSS logical control path. Application-result RTT
+p50/p95/p99/max was 39/52/61/351 ms. Around the first wait, all 154 outbound
+DTLS records in the selected time window matched Orin kernel records; ten
+showed more than 100 ms between probes, up to approximately 304 ms after clock
+offset correction. No packet-socket drops or missing kernel timestamps were
+reported. These encrypted records cannot be mapped to individual control
+commands. This attempt failed acceptance. Evidence: `ui-compact-06-bb`.

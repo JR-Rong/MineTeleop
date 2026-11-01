@@ -34,6 +34,12 @@ telemetry or control readiness is lost. Held keys must be released before a
 new press can take effect after a loss. There is no production emergency-stop
 input or authorization in this prototype.
 
+When a current, scoped vehicle rejection requests input rearm, the mock viewer
+withdraws traction and steering, retains the last confirmed gear, and preserves
+braking while the existing safety gates permit input. Direction controls must
+be released, and a gamepad must return to neutral, before they can drive again.
+The vehicle remains authoritative for its recovery and hard-stop gates.
+
 If the vehicle invalidates the confirmed session profile, the viewer withdraws
 input and keeps the session open. The operator must select “重新确认限幅”;
 the mock profile is sent only after the video, clock, direct path and fresh
