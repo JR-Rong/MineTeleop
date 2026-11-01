@@ -40,7 +40,10 @@ An additional dual-control experiment requires the vehicle process to set
 then sends the same authenticated, sequenced command via its DC and the cloud
 WSS path. The receiver admits the first fresh copy and rejects duplicates and
 older commands without reapplying them or refreshing safety; an ingress ACK is
-not vehicle receipt. A selected direct media path and all existing authority,
+not vehicle receipt. While the cloud authority is live, the same bounded
+vehicle telemetry snapshot is also offered over WSS; duplicate or delayed
+snapshots cannot advance the viewer's telemetry sequence or source time. A
+selected direct media path and all existing authority,
 video, input and clock gates remain required. The paths may share the same
 Wi-Fi and cellular links and cannot guarantee independence or bounded delay.
 This is an isolated experiment, not a production transport or safety claim.

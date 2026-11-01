@@ -3082,6 +3082,17 @@ struct VehicleMediaRuntime::Impl {
     if (control_channel != nullptr && control_link_open &&
         (!control_transport_fence.negotiated() || control_transport_fence.path() == detail::ControlPath::DataChannel)) {
       gst_webrtc_data_channel_send_string(control_channel, message.dump().c_str());
+      // The isolated mock can race the very same telemetry snapshot over the
+      // authenticated signaling path. Keep its original identity, sequence and
+      // source time; the receiver must not refresh health on duplicates.
+      if (mock_dual_control_enabled() && message.value("event", "") == "vehicle_telemetry" &&
+          cloud_control_authority_live_locked() &&
+          (!message.contains("session_id") || message.at("session_id") == signaling.session_id()) &&
+          (!message.contains("vehicle_id") || message.at("vehicle_id") == config.vehicle_id) &&
+          (!message.contains("driver_id") || message.at("driver_id") == signaling.driver_id())) {
+        pending_control_status["vehicle_telemetry"] = message;
+        wake_native_control_feedback();
+      }
     } else if (control_transport_fence.negotiated() || cloud_control_authority_live_locked()) {
       if ((message.contains("session_id") && message.at("session_id") != signaling.session_id()) ||
           (message.contains("vehicle_id") && message.at("vehicle_id") != config.vehicle_id) ||

@@ -31,6 +31,8 @@ struct Publisher {
   FeedbackTransportFence feedback_transport_fence;
   std::map<std::string, Json> latest_feedback_status, pending_control_status;
   unsigned wakeups{};
+  bool mock_dual{false};
+  bool mock_dual_control_enabled() const { return mock_dual; }
   void wake_native_control_feedback() { ++wakeups; }
 #include "feedback_vehicle_method.inc"
 };
@@ -297,6 +299,31 @@ void cloud_bootstrap_feedback_requires_live_authenticated_lease() {
     expect(publisher.wakeups == 1, "invalid cloud status woke the network owner");
   }
 }
+void mock_dual_telemetry_preserves_identity_and_requires_cloud_authority() {
+  for (int gate = 0; gate != 5; ++gate) {
+    Publisher publisher; FakeChannel channel; publisher.control_channel = &channel;
+    publisher.config.runtime.experimental_direct_authority_max_ms = 0;
+    publisher.mock_dual = gate != 1;
+    publisher.native_control_websocket_connected = gate != 2;
+    publisher.native_control_transport_cloud_capable = true;
+    if (gate == 3) publisher.signaling.expiry = publisher.signaling.clock;
+    Json telemetry = {{"event", "vehicle_telemetry"}, {"control_status_seq", 7}, {"seq", 5},
+        {"sent_at_utc_ms", 900}, {"session_id", gate == 4 ? "old" : "s"},
+        {"vehicle_id", "v"}, {"driver_id", "d"}};
+    publisher.send_control_status_locked(telemetry);
+    expect(channel.sent.size() == 1 && channel.sent.front() == telemetry, "mock telemetry changed on DC");
+    expect(publisher.pending_control_status.size() == (gate == 0 ? 1U : 0U) && publisher.wakeups == (gate == 0 ? 1U : 0U),
+        "mock telemetry mirror bypassed its cloud, identity or opt-in gate");
+    if (gate == 0) {
+      expect(publisher.pending_control_status.at("vehicle_telemetry") == telemetry,
+          "mock telemetry mirror changed the original sequence or source timestamp");
+      telemetry["control_status_seq"] = 8; telemetry["seq"] = 6; telemetry["sent_at_utc_ms"] = 910;
+      publisher.send_control_status_locked(telemetry);
+      expect(publisher.pending_control_status.size() == 1 && publisher.pending_control_status.at("vehicle_telemetry") == telemetry,
+          "mock mirror did not coalesce the latest telemetry snapshot");
+    }
+  }
+}
 void raw_vcu_details_are_not_a_transport_wrapper() {
   Publisher publisher;
   publisher.config.runtime.experimental_direct_authority_max_ms = 0;
@@ -329,6 +356,6 @@ void raw_vcu_details_are_not_a_transport_wrapper() {
 }
 }
 int main() {
-  try { mirrored_duplicate_is_not_published_or_applied(); transport_expiry_has_signed_reason_and_trace_without_apply(); raw_vcu_details_are_not_a_transport_wrapper(); early_rejection_publishes_precise_signed_result(); cloud_only_startup_retains_all_safety_gates(); cloud_bootstrap_feedback_requires_live_authenticated_lease(); publish_all_four_independent_axes(); std::cout << "Actual vehicle feedback publisher: duplicate suppression, expiry rejection trace, raw/wrapped status ordering, early rejection reasons, four axes, real MAC and bounded snapshots passed; fake Gst send, no ABI/network proof\n"; }
+  try { mock_dual_telemetry_preserves_identity_and_requires_cloud_authority(); mirrored_duplicate_is_not_published_or_applied(); transport_expiry_has_signed_reason_and_trace_without_apply(); raw_vcu_details_are_not_a_transport_wrapper(); early_rejection_publishes_precise_signed_result(); cloud_only_startup_retains_all_safety_gates(); cloud_bootstrap_feedback_requires_live_authenticated_lease(); publish_all_four_independent_axes(); std::cout << "Actual vehicle feedback publisher: duplicate suppression, expiry rejection trace, raw/wrapped status ordering, early rejection reasons, four axes, real MAC and bounded snapshots passed; fake Gst send, no ABI/network proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
