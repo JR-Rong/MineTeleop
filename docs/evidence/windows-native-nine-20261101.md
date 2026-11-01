@@ -46,6 +46,15 @@ or scheduler. DC and WSS share that path and cannot guarantee resilience against
 its complete outage. In both experiments WSS is the existing authenticated
 signaling path; it is not a separately allocated TURN media relay.
 
+A further controlled retry kept both cameras at 960x768 and 30 fps but reduced
+the encoder target from 1,500 to 750 kbps per camera. It was stopped early
+after safety waits made the 30-minute criterion unattainable. Of 21 completed
+press windows, 4 had no matching accepted command; the vehicle logged 3 braking
+waits. Around the first event, Windows-to-gateway probes had 2 timeouts and a
+229.58 ms maximum, while Orin-to-STUN probes peaked at 33.49 ms. Lowering the
+test bitrate therefore did not remove the observed failure in this short run;
+the non-randomized run cannot establish that bitrate has no effect.
+
 The experiment is opt-in for the scoped mock vehicle and is not enabled for
 production control. A third independent access link, an improved WLAN, or a
 separate field test is needed before drawing conclusions about a stable
