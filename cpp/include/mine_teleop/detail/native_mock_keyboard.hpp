@@ -41,7 +41,7 @@ class NativeMockKeyboard {
  public:
   struct Keys { bool forward{}, left{}, right{}, brake{}, hard_brake{}, reverse{}; };
   struct Gamepad { bool connected{}; double steering{}, throttle{}, brake{}; unsigned index{}; };
-  struct Input { double throttle{}, steering{}, brake{}; char gear{'N'}; };
+  struct Input { double throttle{}, steering{}, brake{}; char gear{'N'}; std::uint8_t key_mask{}; bool armed{}; };
 
   void set_control_limits(double throttle, double steering_deg, double steering_scale_deg) {
     if (!std::isfinite(throttle) || throttle < 0 || throttle > 1 ||
@@ -156,17 +156,19 @@ class NativeMockKeyboard {
     // Ask for a gear change with no traction or steering, and wait for fresh
     // vehicle telemetry to confirm it before applying the held direction.
     const bool braking = keys_.brake || keys_.hard_brake || pad.brake > 0;
+    const auto key_mask = static_cast<std::uint8_t>((keys_.forward ? 1 : 0) | (keys_.reverse ? 2 : 0) |
+        (keys_.left ? 4 : 0) | (keys_.right ? 8 : 0) | (keys_.brake ? 16 : 0) | (keys_.hard_brake ? 32 : 0));
     const char requested = keys_.forward != keys_.reverse ? (keys_.forward ? 'D' : 'R') :
         (!keys_.forward && !keys_.reverse && pad.throttle > 0 && confirmed_gear == 'N' ? 'D' : confirmed_gear);
     if (requested != confirmed_gear) gamepad_needs_neutral_ = true;
-    if (!braking && requested != confirmed_gear) return {0.0, 0.0, 0.0, requested};
+    if (!braking && requested != confirmed_gear) return {0.0, 0.0, 0.0, requested, key_mask, true};
     // The web contract scales both axes by the acknowledged effective profile.
     // Normalized brake ratios are passed as pressures against a unit maximum.
     const auto result = NativeWebControl::derive(
         {keys_.forward, keys_.reverse, keys_.left, keys_.right, keys_.brake, keys_.hard_brake},
         pad, confirmed_gear, {throttle_limit_, brake_available_ ? 1.0 : 0.0,
             service_brake_, hard_brake_, steering_limit_}, steering_scale_);
-    return {result.throttle, result.steering, result.brake, result.gear};
+    return {result.throttle, result.steering, result.brake, result.gear, key_mask, true};
   }
   std::mutex mutex_;
   Keys keys_{};

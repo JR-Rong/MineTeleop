@@ -52,6 +52,10 @@ void test_neutral_refresh_sequence() {
   require(sequence.next(input) == 4, "bad sample revision did not advance sequence");
   input["ui_control_epoch"] = 2;
   require(sequence.next(input) == 5, "owner epoch change did not advance sequence");
+  input["mock_key_mask"] = 4;
+  require(sequence.next(input) == 6 && sequence.next(input) == 6, "held key did not retain input revision");
+  input["mock_key_mask"] = 8;
+  require(sequence.next(input) == 7, "different zero-limited key input reused a revision");
 }
 void test_profile_retry_stays_bounded_and_needs_live_guards() {
   mine_teleop::detail::NativeMockProfileRetry retry;
@@ -103,9 +107,10 @@ void test_mock_keyboard_rearms_only_after_release() {
   require(keyboard.sample(true, 101).throttle == 0.0, "initial neutral did not arm");
   keyboard.observe(true, Keys{true, true, false, false}, 110);
   auto input = keyboard.sample(true, 111, 'D');
-  require(input.throttle == .25 && input.steering == -.25 && input.brake == 0.0,
+  require(input.throttle == .25 && input.steering == -.25 && input.brake == 0.0 && input.armed && input.key_mask == 5,
           "foreground mock keys were not mapped");
-  require(keyboard.sample(false, 112).throttle == 0.0, "safety loss did not neutralize input");
+  input = keyboard.sample(false, 112);
+  require(input.throttle == 0.0 && !input.armed && input.key_mask == 0, "safety loss did not neutralize input");
   require(keyboard.sample(true, 113).throttle == 0.0, "held key resumed after safety recovery");
   keyboard.observe(true, Keys{}, 120);
   static_cast<void>(keyboard.sample(true, 121));

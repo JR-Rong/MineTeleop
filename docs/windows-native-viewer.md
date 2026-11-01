@@ -53,9 +53,15 @@ Generic HID devices, interactive calibration and gamepad controls outside
 mock mode are not implemented. The displayed CAN indication reports missing,
 unsupported or stale feedback rather than treating mock data as physical CAN.
 
+The login/vehicle-selection screen also offers an export for authorized,
+completed session logs through the existing driver runtime. It must run while
+there is no active session, and its ZIP does not contain video. Partial export
+or unconfirmed recording completeness must not be interpreted as a complete
+recording. This native export flow has not yet been validated end to end.
+
 The native viewer is not yet functionally equivalent to the web console. It
 does not implement the web console's complete CAN feedback, editable session
-profile, recording status or session-log export UI. Its control mode remains
+profile or recording status. Its control mode remains
 limited to the zero-speed isolated mock. Keyboard and standard-gamepad control
 values use the acknowledged profile scaling, so that profile sends zero
 throttle and steering in this mock configuration. Directional key presses
@@ -88,6 +94,10 @@ record of command sequence, local DataChannel enqueue start/end and outcome.
 The record contains no raw packet or credentials; local enqueue is not proof of
 delivery. Correlate it with the vehicle receipt and driver dispatch traces to
 locate delay, accounting for clock uncertainty between hosts.
+Mock-only input trace batches also record the locally armed key mask and the
+intent sequence. Different key states receive different intent revisions even
+when zero limits produce identical commands; correlate those revisions with
+vehicle `receive_apply` records. The key mask is not sent to the vehicle.
 It also emits bounded transition records for focus, UI heartbeat, clock,
 video, remote media, direct path and input authorization. A null check means
 that an earlier guard short-circuited it; dropped records are counted. These

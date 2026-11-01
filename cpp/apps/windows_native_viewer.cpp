@@ -16,10 +16,12 @@
 #include <windows.h>
 #include <Xinput.h>
 #include <shellapi.h>
+#include <commdlg.h>
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
 #include <condition_variable>
+#include <fstream>
 #include <string_view>
 
 namespace {
@@ -180,7 +182,7 @@ struct RenderSession {
 };
 
 struct Window {
-  HWND hwnd{}, driver_config{}, vehicle_config{}, driver_id{}, password{}, status{}, start{}, stop{}, vehicle_list{};
+  HWND hwnd{}, driver_config{}, vehicle_config{}, driver_id{}, password{}, status{}, start{}, stop{}, vehicle_list{}, logs_button{};
   std::array<HWND, 4> config_labels{};
   std::array<HWND, 6> operator_labels{}, operator_readouts{};
   std::array<HWND, 6> keycaps{};
@@ -190,11 +192,14 @@ struct Window {
   HBRUSH background{}, surface{}, input_background{};
   std::array<HWND, 2> video{};
   std::mutex mutex;
-  struct VehicleChoice { std::wstring label; bool eligible{}; };
+  struct VehicleChoice { std::wstring label; bool eligible{}; std::string key; };
   std::mutex selection_mutex;
   std::condition_variable selection_ready;
   std::vector<VehicleChoice> vehicle_choices;
   bool awaiting_selection{}, selection_confirmed{};
+  bool selection_logs_requested{}, selection_log_mode{}, selection_save_response{}, selection_busy{};
+  std::size_t selection_index{};
+  std::wstring selection_save_path;
   std::mutex intent_display_mutex;
   struct IntentDisplay { detail::NativeOperatorIntent input{}; std::int64_t observed_ms{}; bool valid{}; };
   IntentDisplay intent_display;
@@ -330,32 +335,49 @@ struct Window {
     std::mutex guard_mutex;
     std::vector<GuardEvent> guard_events;
     std::uint64_t guard_dropped = 0;
+    struct InputEvent { std::int64_t at; std::uint64_t intent_seq; unsigned keys; char gear; };
+    std::mutex input_trace_mutex;
+    std::vector<InputEvent> input_events;
+    std::uint64_t input_trace_dropped = 0;
     const auto flush_guard_trace = [&] {
       if (!config.control_trace_commands) return;
       std::vector<GuardEvent> events;
       std::uint64_t dropped = 0;
       { std::lock_guard lock(guard_mutex); events.swap(guard_events); std::swap(dropped, guard_dropped); }
-      if (events.empty() && !dropped) return;
-      Json records = Json::array();
-      for (const auto& event : events) {
-        const auto& s = event.state;
-        records.push_back({{"monotonic_ms", event.at}, {"focused", s.focused}, {"ui_alive", s.ui_alive},
-            {"clock_ok", s.clock_ok}, {"video_ready", s.video_ready}, {"video_sample_healthy", s.video_sample_healthy},
-            {"authorized", s.authorized}, {"ready", s.ready},
-            {"remote_ready", s.remote_ready < 0 ? Json(nullptr) : Json(s.remote_ready != 0)},
-            {"direct_ready", s.direct_ready < 0 ? Json(nullptr) : Json(s.direct_ready != 0)},
-            {"authorization_age_ms", event.authorization_at > 0 ?
-                Json(event.authorization_now - event.authorization_at) : Json(nullptr)},
-            {"bad_revision", s.bad_revision}, {"brake_revision", s.brake_revision}});
+      if (!events.empty() || dropped) {
+        Json records = Json::array();
+        for (const auto& event : events) {
+          const auto& s = event.state;
+          records.push_back({{"monotonic_ms", event.at}, {"focused", s.focused}, {"ui_alive", s.ui_alive},
+              {"clock_ok", s.clock_ok}, {"video_ready", s.video_ready}, {"video_sample_healthy", s.video_sample_healthy},
+              {"authorized", s.authorized}, {"ready", s.ready},
+              {"remote_ready", s.remote_ready < 0 ? Json(nullptr) : Json(s.remote_ready != 0)},
+              {"direct_ready", s.direct_ready < 0 ? Json(nullptr) : Json(s.direct_ready != 0)},
+              {"authorization_age_ms", event.authorization_at > 0 ?
+                  Json(event.authorization_now - event.authorization_at) : Json(nullptr)},
+              {"bad_revision", s.bad_revision}, {"brake_revision", s.brake_revision}});
+        }
+        std::fprintf(stderr, "%s\n", Json{{"event", "native_mock_guard_batch"}, {"records", std::move(records)},
+            {"dropped", dropped}}.dump().c_str());
       }
-      std::fprintf(stderr, "%s\n", Json{{"event", "native_mock_guard_batch"}, {"records", std::move(records)},
-          {"dropped", dropped}}.dump().c_str());
+      std::vector<InputEvent> inputs;
+      dropped = 0;
+      { std::lock_guard lock(input_trace_mutex); inputs.swap(input_events); std::swap(dropped, input_trace_dropped); }
+      if (!inputs.empty() || dropped) {
+        Json input_records = Json::array();
+        for (const auto& event : inputs) input_records.push_back({{"monotonic_ms", event.at},
+            {"intent_seq", event.intent_seq}, {"keys", event.keys}, {"gear", std::string(1, event.gear)}});
+        std::fprintf(stderr, "%s\n", Json{{"event", "native_mock_input_batch"}, {"records", std::move(input_records)},
+            {"dropped", dropped}}.dump().c_str());
+      }
     };
     std::jthread input_worker([&](std::stop_token input_stop) {
       try {
         detail::NativeMockInputSequence input_sequence;
         bool withdrawn = false;
         std::optional<GuardState> previous_guard;
+        std::int64_t last_input_trace_at = 0;
+        unsigned last_input_keys = 256;
         while (!input_stop.stop_requested() && !stop.stop_requested() && !parent.stop_requested()) {
           const auto clock_at = clock_observed_ms.load();
           const auto now_ms = static_cast<std::int64_t>(bench_now_ms());
@@ -393,9 +415,21 @@ struct Window {
                 {"critical_video_sample_healthy", ready && video_health.sample_healthy},
                 {"critical_video_bad_sample_revision", video_health.bad_revision},
                 {"critical_video_brake_revision", video_health.brake_revision}};
-            input["intent_seq"] = input_sequence.next(input);
+            // Different key states can produce the same zero-limited intent.
+            // Give them distinct local revisions without sending the key mask.
+            auto input_identity = input;
+            input_identity["mock_key_mask"] = keyboard_input.key_mask;
+            input["intent_seq"] = input_sequence.next(input_identity);
             const auto result = driver.update_control_intent(input);
             if (!result.value("accepted", false)) throw std::runtime_error("mock input rejected");
+            if (config.control_trace_commands && keyboard_input.armed &&
+                (keyboard_input.key_mask != last_input_keys || now_ms - last_input_trace_at >= 1000)) {
+              std::lock_guard lock(input_trace_mutex);
+              if (input_events.size() < 128) input_events.push_back({now_ms,
+                  input.at("intent_seq").get<std::uint64_t>(), keyboard_input.key_mask, keyboard_input.gear});
+              else ++input_trace_dropped;
+              last_input_keys = keyboard_input.key_mask; last_input_trace_at = now_ms;
+            }
             {
               std::lock_guard lock(intent_display_mutex);
               intent_display = {{keyboard_input.gear, keyboard_input.steering, keyboard_input.throttle,
@@ -643,7 +677,8 @@ struct Window {
             L"\n画面：" + (video_health.ready && gate->ready_now() ? L"就绪" : L"未就绪") +
             L"  校时：" + (clock_ok ? std::wstring(L"±") + std::to_wstring(time_uncertainty) + L" ms" : L"不可用") +
             L"\n车端：" + (mock_estop_requested.load() && safety_state != "ESTOP" ? L"急停等待确认" : vehicle_state) +
-            L"\n结果：" + result_text + L"\nCAN：" + can_state,
+            L"\n结果：" + result_text + L"\nCAN：" + can_state +
+            L"\n会话限幅：" + (profile_accepted ? L"零速 / 零转向 · 已确认" : L"等待确认"),
             detail::native_operator_readouts(speed, actual_gear, shown_intent));
         next_mock_ui = now + 100ms;
       }
@@ -784,16 +819,93 @@ struct Window {
             const bool matches = id == vehicle.vehicle_id;
             const bool available = entry.value("online", false) && entry.value("controllable", false);
             vehicle_choices.push_back({wide(id) + (matches ? L" · 台架配置匹配" : L" · 需对应台架配置") +
-                (available ? L" · 可连接" : L" · 不可连接"), matches && available});
+                (available ? L" · 可连接" : L" · 不可连接"), matches && available, id});
           }
           selection_confirmed = false;
+          selection_logs_requested = false;
+          selection_log_mode = false;
+          selection_busy = false;
           awaiting_selection = true;
         }
+        const auto authorized_choices = vehicle_choices;
         PostMessageW(hwnd, WM_APP + 3, 0, 0);
         report(L"请选择授权车辆；仅可连接与本地隔离台架配置匹配的车辆。");
         {
           std::unique_lock lock(selection_mutex);
-          while (!selection_confirmed && !stop_token.stop_requested()) selection_ready.wait_for(lock, 100ms);
+          while (!stop_token.stop_requested()) {
+            selection_ready.wait_for(lock, 100ms, [&] { return selection_confirmed || selection_logs_requested; });
+            if (stop_token.stop_requested()) break;
+            if (selection_logs_requested) {
+              selection_logs_requested = false;
+              if (selection_log_mode) {
+                vehicle_choices = authorized_choices; selection_log_mode = false;
+                PostMessageW(hwnd, WM_APP + 3, 0, 0);
+                continue;
+              }
+              lock.unlock();
+              try {
+                const auto sessions = driver.log_sessions().at("sessions");
+                if (!sessions.is_array()) throw std::runtime_error("invalid session catalog");
+                std::vector<VehicleChoice> choices;
+                for (const auto& item : sessions) {
+                  if (!item.is_object() || !item.contains("key") || !item.at("key").is_string() ||
+                      !item.contains("session_id") || !item.at("session_id").is_string() ||
+                      !item.contains("vehicle_id") || !item.at("vehicle_id").is_string()) continue;
+                  choices.push_back({wide(item.at("session_id").get<std::string>()) + L" · " +
+                      wide(item.at("vehicle_id").get<std::string>()), true, item.at("key").get<std::string>()});
+                }
+                lock.lock(); vehicle_choices = std::move(choices); selection_log_mode = true;
+                PostMessageW(hwnd, WM_APP + 3, 0, 0);
+                lock.unlock(); report(L"选择已结束会话；日志仅对当前授权驾驶员可见。"); lock.lock();
+              } catch (...) {
+                if (lock.owns_lock()) lock.unlock();
+                report(L"读取会话日志列表失败，请检查登录和信令。");
+                lock.lock();
+                PostMessageW(hwnd, WM_APP + 3, 0, 0);
+              }
+              continue;
+            }
+            if (!selection_confirmed) continue;
+            selection_confirmed = false;
+            if (!selection_log_mode) break;
+            if (selection_index >= vehicle_choices.size()) continue;
+            const auto log_key = vehicle_choices[selection_index].key;
+            lock.unlock();
+            try {
+              PostMessageW(hwnd, WM_APP + 6, 0, 0);
+              static_cast<void>(driver.start_log_export(log_key));
+              report(L"正在收集三端日志，请保持车辆空闲并在线；最多约 10 分钟。");
+              Json progress;
+              while (!stop_token.stop_requested()) {
+                progress = driver.log_export_status();
+                if (progress.value("state", "") != "collecting") break;
+                std::this_thread::sleep_for(500ms);
+              }
+              if (stop_token.stop_requested()) { lock.lock(); break; }
+              if (progress.value("state", "") != "ready") throw std::runtime_error("log export failed");
+              report(progress.value("logs_complete", false) ?
+                  L"日志收集完成。ZIP 不含视频，录像完整性请查看摘要。" :
+                  L"日志仅部分收集。ZIP 不含视频，请查看清单中的缺失原因。");
+              lock.lock(); selection_save_response = false; selection_save_path.clear();
+              PostMessageW(hwnd, WM_APP + 5, 0, 0);
+              while (!selection_save_response && !stop_token.stop_requested()) selection_ready.wait_for(lock, 100ms);
+              const auto path = selection_save_path;
+              lock.unlock();
+              if (!stop_token.stop_requested() && !path.empty()) {
+                const auto zip = driver.log_export_zip();
+                std::ofstream file(std::filesystem::path(path), std::ios::binary | std::ios::trunc);
+                file.write(zip.data(), static_cast<std::streamsize>(zip.size()));
+                if (!file) throw std::runtime_error("log save failed");
+                report(L"日志 ZIP 已保存；录像文件不包含在内。");
+              }
+              lock.lock();
+            } catch (...) {
+              if (lock.owns_lock()) lock.unlock();
+              report(L"日志收集或保存失败；可重新选择已结束会话重试。");
+              lock.lock();
+            }
+            PostMessageW(hwnd, WM_APP + 3, 0, 0);
+          }
           awaiting_selection = false;
           if (stop_token.stop_requested()) throw std::runtime_error("cancelled");
         }
@@ -998,7 +1110,8 @@ void layout(Window& app, int width, int height) {
   }
   MoveWindow(app.start, left, 385, (field_width - gap) / 2, 34, TRUE);
   MoveWindow(app.stop, left + (field_width + gap) / 2, 385, (field_width - gap) / 2, 34, TRUE);
-  MoveWindow(app.vehicle_list, left, 422, field_width, 180, TRUE);
+  MoveWindow(app.vehicle_list, left, 422, field_width - 80, 180, TRUE);
+  MoveWindow(app.logs_button, left + field_width - 74, 422, 74, 26, TRUE);
   MoveWindow(app.help, left, 450, field_width, app.mock_control ? 20 : 70, TRUE);
   if (app.mock_control) {
     constexpr int key_width = 40, key_height = 25, key_gap = 4;
@@ -1075,6 +1188,8 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       app->stop = control(hwnd, L"BUTTON", L"断开", BS_OWNERDRAW, 0, 0, 1, 1, 2);
       app->vehicle_list = control(hwnd, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 0, 1, 1, 4);
       EnableWindow(app->vehicle_list, FALSE);
+      app->logs_button = control(hwnd, L"BUTTON", L"会话日志", BS_OWNERDRAW, 0, 0, 1, 1, 5);
+      EnableWindow(app->logs_button, FALSE);
       app->help = control(hwnd, L"STATIC", app->mock_control ?
           L"按键状态 · E 急停 · 非执行确认" :
           L"仅观看台架画面\n控制功能保持禁用", 0, 0, 0, 1, 1);
@@ -1163,7 +1278,7 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         SelectObject(item->hDC, old);
         return TRUE;
       }
-      if (item->CtlID != 1 && item->CtlID != 2 && item->CtlID != 3) return DefWindowProcW(hwnd, msg, wparam, lparam);
+      if (item->CtlID != 1 && item->CtlID != 2 && item->CtlID != 3 && item->CtlID != 5) return DefWindowProcW(hwnd, msg, wparam, lparam);
       const bool enabled = !(item->itemState & ODS_DISABLED);
       const COLORREF color = !enabled ? RGB(38, 54, 77) : item->CtlID == 1 ? RGB(14, 116, 144) :
           item->CtlID == 3 ? RGB(150, 42, 55) : RGB(30, 47, 68);
@@ -1188,10 +1303,12 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
           std::lock_guard lock(app->selection_mutex);
           valid = app->awaiting_selection && selected != CB_ERR &&
               static_cast<std::size_t>(selected) < app->vehicle_choices.size() && app->vehicle_choices[static_cast<std::size_t>(selected)].eligible;
-          if (valid) app->selection_confirmed = true;
+          if (valid && !app->selection_busy) {
+            app->selection_index = static_cast<std::size_t>(selected); app->selection_confirmed = true; app->selection_busy = true;
+          } else valid = false;
         }
         if (valid) { EnableWindow(app->start, FALSE); app->selection_ready.notify_one(); if (app->mock_control) SetFocus(hwnd); }
-        else app->report(L"请选择在线、可连接且与当前台架配置匹配的授权车辆。");
+        else app->report(L"请选择有效的授权车辆或已结束会话。");
       } else if (LOWORD(wparam) == 1 && !app->running.exchange(true)) {
         try {
           if (app->worker.joinable()) app->worker.join();
@@ -1215,14 +1332,23 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         app->keyboard.withdraw();
         app->worker.request_stop(); app->report(L"正在断开视频会话……");
       } else if (LOWORD(wparam) == 3) app->request_mock_estop();
+      else if (LOWORD(wparam) == 5) {
+        { std::lock_guard lock(app->selection_mutex);
+          if (!app->awaiting_selection || app->selection_busy) return 0;
+          app->selection_logs_requested = true; app->selection_busy = true;
+        }
+        EnableWindow(app->start, FALSE); EnableWindow(app->logs_button, FALSE);
+        app->selection_ready.notify_one();
+      }
       return 0;
     case WM_APP + 1: {
       std::lock_guard lock(app->mutex);
       SetWindowTextW(app->status, app->message.c_str());
       { std::lock_guard selection_lock(app->selection_mutex);
-        EnableWindow(app->start, !app->running.load() || app->awaiting_selection);
+        EnableWindow(app->start, !app->running.load() || (app->awaiting_selection && !app->selection_busy));
         if (!app->running.load()) {
           EnableWindow(app->vehicle_list, FALSE);
+          EnableWindow(app->logs_button, FALSE);
           SetWindowTextW(app->start, app->mock_control ? L"连接台架" : L"连接视频");
         }
       }
@@ -1234,6 +1360,8 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     }
     case WM_APP + 3: {
       std::lock_guard lock(app->selection_mutex);
+      if (!app->awaiting_selection || !app->running.load()) return 0;
+      app->selection_busy = false;
       SendMessageW(app->vehicle_list, CB_RESETCONTENT, 0, 0);
       int matching = -1;
       for (std::size_t i = 0; i < app->vehicle_choices.size(); ++i) {
@@ -1242,12 +1370,31 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       }
       if (matching >= 0) SendMessageW(app->vehicle_list, CB_SETCURSEL, matching, 0);
       EnableWindow(app->vehicle_list, TRUE); EnableWindow(app->start, TRUE);
-      SetWindowTextW(app->start, L"连接所选");
+      EnableWindow(app->logs_button, TRUE);
+      SetWindowTextW(app->start, app->selection_log_mode ? L"收集日志" : L"连接所选");
+      SetWindowTextW(app->logs_button, app->selection_log_mode ? L"返回车辆" : L"会话日志");
       return 0;
     }
     case WM_APP + 4:
       EnableWindow(app->vehicle_list, FALSE); EnableWindow(app->start, FALSE);
+      EnableWindow(app->logs_button, FALSE);
       SetWindowTextW(app->start, app->mock_control ? L"连接台架" : L"连接视频");
+      return 0;
+    case WM_APP + 5: {
+      wchar_t filename[MAX_PATH] = L"mine-teleop-session.zip";
+      OPENFILENAMEW dialog{};
+      dialog.lStructSize = sizeof(dialog); dialog.hwndOwner = hwnd;
+      dialog.lpstrFilter = L"ZIP 文件\0*.zip\0\0"; dialog.lpstrFile = filename;
+      dialog.nMaxFile = MAX_PATH; dialog.lpstrDefExt = L"zip";
+      dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+      const bool chosen = GetSaveFileNameW(&dialog) != FALSE;
+      { std::lock_guard lock(app->selection_mutex);
+        app->selection_save_path = chosen ? filename : L""; app->selection_save_response = true; }
+      app->selection_ready.notify_one();
+      return 0;
+    }
+    case WM_APP + 6:
+      EnableWindow(app->start, FALSE); EnableWindow(app->logs_button, FALSE); EnableWindow(app->vehicle_list, FALSE);
       return 0;
     case WM_APP + 2: {
       std::lock_guard lock(app->mutex);
