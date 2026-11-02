@@ -98,6 +98,25 @@ int main(int argc, char** argv) {
   gst_init(&argc, &argv);
   g_networking_init();
   try {
+    // Only RTP marker headers enter the diagnostic; DTLS, RTCP, incomplete
+    // headers and ordinary RTP packets must not masquerade as video frames.
+    ArrivalTimes header_trace;
+    const auto observe_header = [&](std::initializer_list<std::uint8_t> bytes) {
+      auto* buffer = gst_buffer_new_allocate(nullptr, bytes.size(), nullptr);
+      std::vector<std::uint8_t> data(bytes);
+      gst_buffer_fill(buffer, 0, data.data(), data.size());
+      ArrivalTimes::record_wire_buffer(header_trace, buffer);
+      gst_buffer_unref(buffer);
+    };
+    observe_header({0x80, 0xe0, 0, 1, 0, 0, 0, 0, 0x12, 0x34, 0x56, 0x78});
+    observe_header({0x80, 0x60, 0, 1, 0, 0, 0, 0, 0x12, 0x34, 0x56, 0x78});
+    observe_header({0x80, 0xc8, 0, 1, 0, 0, 0, 0, 0x12, 0x34, 0x56, 0x78});
+    observe_header({0x17, 0xfe, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+    observe_header({0x80, 0xe0, 0, 1});
+    const auto header_events = header_trace.wire_markers();
+    require(header_events.at("events_ssrc_clock_ms").size() == 1 &&
+            header_events.at("events_ssrc_clock_ms").at(0).at(0) == 0x12345678U,
+            "ICE-source RTP marker classifier accepted a non-marker header");
     const bool swap_identity = argc == 2 && std::string_view(argv[1]) == "--swap-identity";
     const bool software = argc == 2 && std::string_view(argv[1]) == "--software-frames";
     require(argc == 1 || swap_identity || software, "unknown fixture argument");
@@ -179,6 +198,12 @@ int main(int argc, char** argv) {
     require(markers.at("dropped") == 0 && (swap_identity ||
             (marker_sources.contains(1000000001U) && marker_sources.contains(1000000002U))),
             "synthetic streams did not produce bounded jitter-input marker observations");
+    const auto wire = receiver.report().at("ice_input_markers");
+    std::set<std::uint32_t> wire_sources;
+    for (const auto& event : wire.at("events_ssrc_clock_ms")) wire_sources.insert(event.at(0).get<std::uint32_t>());
+    require(wire.at("dropped") == 0 && (swap_identity ||
+            (wire_sources.contains(1000000001U) && wire_sources.contains(1000000002U))),
+            "synthetic streams did not produce bounded ICE-source marker observations");
     require(swap_identity ? rejected_swap : passed, "two decoded tracks did not retain their negotiated camera identities");
     require(pair.is_object() && pair.value("local_address", "") == "127.0.0.1" &&
             pair.value("remote_address", "") == "127.0.0.1" && pair.value("local_transport", "") == "udp" &&

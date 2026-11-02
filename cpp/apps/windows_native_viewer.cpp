@@ -1283,6 +1283,7 @@ struct Window {
               const Json timing{{"event", "native_mock_receiver_timing"},
                   {"scope", "receiver-local jitter input and decoded PTS; not capture or scan-out"},
                   {"jitter_input_markers", report.at("jitter_input_markers")},
+                  {"ice_input_markers", report.at("ice_input_markers")},
                   {"tracks", report.at("tracks")}};
               std::fprintf(stderr, "%s\n", timing.dump().c_str()); std::fflush(stderr);
             } catch (...) {

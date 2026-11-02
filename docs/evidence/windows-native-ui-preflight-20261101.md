@@ -721,3 +721,13 @@ the bounded diagnostic. These probes bound this interruption to after sender
 payloader output and before receiver jitter-input marker observation, but do
 not identify a network segment, prove all packets missing, or measure actual
 monitor scan-out. Evidence: `ui-compact-40-6a8-6193`.
+
+Attempt 41 stopped after 241.75 seconds on a critical-video wait; all 40 input
+windows matched, including four with nonzero brake. All 241 sampled logical
+paths were DC; WSS delivered 213 accepted copies first. At the wait, vehicle
+RTP payloader-output maximum gaps were 55 and 42 ms, with latest events 4 and
+8 ms old. The two receiver jitter-input frame-ending markers were last seen
+approximately 523 ms before withdrawal, with no diagnostic marker drops. The
+accepted control-result RTT p99 was 62 ms and maximum 86 ms, so this is not
+proof that control packets or the entire Wi-Fi link stopped during the same
+interval. Evidence: `ui-compact-41-6a8-6193`.
