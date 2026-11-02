@@ -23,7 +23,9 @@ void test_two_tracks_and_stale_recovery() {
   auto stale = health.snapshot(530);
   require(!stale.ready && !stale.sample_healthy && stale.bad_revision == 1 && stale.brake_revision == 1,
           "rear stale boundary did not withdraw readiness");
+  require(stale.faults.stale == 1 && stale.faults.unusable == 0, "stale diagnosis was not isolated");
   require(health.snapshot(531).brake_revision == 1, "stale polling repeated the fault");
+  require(health.snapshot(531).faults.stale == 1, "stale polling repeated the diagnostic");
   for (std::uint64_t seq = 4; seq <= 6; ++seq)
     require(health.render_submitted("rear", 1, seq, static_cast<std::int64_t>(530 + seq)), "recovery frame rejected");
   require(health.snapshot(536).ready, "three new frames did not recover both tracks");
@@ -42,8 +44,11 @@ void test_generation_and_lifecycle_fencing() {
     require(health.render_submitted("front", 2, seq, static_cast<std::int64_t>(4 + seq)), "new generation frame rejected");
   auto ready = health.snapshot(7);
   require(ready.ready && ready.brake_revision == 1, "replacement did not retain brake revision");
+  require(ready.faults.replaced == 1 && ready.faults.unusable == 0, "replacement diagnosis wrong");
   require(health.set_usable("front", 2, false), "track loss rejected");
   require(!health.snapshot(8).ready && health.snapshot(8).brake_revision == 2, "track loss did not revoke");
+  require(health.snapshot(8).faults.unusable == 1 && health.snapshot(8).faults.stale == 0,
+          "unusable diagnosis wrong");
   require(health.set_usable("front", 2, true), "track restore rejected");
   require(!health.render_submitted("front", 2, 3, 9), "old frame recovered track");
   for (std::uint64_t seq = 4; seq <= 6; ++seq)
@@ -56,8 +61,10 @@ void test_clock_and_bad_sample_fail_closed() {
   require(health.render_submitted("front", 1, 0, 10), "zero PTS is valid");
   require(!health.render_submitted("front", 1, std::numeric_limits<std::uint64_t>::max(), 11), "invalid PTS accepted");
   require(!health.snapshot(11).ready && health.snapshot(11).brake_revision == 1, "invalid frame did not revoke");
+  require(health.snapshot(11).faults.invalid_frame == 1, "invalid frame diagnosis missing");
   require(health.render_submitted("front", 1, 1, 12), "first new frame rejected");
   require(!health.snapshot(11).sample_healthy, "clock regression accepted");
+  require(health.snapshot(13).faults.clock == 1, "clock regression diagnosis missing");
   require(!health.render_submitted("front", 1, 2, 13) && !health.snapshot(13).ready, "clock fault recovered without new session");
 }
 void test_concurrent_current_time_observations() {

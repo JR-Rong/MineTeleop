@@ -19,9 +19,14 @@ namespace mine_teleop::detail {
 // Capture freshness and authenticated camera identity remain separate gates.
 class NativeVideoHealth {
  public:
+  struct FaultCounts {
+    std::uint64_t unusable{}, stale{}, invalid_frame{}, replaced{}, explicit_fault{}, clock{};
+    bool operator==(const FaultCounts&) const = default;
+  };
   struct Snapshot {
     bool ready{}, sample_healthy{};
     std::uint64_t bad_revision{}, brake_revision{};
+    FaultCounts faults{};
   };
 
   explicit NativeVideoHealth(const std::vector<std::string>& critical_cameras, std::int64_t stale_ms)
@@ -41,7 +46,7 @@ class NativeVideoHealth {
     if (it == tracks_.end() || generation == 0 || generation <= it->second.generation) return false;
     if (it->second.generation != 0) {
       if (it->second.failed) bump_revisions();
-      else bad(it->second);
+      else bad(it->second, &FaultCounts::replaced);
     }
     it->second = Track{};
     it->second.generation = generation;
@@ -52,7 +57,7 @@ class NativeVideoHealth {
     std::lock_guard lock(mutex_);
     auto* track = current(camera, generation);
     if (!track) return false;
-    if (!usable && track->usable) bad(*track);
+    if (!usable && track->usable) bad(*track, &FaultCounts::unusable);
     track->usable = usable;
     return true;
   }
@@ -73,7 +78,7 @@ class NativeVideoHealth {
     std::lock_guard lock(mutex_);
     auto* track = current(camera, generation);
     if (!track) return false;
-    bad(*track);
+    bad(*track, &FaultCounts::explicit_fault);
     return true;
   }
 
@@ -95,9 +100,9 @@ class NativeVideoHealth {
                                std::uint64_t frame_pts, std::int64_t now_ms) {
     auto* track = current(camera, generation);
     if (!track || !track->usable || !observe_clock(now_ms)) return false;
-    if (frame_pts == (std::numeric_limits<std::uint64_t>::max)()) { bad(*track); return false; }
+    if (frame_pts == (std::numeric_limits<std::uint64_t>::max)()) { bad(*track, &FaultCounts::invalid_frame); return false; }
     if (track->last_pts && frame_pts <= *track->last_pts) return false;
-    if (track->last_submitted && now_ms - *track->last_submitted >= stale_ms_) bad(*track);
+    if (track->last_submitted && now_ms - *track->last_submitted >= stale_ms_) bad(*track, &FaultCounts::stale);
     track->last_pts = frame_pts;
     track->last_submitted = now_ms;
     track->failed = false;
@@ -106,18 +111,18 @@ class NativeVideoHealth {
   }
 
   Snapshot snapshot_locked(std::int64_t now_ms) {
-    if (!observe_clock(now_ms)) return {false, false, bad_revision_, brake_revision_};
+    if (!observe_clock(now_ms)) return {false, false, bad_revision_, brake_revision_, faults_};
     bool healthy = !overflow_ && !clock_fault_;
     bool ready = healthy;
     for (auto& [id, track] : tracks_) {
       (void)id;
-      if (track.last_submitted && now_ms - *track.last_submitted >= stale_ms_) bad(track);
+      if (track.last_submitted && now_ms - *track.last_submitted >= stale_ms_) bad(track, &FaultCounts::stale);
       const bool current_sample = track.usable && !track.failed && track.last_submitted &&
           now_ms >= *track.last_submitted && now_ms - *track.last_submitted < stale_ms_;
       healthy = healthy && current_sample;
       ready = ready && current_sample && track.consecutive >= 3;
     }
-    return {ready && !overflow_, healthy && !overflow_, bad_revision_, brake_revision_};
+    return {ready && !overflow_, healthy && !overflow_, bad_revision_, brake_revision_, faults_};
   }
 
   struct Track {
@@ -131,8 +136,12 @@ class NativeVideoHealth {
     auto it = tracks_.find(camera);
     return it != tracks_.end() && generation != 0 && generation == it->second.generation ? &it->second : nullptr;
   }
-  void bad(Track& track) {
-    if (!track.failed) bump_revisions();
+  void bad(Track& track, std::uint64_t FaultCounts::* reason) {
+    if (!track.failed) {
+      bump_revisions();
+      auto& count = faults_.*reason;
+      if (count != (std::numeric_limits<std::uint64_t>::max)()) ++count;
+    }
     track.failed = true;
     track.consecutive = 0;
     track.last_submitted.reset();
@@ -145,7 +154,7 @@ class NativeVideoHealth {
   bool observe_clock(std::int64_t now_ms) {
     if (now_ms < 0 || (last_time_ && now_ms < *last_time_)) {
       clock_fault_ = true;
-      for (auto& [id, track] : tracks_) { (void)id; bad(track); }
+      for (auto& [id, track] : tracks_) { (void)id; bad(track, &FaultCounts::clock); }
       return false;
     }
     last_time_ = now_ms;
@@ -156,6 +165,7 @@ class NativeVideoHealth {
   std::map<std::string, Track> tracks_;
   std::optional<std::int64_t> last_time_;
   std::uint64_t bad_revision_{}, brake_revision_{};
+  FaultCounts faults_{};
   bool overflow_{}, clock_fault_{};
 };
 }  // namespace mine_teleop::detail

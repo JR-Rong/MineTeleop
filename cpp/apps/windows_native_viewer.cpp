@@ -370,6 +370,7 @@ struct Window {
       bool focused, ui_alive, clock_ok, video_ready, video_sample_healthy, authorized, ready;
       int remote_ready, direct_ready;
       std::uint64_t bad_revision, brake_revision;
+      detail::NativeVideoHealth::FaultCounts video_faults;
       bool operator==(const GuardState&) const = default;
     };
     struct GuardEvent { std::int64_t at, authorization_at, authorization_now; GuardState state; };
@@ -396,7 +397,10 @@ struct Window {
               {"direct_ready", s.direct_ready < 0 ? Json(nullptr) : Json(s.direct_ready != 0)},
               {"authorization_age_ms", event.authorization_at > 0 ?
                   Json(event.authorization_now - event.authorization_at) : Json(nullptr)},
-              {"bad_revision", s.bad_revision}, {"brake_revision", s.brake_revision}});
+              {"bad_revision", s.bad_revision}, {"brake_revision", s.brake_revision},
+              {"video_faults", {{"unusable", s.video_faults.unusable}, {"stale", s.video_faults.stale},
+                  {"invalid_frame", s.video_faults.invalid_frame}, {"replaced", s.video_faults.replaced},
+                  {"explicit_fault", s.video_faults.explicit_fault}, {"clock", s.video_faults.clock}}}});
         }
         std::fprintf(stderr, "%s\n", Json{{"event", "native_mock_guard_batch"}, {"records", std::move(records)},
             {"dropped", dropped}}.dump().c_str());
@@ -437,7 +441,8 @@ struct Window {
               !mock_gear_reconnect_required.load();
           if (config.control_trace_commands) {
             const GuardState state{focused, ui_alive, clock_ok, video_health.ready, video_health.sample_healthy,
-                authorized, ready, remote_ready, direct_ready, video_health.bad_revision, video_health.brake_revision};
+                authorized, ready, remote_ready, direct_ready, video_health.bad_revision, video_health.brake_revision,
+                video_health.faults};
             if (!previous_guard || *previous_guard != state) {
               std::lock_guard lock(guard_mutex);
               if (guard_events.size() < 128) guard_events.push_back({now_ms, authorized_at, authorization_now_ms, state});
