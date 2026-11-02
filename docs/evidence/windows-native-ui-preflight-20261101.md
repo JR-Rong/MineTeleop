@@ -891,3 +891,86 @@ logical control was DC in 1,036 observations and WSS in three. Accepted
 copies arrived first via DC 19,873 times and WSS 448 times. Accepted-result
 RTT p99 was 62 ms and max 500 ms, excluding missing or rejected results.
 Evidence: `ui-compact-56-6ac-6ac`.
+
+Attempt 57 used Windows and Orin `6ac2236` and stopped after 396.32 seconds on
+a control-link wait. Of 66 input windows, 65 matched; the final left window
+was interrupted, and seven brake windows contained nonzero requests. Logical
+control was DC in 389 samples and WSS in five while the selected media pair
+remained direct; WSS delivered 209 accepted copies first, DC 7,478, and one
+accepted copy lacked carrier attribution. Accepted-result RTT p99 was 58 ms
+and max 357 ms, excluding missing or rejected results. Evidence:
+`ui-compact-57-6ac-6ac`.
+
+Attempt 58 used Windows and Orin `6ac2236`, stopping after 234.41 seconds on
+a critical-video wait. Of 39 input windows, 38 matched; the final left input
+was interrupted, and four brake windows had nonzero requests. All 233 sampled
+logical paths were DC, while WSS delivered 122 accepted copies first. Around
+the vehicle wait (+/- 1 second), the Orin outbound AF_PACKET tap saw 60 RTP
+markers on each stream with maximum gaps 38.4 and 38.5 ms and no reported
+capture drops; Windows ICE-source markers were approximately 530 ms old at
+withdrawal. This repeats the observed boundary, not a specific NIC or carrier
+fault attribution. Evidence: `ui-compact-58-6ac-6ac`.
+
+Attempt 59 used Windows and Orin `6ac2236`; it stopped after 1,321.15 seconds
+on a control-link wait. All 220 input windows matched, including 24 nonzero
+brake windows. Logical control was DC in 1,312 samples and WSS in two, while
+the selected media pair stayed direct; WSS delivered 708 accepted copies
+first and DC 25,000. Accepted-result RTT p99 was 58 ms and max 86 ms,
+excluding missing or rejected results. One DTLS application-trace record
+was dropped, so it is not used to infer packet loss. Evidence:
+`ui-compact-59-6ac-6ac`.
+
+Attempt 60 used Windows and Orin `6ac2236`; it stopped after 84.53 seconds on
+a critical-video wait. All 14 input windows matched, including one nonzero
+brake window; all 84 sampled logical paths were DC and WSS delivered 40
+accepted copies first. In a +/-1 second window around the vehicle wait, the
+outbound AF_PACKET tap saw 60 markers per stream, with maximum gaps of 39.4
+and 37.9 ms; Windows ICE-source marker ages at withdrawal were about 533 and
+523 ms. Capture and trace drop counters were zero. The tap does not prove NIC
+transmission or identify the failing network segment. Evidence:
+`ui-compact-60-6ac-6ac`.
+
+Attempt 61 used Windows and Orin `6ac2236`; it stopped after 816.53 seconds
+on a control-link wait. All 136 input windows matched, including 15 nonzero
+brake windows. Logical control was DC in 812 samples and WSS in one, while
+the selected media pair stayed direct; WSS delivered 438 accepted copies
+first and DC 15,468. Accepted-result RTT p99 was 57 ms and max 432 ms,
+excluding missing or rejected results. Evidence: `ui-compact-61-6ac-6ac`.
+
+Attempt 62 used Windows and Orin `6ac2236`; it stopped after 144.31 seconds on
+a critical-video wait. Of 24 input windows, 23 matched; the final forward-right
+window was interrupted, and two brake windows had nonzero requests. All 143
+sampled logical paths were DC; WSS delivered 65 accepted copies first. Around
+the vehicle wait (+/- 1 second) the outbound AF_PACKET tap saw 60 markers per
+stream, with maximum gaps of 40.6 and 39.6 ms, while Windows ICE-source
+markers were approximately 510 ms old at withdrawal. No capture or diagnostic
+trace drops were recorded. This does not prove NIC transmission or locate the
+network segment. Evidence: `ui-compact-62-6ac-6ac`.
+
+Attempt 63 used Windows and Orin `6ac2236`; it stopped after 72.30 seconds on
+a control-link wait. All 12 input windows matched, including one nonzero
+brake window. Logical control was DC in 69 samples and WSS in three, while
+the selected media pair stayed direct; WSS delivered 23 accepted copies
+first and DC 1,313. Accepted-result RTT p99 was 57 ms and max 64 ms,
+excluding missing or rejected results. Evidence: `ui-compact-63-6ac-6ac`.
+
+Attempt 64 used Windows and Orin `6ac2236`; it stopped after 942.10 seconds.
+Of 157 input windows, 156 matched; the final right input was interrupted, and
+17 brake windows had nonzero requests. At the initial client withdrawal, local
+video was still fresh but the separate remote media-status gate had expired.
+The vehicle subsequently recorded a critical-video wait; later WSS/path and
+video-not-ready samples include shutdown. These observations do not prove the
+initial local decoded frame had expired. Evidence: `ui-compact-64-6ac-6ac`.
+
+Attempt 65 used Windows and Orin `6ac2236` and stopped after 138.42 seconds
+on a critical-video wait. Of 23 input windows, 22 matched; the final
+forward-left input was interrupted and two brake windows contained nonzero
+requests. All 137 sampled logical paths were DC; WSS delivered 49 accepted
+copies first. Clock uncertainty was at most 14 ms. Around the vehicle wait
+(+/- 1 second), the outbound AF_PACKET tap saw 60 RTP markers per stream,
+with maximum gaps of 40.9 and 40.4 ms and no socket capture drops. At client
+withdrawal the last receiver markers and decoded frames were approximately
+518 ms old. Larger decoder gaps in this run occurred during startup and do
+not explain the later withdrawal. The outbound tap does not prove NIC
+transmission or identify the failing network segment. CAN remained down.
+Evidence: `ui-compact-65-6ac-6ac`.

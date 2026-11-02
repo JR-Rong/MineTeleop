@@ -41,6 +41,28 @@ void test_gate() {
   require(gate.reason(4100) == "timestamp", "old status diagnosis wrong");
   require(!gate.ready(6100), "expired remote status retained readiness");
 }
+void test_mirrored_media_evidence() {
+  using mine_teleop::detail::native_mock_media_evidence;
+  NativeMockMediaGate gate("session", "test_bench_one", "attempt", {"front", "rear"});
+  auto first = status(10000, 1, 1);
+  auto second = status(11000, 2, 2);
+  first["unrelated"] = "wss-only"; second["lanes"][0]["extra"] = 17;
+  require(!gate.observe(first, 100, 10000, 25), "first sample admitted");
+  require(gate.observe(native_mock_media_evidence(second), 1100, 11000, 25), "mirror rejected");
+  require(gate.observe(second, 1200, 11100, 25), "identical cross-path duplicate revoked readiness");
+  require(gate.observe(native_mock_media_evidence(first), 1300, 11200, 25), "known out-of-order duplicate revoked readiness");
+  require(!gate.observe(second, 4100, 14000, 25) && !gate.ready(4100), "duplicate extended evidence TTL");
+  require(gate.observe(status(15000, 3, 3), 5100, 15000, 25), "fresh advancing mirror could not recover");
+  auto invalid = status(16000, 4, 4); invalid["adapter_type"] = "can";
+  require(!gate.observe(native_mock_media_evidence(invalid), 6100, 16000, 25), "invalid mirrored status admitted");
+  require(!gate.observe(status(15000, 3, 3), 6200, 16100, 25), "duplicate restored revoked readiness");
+  auto conflict = status(17000, 5, 5); conflict["media_negotiation"]["id"] = "old-attempt";
+  require(!gate.observe(conflict, 7100, 17000, 25), "other attempt admitted");
+  require(!gate.observe(status(18000, 6, 6), 8100, 18000, 26), "clock threshold changed");
+  auto missing = native_mock_media_evidence(status(19000, 7, 7));
+  missing["lanes"][0].erase("send_waiting_idr");
+  require(!gate.observe(missing, 9100, 19000, 25), "missing critical field admitted");
+}
 void test_neutral_refresh_sequence() {
   mine_teleop::detail::NativeMockInputSequence sequence;
   Json input{{"ui_control_epoch", 1}, {"critical_video_ready", true},
@@ -353,6 +375,6 @@ void test_mock_gamepad_neutral_and_profile_limits() {
   require(input.throttle == 0 && input.steering == 0, "zero mock limits produced nonzero motion intent");
 }
 }
-int main() { try { test_gate(); test_neutral_refresh_sequence(); test_profile_retry_stays_bounded_and_needs_live_guards(); test_profile_requires_new_manual_confirmation_after_invalidation(); test_mock_gear_confirmation_requires_forwarded_intent_and_new_feedback(); test_dtls_header_trace_is_bounded_and_excludes_payloads(); test_mock_keyboard_rearms_only_after_release(); test_vehicle_rearm_withdraws_motion_and_preserves_brake(); test_mock_direction_combinations_require_gear_confirmation(); test_live_clock_keyboard_and_media_guard(); test_mock_gamepad_neutral_and_profile_limits();
+int main() { try { test_gate(); test_mirrored_media_evidence(); test_neutral_refresh_sequence(); test_profile_retry_stays_bounded_and_needs_live_guards(); test_profile_requires_new_manual_confirmation_after_invalidation(); test_mock_gear_confirmation_requires_forwarded_intent_and_new_feedback(); test_dtls_header_trace_is_bounded_and_excludes_payloads(); test_mock_keyboard_rearms_only_after_release(); test_vehicle_rearm_withdraws_motion_and_preserves_brake(); test_mock_direction_combinations_require_gear_confirmation(); test_live_clock_keyboard_and_media_guard(); test_mock_gamepad_neutral_and_profile_limits();
   std::cout << "PASS scoped mock media, input renewal, keyboard and clock guard\n"; return 0; }
 catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; } }

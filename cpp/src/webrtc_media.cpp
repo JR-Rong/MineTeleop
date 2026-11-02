@@ -2,6 +2,7 @@
 #include "mine_teleop/detail/control_transport.hpp"
 #include "mine_teleop/detail/mock_compact_control.hpp"
 #include "mine_teleop/detail/mock_compact_telemetry.hpp"
+#include "mine_teleop/detail/native_mock_media_gate.hpp"
 #include "mine_teleop/detail/direct_authority.hpp"
 #include "mine_teleop/detail/emergency_stop.hpp"
 #include "mine_teleop/detail/feedback_transport.hpp"
@@ -5326,6 +5327,21 @@ struct VehicleMediaRuntime::Impl {
           }
           queue_signal(
               "media_status", status);
+          // Experimental, zero-speed mock only. Send the same safety evidence
+          // over the already scoped DTLS channel when it has no backlog. It
+          // must never displace or delay control feedback on a busy channel.
+          if (mock_dual_control_enabled()) {
+            const auto payload = Json{{"event", "mock_media_status_v1"},
+                {"status", detail::native_mock_media_evidence(status)}}.dump();
+            if (payload.size() <= 4096) {
+              std::lock_guard lock(control_mutex);
+              if (control_link_open && control_channel) {
+                guint64 buffered = 0;
+                g_object_get(control_channel, "buffered-amount", &buffered, nullptr);
+                if (buffered == 0) gst_webrtc_data_channel_send_string(control_channel, payload.c_str());
+              }
+            }
+          }
           next_media_status_ms = signaling.now_ms() + 1000;
         }
         if (simulate_primary_failure_after_frames > 0 && candidate_index == 0 && !simulated_failure_fired &&

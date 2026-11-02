@@ -684,23 +684,43 @@ struct Window {
       const auto& sync = status.at("time_sync");
       const bool clock_ok = sync.value("synchronized", false) && sync.value("uncertainty_ms", 999) <= 25 &&
           sync.value("uncertainty_ms", -1) >= 0 && status.at("time_sync_readiness").value("ready", false);
+      const bool direct_udp = channel->direct_udp(mock_local_ip, mock_peer_ip);
+      const auto receive = [&]() -> std::optional<std::string> {
+        while (auto bytes = channel->pop()) {
+          if (bytes->size() <= 4096 && bytes->find("mock_media_status_v1") != std::string::npos) {
+            const auto envelope = Json::parse(*bytes, nullptr, false);
+            if (envelope.is_object() && envelope.value("event", "") == "mock_media_status_v1") {
+              if (direct_udp) {
+                const auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                static_cast<void>(gate->observe(envelope.value("status", Json::object()),
+                    static_cast<std::int64_t>(bench_now_ms()), wall_ms + sync.value("offset_ms", std::int64_t{0}),
+                    clock_ok ? sync.value("uncertainty_ms", std::int64_t{999}) : 999));
+              }
+              continue;
+            }
+          }
+          return bytes;
+        }
+        return std::nullopt;
+      };
       const auto video_health = render->health->snapshot_now();
       const bool focused = IsWindowVisible(hwnd) && !IsIconic(hwnd) && GetForegroundWindow() == hwnd;
       if (!focused) for (const auto& id : render->cameras) static_cast<void>(render->health->set_usable(id, 1, false));
-      const bool ready = focused && clock_ok && gate->ready_now() && video_health.ready &&
-          channel->direct_udp(mock_local_ip, mock_peer_ip);
+      bool ready = focused && clock_ok && gate->ready_now() && video_health.ready &&
+          direct_udp;
       if (input_failed.load()) throw std::runtime_error("mock input worker failed");
       const auto current_epoch = epoch.load();
       if (current_epoch == 0) {
         // No command owner exists yet. Do not allow unsolicited telemetry to
         // fill the bounded channel before the safety gates admit neutral input.
-        while (channel->pop()) {}
+        while (receive()) {}
       } else {
         const detail::NativeCourierScope current{{session_id, generation, attempt}, owner, current_epoch};
         if (!courier) courier = std::make_unique<detail::NativeControlCourier>(current, wss_dc_mirror);
         detail::NativeControlCourier::Io io{
             [&] {
-              auto bytes = channel->pop();
+              auto bytes = receive();
               if (config.control_trace_commands && bytes && bytes->find("\"vehicle_telemetry\"") != std::string::npos) {
                 const auto envelope = Json::parse(*bytes, nullptr, false);
                 if (envelope.is_object()) {
@@ -732,6 +752,8 @@ struct Window {
               return queued;
             }, on_status};
         if (!courier->tick(current, io)) throw std::runtime_error("mock courier retired");
+        // Receiving a mirrored status can revoke the gate during this tick.
+        ready = focused && clock_ok && gate->ready_now() && video_health.ready && direct_udp;
         const auto transport = status.at("native_control").at("control_transport");
         const bool negotiated = transport.value("epoch", 0) > 0 && !transport.value("selecting", true);
         const auto recovery_state = telemetry.is_object() ? telemetry.value("safety_state", "") : std::string{};
@@ -788,6 +810,7 @@ struct Window {
           handshake_sent = true;
         }
       }
+      ready = focused && clock_ok && gate->ready_now() && video_health.ready && direct_udp;
       // The courier may have delivered newer telemetry after the loop's
       // initial timestamp. Compare against a clock read taken after delivery.
       const auto authorization_observed_ms = static_cast<std::int64_t>(bench_now_ms());
