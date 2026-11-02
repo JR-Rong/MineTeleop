@@ -1056,3 +1056,13 @@ at most 16 ms and CAN remained down. The sampled vehicle DataChannel buffer
 peaked at 2,189 bytes in this run, so the large backlog observed in attempt 71
 is not a necessary explanation for every stop. Evidence:
 `ui-compact-72-5dc-0e`.
+
+Attempt 73 used Windows `5dcf964` and Orin `18ea534` with mock DataChannel
+backpressure enabled. It stopped after 510.20 seconds on a control-link wait.
+Of 85 input windows, 84 matched; the final right window was interrupted, and
+nine brake windows had nonzero requests. All sampled media pairs were direct;
+logical control was DC in 503 observations and WSS in five. Clock uncertainty
+was at most 16 ms and CAN remained down. The sampled send buffer peaked at
+2,190 bytes and the result backpressure counter remained zero; therefore this
+run did not exercise the new 32 KiB backpressure. Evidence:
+`ui-compact-73-5dc-18e`.

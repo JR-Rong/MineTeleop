@@ -36,6 +36,7 @@ struct Publisher {
   ControlTransportFence control_transport_fence;
   FeedbackTransportFence feedback_transport_fence;
   std::map<std::string, Json> latest_feedback_status, pending_control_status;
+  std::uint64_t mock_skipped_dc_telemetry{}, mock_skipped_dc_vcu_snapshot{};
   unsigned wakeups{};
   bool mock_dual{false};
   bool mock_dual_control_enabled() const { return mock_dual; }
@@ -354,6 +355,31 @@ void mock_backpressure_keeps_expiry_rejection() {
       feedback.at("reason") == "transport_command_expired" && !value.receive_apply_invoked,
       "backpressure suppressed an expired command rejection or applied the command");
 }
+void mock_vcu_backpressure_preserves_faults_and_wss() {
+  Publisher publisher; FakeChannel channel; publisher.control_channel = &channel;
+  publisher.config.runtime.experimental_direct_authority_max_ms = 0;
+  publisher.mock_dual = true;
+  publisher.native_control_websocket_connected = true;
+  publisher.native_control_transport_cloud_capable = true;
+  channel.buffered_bytes = kMockDcBackpressureBytes;
+  Json vcu{{"event", "vcu_handshake_status"}, {"result", "status_update"}, {"adapter_ready", true},
+      {"session_id", "s"}, {"vehicle_id", "v"}, {"driver_id", "d"}, {"control_status_seq", 1},
+      {"status", {{"state", "unsupported"}, {"supported", false}, {"ready", false}, {"requested", false},
+          {"handshake_revoked", false}, {"disarming", false}, {"vmc_fault_code_valid", false}, {"speed_valid", false}}}};
+  publisher.send_control_status_locked(vcu);
+  expect(channel.sent.empty() && publisher.pending_control_status.at("vcu_handshake_status") == vcu,
+      "stable VCU snapshot was not mirrored while DC was congested");
+  expect(publisher.mock_skipped_dc_vcu_snapshot == 1, "skipped VCU snapshot was not counted");
+  auto fault = vcu; fault["control_status_seq"] = 2; fault["status"]["state"] = "fault";
+  publisher.send_control_status_locked(fault);
+  expect(channel.sent.size() == 1 && channel.sent.front() == fault &&
+      publisher.pending_control_status.at("vcu_handshake_status") == fault,
+      "fault VCU status was suppressed or not mirrored");
+  publisher.native_control_websocket_connected = false;
+  publisher.send_control_status_locked(vcu);
+  expect(channel.sent.size() == 2 && channel.sent.back() == vcu,
+      "VCU snapshot was suppressed without a live WSS mirror");
+}
 void raw_vcu_details_are_not_a_transport_wrapper() {
   Publisher publisher;
   publisher.config.runtime.experimental_direct_authority_max_ms = 0;
@@ -386,6 +412,6 @@ void raw_vcu_details_are_not_a_transport_wrapper() {
 }
 }
 int main() {
-  try { mock_dual_telemetry_preserves_identity_and_requires_cloud_authority(); mock_backpressure_keeps_expiry_rejection(); mirrored_duplicate_is_not_published_or_applied(); transport_expiry_has_signed_reason_and_trace_without_apply(); raw_vcu_details_are_not_a_transport_wrapper(); early_rejection_publishes_precise_signed_result(); cloud_only_startup_retains_all_safety_gates(); cloud_bootstrap_feedback_requires_live_authenticated_lease(); publish_all_four_independent_axes(); std::cout << "Actual vehicle feedback publisher: duplicate suppression, expiry rejection trace, raw/wrapped status ordering, early rejection reasons, four axes, real MAC and bounded snapshots passed; fake Gst send, no ABI/network proof\n"; }
+  try { mock_dual_telemetry_preserves_identity_and_requires_cloud_authority(); mock_vcu_backpressure_preserves_faults_and_wss(); mock_backpressure_keeps_expiry_rejection(); mirrored_duplicate_is_not_published_or_applied(); transport_expiry_has_signed_reason_and_trace_without_apply(); raw_vcu_details_are_not_a_transport_wrapper(); early_rejection_publishes_precise_signed_result(); cloud_only_startup_retains_all_safety_gates(); cloud_bootstrap_feedback_requires_live_authenticated_lease(); publish_all_four_independent_axes(); std::cout << "Actual vehicle feedback publisher: duplicate suppression, expiry rejection trace, raw/wrapped status ordering, early rejection reasons, four axes, real MAC and bounded snapshots passed; fake Gst send, no ABI/network proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

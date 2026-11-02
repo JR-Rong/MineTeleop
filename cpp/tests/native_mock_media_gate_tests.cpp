@@ -67,10 +67,27 @@ void test_mirrored_media_evidence() {
 void test_mock_dc_backpressure_fails_closed() {
   using namespace mine_teleop::detail;
   const auto limit = kMockDcBackpressureBytes;
-  require(!mock_skip_dc_telemetry(true, true, limit - 1) && mock_skip_dc_telemetry(true, true, limit),
+  require(!mock_skip_dc_snapshot(true, true, true, limit - 1) && mock_skip_dc_snapshot(true, true, true, limit),
           "telemetry backpressure boundary changed");
-  require(!mock_skip_dc_telemetry(false, true, limit) && !mock_skip_dc_telemetry(true, false, limit),
+  require(!mock_skip_dc_snapshot(false, true, true, limit) && !mock_skip_dc_snapshot(true, false, true, limit) &&
+          !mock_skip_dc_snapshot(true, true, false, limit),
           "telemetry copy dropped outside isolated mock or without WSS");
+  Json vcu{{"event", "vcu_handshake_status"}, {"result", "status_update"}, {"adapter_ready", true},
+      {"status", {{"state", "unsupported"}, {"supported", false}, {"ready", false}, {"requested", false},
+          {"handshake_revoked", false}, {"disarming", false}, {"vmc_fault_code_valid", false}, {"speed_valid", false}}}};
+  require(mock_replaceable_vcu_snapshot(vcu), "stable unsupported mock snapshot was not replaceable");
+  auto bad = vcu; bad["status"]["state"] = "fault";
+  require(!mock_replaceable_vcu_snapshot(bad), "fault VCU status marked replaceable");
+  bad = vcu; bad["status"]["handshake_revoked"] = true;
+  require(!mock_replaceable_vcu_snapshot(bad), "revoked VCU status marked replaceable");
+  bad = vcu; bad["status"].erase("disarming");
+  require(!mock_replaceable_vcu_snapshot(bad), "incomplete VCU status marked replaceable");
+  bad = vcu; bad["status"]["vmc_fault_code_valid"] = true;
+  require(!mock_replaceable_vcu_snapshot(bad), "valid VCU fault evidence marked replaceable");
+  bad = vcu; bad["issue_code"] = "fault";
+  require(!mock_replaceable_vcu_snapshot(bad), "VCU status with issue marked replaceable");
+  bad = vcu; bad["result"] = "connect";
+  require(!mock_replaceable_vcu_snapshot(bad), "VCU action result marked replaceable");
   require(mock_skip_dc_result(true, true, true, true, limit), "replaceable mock result not suppressed");
   require(!mock_skip_dc_result(false, true, true, true, limit) &&
           !mock_skip_dc_result(true, false, true, true, limit) &&

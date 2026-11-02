@@ -3105,20 +3105,24 @@ struct VehicleMediaRuntime::Impl {
     }
     if (control_channel != nullptr && control_link_open &&
         (!control_transport_fence.negotiated() || control_transport_fence.path() == detail::ControlPath::DataChannel)) {
-      // The isolated mock can race the very same telemetry snapshot over the
-      // authenticated signaling path. Keep its original identity, sequence and
-      // source time; the receiver must not refresh health on duplicates.
-      const bool telemetry_mirror = mock_dual_control_enabled() && message.value("event", "") == "vehicle_telemetry" &&
+      // Mirror the original scoped status, preserving sequence and source time.
+      const auto kind = message.value("event", "");
+      const bool snapshot_mirror = mock_dual_control_enabled() &&
+          (kind == "vehicle_telemetry" || kind == "vcu_handshake_status") &&
           cloud_control_authority_live_locked() &&
           (!message.contains("session_id") || message.at("session_id") == signaling.session_id()) &&
           (!message.contains("vehicle_id") || message.at("vehicle_id") == config.vehicle_id) &&
           (!message.contains("driver_id") || message.at("driver_id") == signaling.driver_id());
       guint64 buffered_bytes = 0;
-      if (telemetry_mirror) g_object_get(control_channel, "buffered-amount", &buffered_bytes, nullptr);
-      if (!detail::mock_skip_dc_telemetry(mock_dual_control_enabled(), telemetry_mirror, buffered_bytes))
+      if (snapshot_mirror) g_object_get(control_channel, "buffered-amount", &buffered_bytes, nullptr);
+      const bool replaceable = kind == "vehicle_telemetry" || detail::mock_replaceable_vcu_snapshot(message);
+      const bool skip_dc = detail::mock_skip_dc_snapshot(mock_dual_control_enabled(), snapshot_mirror, replaceable, buffered_bytes);
+      if (skip_dc && kind == "vehicle_telemetry") ++mock_skipped_dc_telemetry;
+      if (skip_dc && kind == "vcu_handshake_status") ++mock_skipped_dc_vcu_snapshot;
+      if (!skip_dc)
         gst_webrtc_data_channel_send_string(control_channel, message.dump().c_str());
-      if (telemetry_mirror) {
-        pending_control_status["vehicle_telemetry"] = message;
+      if (snapshot_mirror) {
+        pending_control_status[kind] = message;
         wake_native_control_feedback();
       }
     } else if (control_transport_fence.negotiated() || cloud_control_authority_live_locked()) {
@@ -3164,6 +3168,8 @@ struct VehicleMediaRuntime::Impl {
       enqueue_control_trace({{"stage", "mock_telemetry_publish"}, {"seq", sequence},
           {"event_monotonic_ms", trace_now}, {"bytes", payload_value.dump().size()},
           {"channel_buffered_bytes", buffered_bytes},
+          {"mock_skipped_dc_telemetry", mock_skipped_dc_telemetry},
+          {"mock_skipped_dc_vcu_snapshot", mock_skipped_dc_vcu_snapshot},
           {"channel_open", control_link_open.load()}, {"summary", payload_value.value("mock_telemetry_summary", false)},
           {"feedback_path", feedback_transport_fence.negotiated() ?
               Json(std::string(detail::control_path_name(feedback_transport_fence.path()))) : Json(nullptr)},
@@ -5748,6 +5754,7 @@ struct VehicleMediaRuntime::Impl {
   std::optional<std::int64_t> last_vcu_status_ms;
   std::uint64_t last_vehicle_telemetry_seq{0};
   std::int64_t last_mock_telemetry_trace_ms{0};
+  std::uint64_t mock_skipped_dc_telemetry{0}, mock_skipped_dc_vcu_snapshot{0};
   std::int64_t last_mock_full_telemetry_ms{0};
   std::string control_status_session_id;
   std::uint64_t control_status_seq{0};
