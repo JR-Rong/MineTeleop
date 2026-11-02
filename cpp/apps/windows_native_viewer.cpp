@@ -859,8 +859,7 @@ struct Window {
             !feedback.value("supported", false) ? L"台架不提供完整 CAN 反馈" :
             !feedback.value("feedback_fresh", false) ? L"反馈过期" : L"反馈新鲜";
         if (evidence_fresh) {
-          if (telemetry.contains("speed_mps") && telemetry.at("speed_mps").is_number())
-            speed = telemetry.at("speed_mps").get<double>();
+          speed = detail::native_feedback_display_speed(telemetry);
           if (telemetry_gear.size() == 1) actual_gear = telemetry_gear.front();
         }
         std::optional<detail::NativeOperatorIntent> shown_intent;

@@ -9,6 +9,28 @@
 
 namespace mine_teleop::detail {
 
+// Prefer the same measured CAN speed as the web console when it is supported
+// and valid. A stale supported CAN feed must not be presented as current.
+inline std::optional<double> native_feedback_display_speed(const nlohmann::json& telemetry) {
+  if (!telemetry.is_object()) return std::nullopt;
+  const auto finite = [](const nlohmann::json& value) -> std::optional<double> {
+    if (!value.is_number()) return std::nullopt;
+    const auto number = value.get<double>();
+    return std::isfinite(number) ? std::optional<double>(number) : std::nullopt;
+  };
+  if (telemetry.contains("can_feedback") && telemetry.at("can_feedback").is_object()) {
+    const auto& feedback = telemetry.at("can_feedback");
+    const auto flag = [&](const char* key) {
+      return feedback.contains(key) && feedback.at(key).is_boolean() && feedback.at(key).get<bool>();
+    };
+    if (flag("supported")) {
+      if (!flag("feedback_fresh")) return std::nullopt;
+      if (flag("speed_valid") && feedback.contains("speed_mps")) return finite(feedback.at("speed_mps"));
+    }
+  }
+  return telemetry.contains("speed_mps") ? finite(telemetry.at("speed_mps")) : std::nullopt;
+}
+
 // Match the web gear confirmation contract: use fresh valid CAN feedback
 // when supported, otherwise use explicit mock telemetry only.
 inline std::optional<char> native_feedback_confirmed_gear(const nlohmann::json& telemetry) {

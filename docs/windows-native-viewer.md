@@ -53,6 +53,8 @@ follow the safety procedure before reconnecting.
 The native status strip follows the web console's distinction between measured
 speed and gear and locally requested gear, steering, throttle and brake.
 Measured values require fresh vehicle telemetry, including its source time;
+the displayed speed prefers fresh, valid CAN speed when supported and uses
+telemetry speed as the fallback. A supported but stale CAN feed remains unknown.
 requested values require a fresh accepted local input and active authorization.
 Unknown or stale values display as `—`. Keyboard highlights describe local key
 state, not vehicle receipt or physical actuation, and clear on focus loss.
