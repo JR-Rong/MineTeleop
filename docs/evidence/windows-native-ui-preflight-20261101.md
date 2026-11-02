@@ -649,3 +649,75 @@ DTLS records matched unambiguously, eight approximate corrected delays were
 over 100 ms and the maximum was 353 ms. These observations cannot identify an
 individual command or conclusively assign all delay to Wi-Fi. Evidence:
 `ui-compact-33-a606-6193`.
+
+Attempts 34 and 35 stopped after 132.12 and 258.92 seconds respectively on
+critical-video waits. All 22 and 43 scheduled input windows matched, with
+two and four nonzero brake windows. The client recorded two stale tracks in
+each run. At the vehicle waits, cumulative RTP payloader-output event gaps
+were 43/45 ms and 46/43 ms, and the last output events were at most 19 ms and
+4 ms old respectively. These probe timings do not attest network delivery or
+monitor scan-out. Attempt 35's inbound DTLS capture had one application-trace
+drop; no packet-loss conclusion is drawn from it. Evidence:
+`ui-compact-34-a606-6193`, `ui-compact-35-a606-6193`.
+
+Attempt 36 stopped after 486.91 seconds on a control-link wait. Eighty of 81
+scheduled input windows matched; the interrupted last brake window did not
+match, and eight brake windows contained nonzero brake. The logical path was
+DC in 480 observations and WSS in five. Near the wait, a Windows gateway probe rose to
+262 ms, while adjacent samples were 2--4 ms. Of 129 unambiguously matched
+encrypted DTLS records in the surrounding window, 22 had approximate
+clock-corrected sender-to-kernel delays over 100 ms, with a maximum of 311 ms.
+This correlation cannot identify individual commands or isolate a network
+segment. This run did not satisfy uninterrupted-control acceptance.
+Evidence: `ui-compact-36-a606-6193`.
+
+Attempt 37 used Windows `6a8fd48`, which adds bounded, opt-in mock tracing of
+RTP frame-ending markers at jitterbuffer input. It stopped after 6.07 seconds
+on a critical-video wait. Both tracks' last marker and decoded observations
+preceded the client withdrawal by approximately 503 ms. At the vehicle's
+wait snapshot, the last payloader-output events were 21 and 20 ms old. A
+large earlier sender-output gap had already occurred before measurement and
+prevents using the cumulative maximum to establish continuity during this
+particular wait. Marker absence is not proof of packet absence or a complete
+frame's loss, and payloader output is not proof of network delivery. The
+trace dropped no markers. This run narrows the observed interruption without
+identifying a network segment or proving a cause. Evidence:
+`ui-compact-37-6a8-6193`.
+
+Attempt 38 used the same mock-instrumented builds and stopped after 714.42
+seconds on a control-link wait. All 711 sampled logical paths were DC and the
+selected media pair was direct; WSS nevertheless delivered the first copy of
+782 accepted results, compared with 13,038 over DC. Of 119 scheduled input
+windows, 118 matched; the final reverse window was interrupted by the stop,
+and 13 brake windows had nonzero brake. A Windows gateway probe timed out at
+400 ms near the wait, with adjacent probes around 2--4 ms. In the surrounding
+window, 506 encrypted DTLS records matched unambiguously, with 13 approximate
+corrected sender-to-kernel delays above 100 ms and a maximum of 501 ms.
+These are correlated observations, not attribution of a specific command or
+network segment. Evidence: `ui-compact-38-6a8-6193`.
+
+Attempt 39 stopped after 456.85 seconds on a control-link wait. All 76 input
+windows matched, including eight with nonzero brake. The logical path was DC
+in 454 observations and WSS in one; the selected pair remained direct.
+First-arriving accepted copies used DC 8,359 times and WSS 507 times. Gateway
+probes near the wait rose to 110 and 98 ms from a usual 2--3 ms; they did not
+time out. The surrounding 272 unambiguously matched encrypted DTLS records
+included 11 approximate corrected delays over 100 ms, with a maximum of
+267 ms. These samples do not identify the delay of a particular command or
+fully explain the stop. The vehicle trace shows a roughly 316 ms gap between
+the last accepted command and the next batch; two expired commands in that
+batch were rejected by the transport fence, and later fresh commands arrived
+after the control state had degraded. Reordering within that batch alone
+cannot fill the preceding gap. Evidence: `ui-compact-39-6a8-6193`.
+
+Attempt 40 stopped after 144.29 seconds on a critical-video wait; all 24 input
+windows matched, including two with nonzero brake. All 143 sampled logical
+paths were DC, while WSS delivered 142 accepted copies first. At the wait,
+vehicle RTP payloader-output event maximum gaps were 46 ms for each camera,
+and each last event was 4 ms old. The last receiver jitter-input frame-ending
+markers preceded the native withdrawal by approximately 503 and 542 ms;
+last decoded observations were similarly old, and no markers were dropped by
+the bounded diagnostic. These probes bound this interruption to after sender
+payloader output and before receiver jitter-input marker observation, but do
+not identify a network segment, prove all packets missing, or measure actual
+monitor scan-out. Evidence: `ui-compact-40-6a8-6193`.
