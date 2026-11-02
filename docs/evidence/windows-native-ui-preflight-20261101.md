@@ -345,3 +345,249 @@ The following `bb514d0` attempt stopped after 390.37 seconds with one vehicle
 the accepted requests carried zero traction and steering, while brake requests
 were present. It did not complete the requested window. Evidence:
 `ui-compact-10-bb`.
+
+With the `1061658` WSS-owned DC mirror code, a further isolated mock attempt
+could not establish ICE/DTLS during the 120-second startup deadline; it never
+entered the measurement window. During a separately authorized temporary
+Wi-Fi adapter power-setting experiment, endpoint-bound simultaneous UDP probes
+were received by Orin but not by Windows for two tested Orin IPv6 addresses.
+After restoring the original setting, a newly allocated Windows address passed
+a bidirectional 73/73 probe; another probe to a different address was one-way,
+and a newly allocated temporary Windows address passed 72/72. This small,
+non-simultaneous sample does not isolate the adapter setting from address,
+neighbor, router or network state. The original setting was restored and
+verified; no VPN or safety threshold was changed. Evidence: `ui-compact-11` and
+the associated `udp11` through `udp16` probe artifacts.
+
+Using the bidirectionally reachable temporary Windows address, another attempt
+entered the direct mock measurement but stopped at 12.18 seconds after a
+braking wait. Two input windows matched local key masks to accepted, zero-limited
+vehicle intent sequences. At one braking event the last valid control command
+was only 5 ms old; this is not evidence of an 800 ms command outage. Evidence:
+`ui-compact-12-106`.
+
+The following attempt stopped after 163.57 seconds when critical video became
+stale. All 27 input windows matched local key masks to accepted zero-limited
+vehicle intent sequences, and three brake windows contained nonzero brake
+requests. The last valid command was 98 ms old at the critical-video wait.
+Decoded callback inter-frame gaps had p99 approximately 180--181 ms and maxima
+approximately 276--279 ms on the two streams. This does not yet establish
+whether the gap arose in the network, jitter buffer or decoder. Evidence:
+`ui-compact-13-106`.
+
+The next attempt stopped after 510.68 seconds with a `control_link` braking
+wait; all 85 input windows had local key-mask and accepted zero-limited intent
+sequence matches, including nine nonzero-brake windows. The last valid command
+was 529 ms old at the first measured braking wait and 1,129 ms at a later
+wait. The two decoded callback streams each had a maximum gap of about 549 ms.
+A one-hertz Windows gateway probe near the first wait rose from 2--3 ms to
+127 ms, while the vehicle-to-cloud probe was 21--22 ms immediately before it;
+these sparse ICMP samples are correlation, not proof of the failing segment.
+In a seven-second window around the first wait, 255 of 258 outbound encrypted
+DTLS records could be matched unambiguously to vehicle kernel arrivals; five
+had an estimated nicesink-to-kernel interval above 100 ms, with a maximum of
+about 335 ms after clock correction. Three unmatched records are not proof of
+loss, and encrypted records cannot be attributed to individual commands.
+Accepted vehicle-result RTT p50/p95/p99/max was 39/52/59/97 ms, which excludes
+the commands for which no result arrived. Evidence: `ui-compact-14-106`.
+
+Another run stopped after 432.23 seconds with a control-link braking wait and
+last valid command age of 511 ms. All 72 input windows had a local key-mask and
+accepted zero-limited intent sequence match, with eight nonzero-brake windows.
+Both decoded callback streams had a maximum inter-frame gap near 1,118 ms.
+Within seven seconds of the braking event, 279 of 286 encrypted DTLS records
+matched unambiguously between Windows nicesink and the vehicle kernel; nine
+were above 100 ms, with a clock-corrected maximum of about 323 ms. Unmatched
+records are not proof of loss and cannot be attributed to individual commands.
+Evidence: `ui-compact-15-106`.
+
+With receiver timing export enabled, the next attempt stopped after 1,603.25
+seconds on a control-link braking wait. All 267 input windows matched local
+key masks to accepted zero-limited intent sequences, including 29 windows with
+nonzero brake requests. Every one of 1,595 measurement observations showed the
+pinned direct pair and logical DC path; the vehicle event still failed the
+acceptance. The vehicle snapshot had a fresh command 6 ms old, but immediately
+preceding commands included multiple DC deliveries rejected as expired at
+229--331 ms. Accepted result RTT p50/p95/p99/max was 39/52/60/92 ms; missing
+or rejected results are outside that distribution.
+
+The two tracks' receiver-local, PTS-matched jitter-input-to-decode p99 values
+were 1.33 and 1.38 ms. The maximum frame gaps at jitter input were 353.7 and
+353.9 ms, and the decoded gaps were similar. This locates those particular
+gaps before the recorded jitter input, but cannot distinguish network delay,
+packet loss, SRTP processing or sender behavior. In a seven-second window
+around the braking wait all 254 observed outbound DTLS records matched vehicle
+kernel arrivals; six intervals exceeded 100 ms, with a clock-corrected maximum
+near 307 ms. The application DTLS trace dropped one record across the run;
+encrypted records cannot identify individual control commands. Evidence:
+`ui-compact-16-c1`.
+
+An isolated bandwidth experiment changed only the vehicle's target video
+bitrate from 1,500 to 1,000 kbps per camera; both remained 960×768 at 30 fps
+and all safety gates were unchanged. It stopped after 942.49 seconds on a
+control-link braking wait, with the last valid command 499 ms old. All 157
+input windows matched local key masks to accepted zero-limited intent sequences,
+including 17 nonzero-brake windows. The two receiver jitter-input frame gaps
+reached approximately 523--530 ms; matched jitter-input-to-decode p99 remained
+approximately 1.3 ms. In the seven seconds around the wait, 361 of 367 observed
+outbound DTLS records matched kernel arrivals; nine intervals exceeded 100 ms
+and the clock-corrected maximum was about 371 ms. Missing matches do not prove
+packet loss, and encrypted records cannot identify control commands. This one
+experiment does not prove that a lower bitrate improves or worsens stability,
+and its image quality was not evaluated. Evidence: `ui-compact-17-c1-1000`.
+
+Separately, IPv4 STUN queries sent through the explicitly bound Windows WLAN
+and Orin cellular interfaces used the same socket per endpoint against two
+servers. Windows reported the same public mapping; Orin reported different
+mapped ports for the two destinations. A 25-second simultaneous IPv4 UDP
+hole-punch attempt using the same STUN-bound sockets received no matching peer
+packets at either end. This is a failed raw UDP experiment for this particular
+network and candidate strategy, not proof that IPv4 ICE or all IPv4 networks
+cannot connect. The test did not modify VPN configuration.
+
+Returning to 1,500 kbps per camera with Windows build `606e5c2`, the next run
+stopped after 96.64 seconds on a critical-video braking wait. The last valid
+control command was 60 ms old. Fifteen of 16 input windows matched local key
+and accepted zero-limited intent sequence; one reverse-left window did not
+match. One brake window contained nonzero brake. Receiver-local jitter-input
+frame gaps reached approximately 229 ms on both tracks, while the
+decoded callback maximum reached approximately 250--327 ms. The hardware
+remained isolated mock with CAN down. Evidence: `ui-compact-18-606`.
+
+The next `606e5c2` run completed 1,801.18 seconds at 1,500 kbps per camera.
+All 1,792 measurement observations showed the pinned direct UDP pair, logical
+DC path, ready video and trusted clock; the maximum sampled uncertainty was
+17 ms. The client reported no safety-stop episodes and no vehicle braking-wait
+event was found in the measurement window with a 100 ms boundary margin. All
+300 input windows matched local key masks to accepted zero-limited vehicle
+intent sequences, and all 33 brake windows contained nonzero brake requests.
+Accepted vehicle-result RTT p50/p95/p99/max was 40/53/61/94 ms; the accepted
+result observations attributed 33,494 first copies to DC and 1,568 to WSS.
+Missing or rejected results are not represented in that RTT distribution.
+
+The two tracks' receiver-local matched jitter-input-to-decode p99 values were
+1.29 and 1.34 ms. Their maximum jitter-input frame gaps were approximately
+113 and 111 ms; maximum decoded gaps were approximately 200 and 179 ms.
+These are local stage measurements, not camera-to-display latency. This is a
+passing isolated zero-speed mock window for the tested binary and network,
+not real-vehicle acceptance, physical gamepad validation, or proof that the
+path is stable in other windows. Evidence: `ui-compact-19-606`.
+
+The subsequent Windows `3503bf8` run stopped after 138.17 seconds on a
+critical-video braking wait. All 138 sampled control paths remained direct DC,
+and the last valid control command was 66 ms old when the vehicle logged the
+wait. All 23 scheduled input windows matched local key masks with accepted
+zero-limited intent sequences; both brake windows contained brake requests.
+The maximum receiver-local decoded gaps were approximately 200 and 203 ms,
+and foreground submission gaps approximately 198 and 202 ms. Those aggregate
+gaps do not establish why the native video gate withdrew readiness: it also
+responds to loss of window usability and invalid frame or clock evidence.
+The vehicle did not report a camera fault at the wait. The subsequent change
+adds separate diagnostic counts for the gate's withdrawal causes without
+changing its thresholds or acceptance behavior. Evidence: `ui-compact-20-3503`.
+
+A further `3503bf8` attempt stopped after 168.46 seconds on a control-link
+braking wait. All 28 scheduled input windows matched, with three brake
+windows containing nonzero brake requests. The direct UDP pair was present in
+all 168 observations, but the logical control path was WSS in two of them.
+Both receiver-local jitter-input frame gaps reached approximately 526 ms.
+Around the failure, 358 DTLS records could be matched unambiguously from the
+Windows outgoing trace to the Orin kernel capture; seven approximate corrected
+delays exceeded 100 ms, with a maximum of 366 ms, subject to clock uncertainty.
+Encrypted records do not identify individual commands, unmatched records are
+not a packet-loss measurement, and the common gap does not establish which
+network segment or sender caused it. Evidence: `ui-compact-21-3503`.
+The one-second Windows-to-Wi-Fi-gateway probe around the wait reported
+113 ms, versus 2--3 ms on adjacent probes. This is correlation with the
+shared first hop, not proof of where all affected packets were delayed.
+
+The next `3503bf8` attempt stopped after 433.05 seconds on a control-link
+braking wait. The pinned UDP pair remained direct in all 430 observations,
+while the logical path was WSS in four observations. Of 72 scheduled input
+windows, 71 matched; the final brake window had no local key sample or
+accepted intent. Seven earlier brake windows had nonzero brake requests.
+At the vehicle wait, the last valid command was 63 ms old, but the incoming
+command explicitly reported the control link and operator input not ready.
+The driver trace shows several result RTTs over the existing 200 ms bound,
+followed by transport selection that withdraws readiness until the new
+authority is confirmed. In the surrounding seven-second capture, all 333
+unique matched DTLS records had approximate sender-to-kernel delays; 21
+exceeded 100 ms and the maximum was 276 ms, subject to clock uncertainty.
+This does not identify the cause of every delayed result. The run failed the
+uninterrupted-control acceptance. Evidence: `ui-compact-22-3503`.
+
+Windows build `a60609e` stopped after 427.12 seconds on a critical-video
+braking wait; the selected control path remained DC in all 426 observations.
+The new diagnostics counted two stale-track withdrawals and zero unusable,
+invalid-frame, replacement, explicit-fault or clock withdrawals. The last
+recorded received and decoded frame on both tracks was about 550 ms before
+the native readiness withdrawal; the finite-window maximum between two
+recorded decoded frames does not include that final open-ended gap. At the
+vehicle wait, the last valid control command was 47 ms old, and both lanes
+reported capture and encoded samples under 100 ms old without camera faults.
+This narrows the interruption to the path after those vehicle-side observations
+and before receiver decode, but does not isolate sender queue, network or
+receiver transport. Of 71 scheduled input windows, 70 matched; the final
+reverse-right window did not. Seven earlier brake windows contained nonzero
+brake. The run failed acceptance. Evidence: `ui-compact-23-a606`.
+
+A further `a60609e` attempt stopped after 114.85 seconds on another
+critical-video braking wait. Diagnostics again counted two stale-track
+withdrawals, with no window-usability or clock withdrawal. All 114 sampled
+paths were direct DC, all 19 scheduled input windows matched and both brake
+windows had nonzero brake. Accepted result RTT p99 was 69 ms; it excludes
+missing or rejected results. The run did not satisfy the 30-minute gate.
+Evidence: `ui-compact-24-a606`.
+
+The Windows gateway/resource probe did not start in attempts 23 and 24:
+its script name was changed when the viewer version was updated. Their
+gateway RTT and resource usage are therefore unavailable. The same issue
+affected attempt 25; its probe was started after the safety stop, so it does
+not cover the measurement or its failure.
+
+At 1,000 kbps per camera, `a60609e` attempt 25 stopped after 1,074.65
+seconds. The diagnostic counters showed two unusable-track withdrawals and no
+stale-track withdrawals; the recorded guard showed the viewer was not the
+foreground window. The vehicle entered critical-video braking wait, as
+required by the existing focus and freshness interlock. All 179 input windows
+matched and 19 brake windows contained nonzero brake requests. The sampled
+logical path remained DC, and the accepted-result RTT p99 was 60 ms; the RTT
+omits missing or rejected results. The interruption's foreground owner was
+not recorded, and this run cannot prove that reducing bitrate fixes network
+tail latency. Evidence: `ui-compact-25-a606-1000`.
+
+Attempt 26, also 1,000 kbps per camera, stopped after 277.27 seconds on a
+control-link braking wait; all 46 input windows matched and five brake windows
+contained nonzero brake. In 276 observations the logical path was DC and the
+selected UDP pair was direct. The Windows foreground monitor still showed the
+viewer in front at the vehicle wait; it observed a different foreground only
+after the viewer ended. A gateway probe started just before the wait timed
+out at its 400 ms bound, with adjacent one-second samples at 2--3 ms. In the
+surrounding seven-second DTLS window, 242 records matched unambiguously and
+five approximate corrected delays exceeded 100 ms, with a maximum of 310 ms.
+An ICMP timeout is not proof of where every delayed media or control packet
+was queued, and matched encrypted records do not identify commands. Evidence:
+`ui-compact-26-a606-1000`.
+
+Attempt 27 did not enter the measurement window: the vehicle created an
+offer, received an answer and a remote IPv6 host candidate, but the native
+viewer never reached authenticated direct control within its startup bound.
+The scoped Orin capture recorded no DTLS records for the pinned pair. A
+subsequent simultaneous raw IPv6 UDP probe using the same endpoint addresses
+returned all 72 Windows-sent matching probes. That short probe does not prove
+ICE or control stability; the preliminary ICMP probes timed out and should
+not be used as evidence that UDP was unavailable. Evidence:
+`ui-compact-27-a606-1000-invalid`.
+
+Attempt 28 entered the measurement window but stopped after 24.83 seconds;
+the vehicle recorded two control-link braking waits. The selected media pair
+remained direct in 25 observations, while four observations used WSS as the
+logical control path. Three of four scheduled input windows matched; the
+interrupted right-key window had no local sample or accepted intent. Gateway
+probes near the waits increased from 2--3 ms to 105 and 240 ms before
+returning to 3 ms. All 344 uniquely matched DTLS records in the surrounding
+seven-second window were accounted for, with 29 approximate corrected
+sender-to-kernel delays above 100 ms and a maximum of 334 ms. These concurrent
+observations do not locate all queueing to the Wi-Fi link. The 1,000 kbps
+trial did not eliminate the control-path interruption. Evidence:
+`ui-compact-28-a606-1000`.
