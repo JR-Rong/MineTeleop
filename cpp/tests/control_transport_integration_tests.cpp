@@ -137,6 +137,8 @@ struct Fixture {
   bool drop_wss_commands{false};
   std::uint64_t dual_applied{}, dual_duplicates{}, dual_wss_applied{}, dual_dc_applied{};
   std::uint64_t wss_dc_mirror_applied{};
+  std::int64_t last_pump_ms{-1}, max_pump_gap_ms{}, max_wss_result_lateness_ms{};
+  std::size_t max_delayed_results{};
   std::set<std::uint64_t> dual_applied_sequences;
   std::map<std::uint64_t, std::string> dual_frames;
   std::unique_ptr<NativeControlCourier> native_courier;
@@ -410,6 +412,12 @@ struct Fixture {
     return response;
   }
   void pump(bool dc_ready) {
+    if (mock_dual) {
+      const auto now = steady();
+      if (last_pump_ms >= 0 && now >= last_pump_ms)
+        max_pump_gap_ms = std::max(max_pump_gap_ms, now - last_pump_ms);
+      last_pump_ms = now;
+    }
     renew_authority();
     if (refresh_input && steady() - last_input >= 60) input();
     const auto received = cloud_online ? vehicle_socket.receive_json(std::chrono::milliseconds(1)) : WebSocketReceiveResult{};
@@ -423,9 +431,14 @@ struct Fixture {
           {"trace_session_id", session}, {"seq", payload.at("seq")}, {"intent_seq", payload.at("intent_seq")}});
       // Model the reported distinction: cloud ingress remains fast while the
       // actual vehicle result is slower than the simulated DC byte path.
-      if (!dropped && result.is_object()) { if (feedback_enabled) route_feedback(result, payload); else delayed.emplace_back(steady() + 60, std::move(result)); }
+      if (!dropped && result.is_object()) {
+        if (feedback_enabled) route_feedback(result, payload);
+        else delayed.emplace_back(steady() + 60, std::move(result));
+        if (mock_dual) max_delayed_results = std::max(max_delayed_results, delayed.size());
+      }
     }
     while (cloud_online && !delayed.empty() && delayed.front().first <= steady()) {
+      if (mock_dual) max_wss_result_lateness_ms = std::max(max_wss_result_lateness_ms, steady() - delayed.front().first);
       vehicle_socket.send_json(delayed.front().second); delayed.pop_front();
     }
     if (ui_epoch == 0) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); return; }
@@ -495,6 +508,9 @@ void mock_dual_control_survives_direct_packet_loss() {
   expect(fixture.dual_applied >= 5 && fixture.dual_duplicates >= 2,
       "real signaling path did not deliver authenticated duplicates");
   const auto wss_before = fixture.dual_wss_applied;
+  fixture.last_pump_ms = steady();
+  fixture.max_pump_gap_ms = fixture.max_wss_result_lateness_ms = 0;
+  fixture.max_delayed_results = fixture.delayed.size();
   fixture.drop_dc_commands = true;
   deadline = steady() + 2000;
   while (steady() < deadline) fixture.pump(true);
@@ -504,6 +520,8 @@ void mock_dual_control_survives_direct_packet_loss() {
     throw std::runtime_error("signed vehicle results from WSS did not sustain dual control when DC copies were lost: " +
         Json{{"wss_applied_before", wss_before}, {"wss_applied_after", fixture.dual_wss_applied},
              {"duplicates", fixture.dual_duplicates}, {"control_transport", state},
+             {"max_pump_gap_ms", fixture.max_pump_gap_ms}, {"max_wss_result_lateness_ms", fixture.max_wss_result_lateness_ms},
+             {"max_delayed_results", fixture.max_delayed_results},
              {"last_vehicle_rejection", fixture.first_vehicle_rejection}}.dump());
   const auto result_latency = fixture.driver->status().at("native_control").at("vehicle_result_latency");
   expect(result_latency.value("vehicle_received_path", "") == "wss",
