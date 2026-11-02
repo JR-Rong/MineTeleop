@@ -860,7 +860,7 @@ struct Window {
             !feedback.value("feedback_fresh", false) ? L"反馈过期" : L"反馈新鲜";
         if (evidence_fresh) {
           speed = detail::native_feedback_display_speed(telemetry);
-          if (telemetry_gear.size() == 1) actual_gear = telemetry_gear.front();
+          actual_gear = detail::native_feedback_display_gear(telemetry);
         }
         std::optional<detail::NativeOperatorIntent> shown_intent;
         {

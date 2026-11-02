@@ -4,6 +4,7 @@
 
 int main() {
   using mine_teleop::detail::native_can_feedback_text;
+  using mine_teleop::detail::native_feedback_display_gear;
   using mine_teleop::detail::native_feedback_display_speed;
   using mine_teleop::detail::native_feedback_confirmed_gear;
   using Json = nlohmann::json;
@@ -46,6 +47,20 @@ int main() {
     measured["can_feedback"] = {{"supported", false}};
     if (native_feedback_display_speed(measured) != 1.0)
       throw std::runtime_error("mock telemetry speed was not displayed");
+    measured["gear"] = "R";
+    measured["can_feedback"] = valid_gear;
+    if (native_feedback_display_gear(measured) != 'D')
+      throw std::runtime_error("valid CAN gear was not preferred for display");
+    measured["can_feedback"]["gear_valid"] = false;
+    if (native_feedback_display_gear(measured) != 'R')
+      throw std::runtime_error("telemetry gear fallback was not displayed");
+    measured["can_feedback"]["feedback_fresh"] = false;
+    if (native_feedback_display_gear(measured))
+      throw std::runtime_error("stale supported CAN gear was displayed");
+    measured["can_feedback"] = {{"supported", false}};
+    measured["gear"] = "P";
+    if (native_feedback_display_gear(measured) != 'P')
+      throw std::runtime_error("parked telemetry gear was not displayed");
     Json telemetry{{"gear", "R"}, {"can_feedback", {{"supported", false}}}};
     if (native_feedback_confirmed_gear(telemetry) != 'R')
       throw std::runtime_error("mock gear feedback was not admitted");

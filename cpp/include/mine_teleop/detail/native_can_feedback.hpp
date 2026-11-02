@@ -31,6 +31,32 @@ inline std::optional<double> native_feedback_display_speed(const nlohmann::json&
   return telemetry.contains("speed_mps") ? finite(telemetry.at("speed_mps")) : std::nullopt;
 }
 
+// Display the fresh measured CAN gear first; unlike control authorization,
+// the display may also show an explicitly reported parked gear.
+inline std::optional<char> native_feedback_display_gear(const nlohmann::json& telemetry) {
+  if (!telemetry.is_object()) return std::nullopt;
+  if (telemetry.contains("can_feedback") && telemetry.at("can_feedback").is_object()) {
+    const auto& feedback = telemetry.at("can_feedback");
+    const auto flag = [&](const char* key) {
+      return feedback.contains(key) && feedback.at(key).is_boolean() && feedback.at(key).get<bool>();
+    };
+    if (flag("supported")) {
+      if (!flag("feedback_fresh")) return std::nullopt;
+      if (flag("gear_valid")) {
+        if (!feedback.contains("gear") || !feedback.at("gear").is_number_integer()) return std::nullopt;
+        if (feedback.at("gear") == 1) return 'N';
+        if (feedback.at("gear") == 2) return 'R';
+        if (feedback.at("gear") == 3) return 'D';
+        return std::nullopt;
+      }
+    }
+  }
+  if (!telemetry.contains("gear") || !telemetry.at("gear").is_string()) return std::nullopt;
+  const auto gear = telemetry.at("gear").get<std::string>();
+  return gear == "N" || gear == "D" || gear == "R" || gear == "P"
+      ? std::optional<char>(gear.front()) : std::nullopt;
+}
+
 // Match the web gear confirmation contract: use fresh valid CAN feedback
 // when supported, otherwise use explicit mock telemetry only.
 inline std::optional<char> native_feedback_confirmed_gear(const nlohmann::json& telemetry) {
