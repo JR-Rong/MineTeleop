@@ -1275,14 +1275,14 @@ struct Window {
         if (receiver) {
           receiver->stop();
           if (mock_control && config.control_trace_commands) {
-            // The receiver already records bounded PTS-correlated packet and
-            // decode observations. Export them only after stopping media, so
-            // diagnosis cannot add work to the live frame or control path.
+            // Export the bounded packet and decode observations only after
+            // stopping media; their trace probes run during the mock session.
             // Do not export the selected-pair addresses from the full report.
             try {
               const auto report = receiver->report();
               const Json timing{{"event", "native_mock_receiver_timing"},
                   {"scope", "receiver-local jitter input and decoded PTS; not capture or scan-out"},
+                  {"jitter_input_markers", report.at("jitter_input_markers")},
                   {"tracks", report.at("tracks")}};
               std::fprintf(stderr, "%s\n", timing.dump().c_str()); std::fflush(stderr);
             } catch (...) {

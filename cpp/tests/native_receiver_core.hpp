@@ -384,16 +384,26 @@ inline Json structure_json(const GstStructure* structure) {
 struct ArrivalTimes {
   std::mutex mutex;
   std::map<std::uint64_t, double> latest;
+  bool trace_markers{false};  // Set before the receiver pipeline starts.
+  std::vector<std::pair<std::uint32_t, double>> marker_events;
+  std::uint64_t marker_events_dropped{};
   static GstPadProbeReturn record(GstPad*, GstPadProbeInfo* info, gpointer data) {
     auto& self = *static_cast<ArrivalTimes*>(data);
     auto* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
     GstRTPBuffer packet = GST_RTP_BUFFER_INIT;
     if (buffer && gst_rtp_buffer_map(buffer, GST_MAP_READ, &packet)) {
-      const auto key = (static_cast<std::uint64_t>(gst_rtp_buffer_get_ssrc(&packet)) << 32) |
+      const auto ssrc = gst_rtp_buffer_get_ssrc(&packet);
+      const bool marker = gst_rtp_buffer_get_marker(&packet);
+      const auto key = (static_cast<std::uint64_t>(ssrc) << 32) |
           gst_rtp_buffer_get_timestamp(&packet);
       gst_rtp_buffer_unmap(&packet);
+      const auto now = bench_now_ms();
       std::lock_guard lock(self.mutex);
-      self.latest[key] = bench_now_ms();
+      self.latest[key] = now;
+      if (self.trace_markers && marker) {
+        if (self.marker_events.size() < 131072) self.marker_events.emplace_back(ssrc, now);
+        else ++self.marker_events_dropped;
+      }
       // A handful of frames in flight, bounded even with malformed traffic.
       if (self.latest.size() > 512) {
         auto oldest = std::min_element(self.latest.begin(), self.latest.end(),
@@ -407,6 +417,12 @@ struct ArrivalTimes {
     std::lock_guard lock(mutex);
     const auto it = latest.find(key);
     return it == latest.end() ? 0 : it->second;
+  }
+  Json markers() {
+    std::lock_guard lock(mutex);
+    Json events = Json::array();
+    for (const auto& [ssrc, time] : marker_events) events.push_back({ssrc, time});
+    return {{"events_ssrc_clock_ms", std::move(events)}, {"dropped", marker_events_dropped}};
   }
 };
 struct Track {
@@ -585,6 +601,7 @@ struct Track {
 class Receiver {
  public:
   explicit Receiver(const Options& options) : options_(options) {
+    arrivals_->trace_markers = options.trace_dtls_headers;
     pipeline_ = gst_pipeline_new("native-receiver");
     peer_ = gst_element_factory_make("webrtcbin", "peer");
     if (!peer_) { gst_object_unref(pipeline_); pipeline_ = nullptr; throw std::runtime_error("webrtcbin unavailable"); }
@@ -727,7 +744,7 @@ class Receiver {
     Json tracks = Json::array();
     std::lock_guard lock(mutex_);
     for (auto& track : tracks_) tracks.push_back(track->json());
-    return {{"tracks", tracks}, {"selected_pair", selected_pair_}, {"selected_pair_changes", pair_changes_},
+    return {{"tracks", tracks}, {"jitter_input_markers", arrivals_->markers()}, {"selected_pair", selected_pair_}, {"selected_pair_changes", pair_changes_},
       {"surface_budget", {{"consumer_queue_slots",options_.display?1:0},{"appsink_slots",1},{"consumer_held_slots",1},
           {"display_queue_slots",options_.display?1:0},{"decoder_reference_surfaces",nullptr},
           {"gpu_inflight_surfaces",nullptr},{"pool_capacity",nullptr},{"verified",false},
