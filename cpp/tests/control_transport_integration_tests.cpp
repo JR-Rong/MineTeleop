@@ -132,6 +132,7 @@ struct Fixture {
   std::unique_ptr<NativeControlPublication> native_publication;
   bool use_native_courier{false};
   bool mock_dual{false};
+  bool delay_wss_results{true};
   bool wss_dc_peer{false};
   bool drop_dc_commands{false};
   bool drop_wss_commands{false};
@@ -433,7 +434,7 @@ struct Fixture {
       // actual vehicle result is slower than the simulated DC byte path.
       if (!dropped && result.is_object()) {
         if (feedback_enabled) route_feedback(result, payload);
-        else delayed.emplace_back(steady() + 60, std::move(result));
+        else delayed.emplace_back(steady() + (delay_wss_results ? 60 : 0), std::move(result));
         if (mock_dual) max_delayed_results = std::max(max_delayed_results, delayed.size());
       }
     }
@@ -493,6 +494,11 @@ struct Fixture {
 };
 void mock_dual_control_survives_direct_packet_loss() {
   Fixture fixture(false, false, true, "p2p_preferred", true);
+  // This test exercises delivery via a fresh WSS copy when the DC copy is
+  // lost. A fixed artificial delay plus CI scheduling can exceed the real
+  // 200 ms safety bound, for which the correct behavior is to withdraw input;
+  // late-ACK withdrawal is exercised separately by native-control-ack tests.
+  fixture.delay_wss_results = false;
   fixture.dc_network_path = "p2p";
   fixture.use_native_courier = true;
   auto deadline = steady() + 8000;
