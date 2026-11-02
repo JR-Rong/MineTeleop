@@ -51,7 +51,7 @@ PRELUDE = r'''
 #include "mine_teleop/detail/ice_diagnostics.hpp"
 namespace detail { using mine_teleop::detail::ice_candidate_summary; using mine_teleop::detail::ice_direct_sdp; }
 using Json=nlohmann::json;
-namespace detail { constexpr std::string_view kControlTransportCapability="native-control-transport-v1"; constexpr std::string_view kEmergencyStopCapability="native-stop-only-v1"; constexpr std::string_view kFeedbackTransportCapability="native-feedback-transport-v1"; constexpr std::string_view kMockCompactControl="mock-compact-control-cbor-v1"; constexpr std::string_view kMockCompactDualControl="mock-compact-dual-control-cbor-v2"; constexpr std::string_view kMockDualControlCapability="mock-dual-control-v1"; }
+namespace detail { constexpr std::string_view kControlTransportCapability="native-control-transport-v1"; constexpr std::string_view kEmergencyStopCapability="native-stop-only-v1"; constexpr std::string_view kFeedbackTransportCapability="native-feedback-transport-v1"; constexpr std::string_view kMockCompactControl="mock-compact-control-cbor-v1"; constexpr std::string_view kMockCompactDualControl="mock-compact-dual-control-cbor-v2"; constexpr std::string_view kMockDualControlCapability="mock-dual-control-v1"; constexpr std::string_view kMockWssDcMirrorCapability="mock-wss-dc-mirror-v1"; }
 using namespace std::chrono_literals;
 enum class VideoCodec {H264,H265};
 const char* to_string(VideoCodec value){return value==VideoCodec::H264?"h264":"h265";}
