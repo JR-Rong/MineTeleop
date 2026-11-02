@@ -768,3 +768,126 @@ p99 was 57 ms and max 417 ms. The two receiver matched-marker frame-gap
 maxima were approximately 514 and 524 ms, although the recorded braking
 cause was control link. These observations do not establish that a particular
 video packet or command caused the wait. Evidence: `ui-compact-44-d07-6193`.
+
+Attempt 45 stopped after 480.12 seconds on a control-link wait. Of 80 input
+windows, 79 matched; the final reverse-right window was interrupted, and
+eight brake windows contained nonzero requests. Logical control used DC in
+473 samples and WSS in five; the media pair remained direct. WSS delivered
+234 accepted copies first and DC 9,004. Accepted-result RTT p99 was 58 ms
+and max 91 ms; missing or rejected results are excluded. Evidence:
+`ui-compact-45-d07-6193`.
+
+Attempt 46 used Windows `d07ea8e` and Orin `6ac2236` and stopped after 66.64
+seconds on a critical-video wait. All 11 input windows matched, including one
+nonzero brake window; all 67 sampled logical paths were DC and WSS delivered
+34 accepted copies first. The sender ICE-sink probe observed both RTP sources
+with maximum marker gaps of 46 and 54 ms and last-marker ages of 9 and 11 ms
+at the vehicle wait. At the client withdrawal, the corresponding receiver
+ICE-source markers were approximately 557 and 551 ms old, with no diagnostic
+source or marker drops. The client withdrawal and vehicle wait wall times
+were about 20 ms apart, subject to host clock uncertainty. This bounds the
+observed frame-ending-marker interruption to after sender ICE-sink entry and
+before receiver ICE-source observation. It does not prove socket delivery,
+that all RTP packets were lost, or which OS stack or network segment delayed
+them. Evidence: `ui-compact-46-d07-6ac`.
+
+Attempt 47 used Windows `d07ea8e` and Orin `6ac2236`; it stopped after
+1,500.15 seconds on a control-link wait. Of 250 input windows, 249 matched;
+the final reverse-left window was interrupted, and 27 brake windows contained
+nonzero requests. The selected media pair remained direct; logical control
+was DC in 1,487 samples and WSS in five. Accepted copies arrived first over
+DC 28,273 times and WSS 835 times. Accepted-result RTT p99 was 57 ms and max
+86 ms, excluding missing or rejected results. This window failed the
+30-minute uninterrupted-control acceptance. Evidence:
+`ui-compact-47-d07-6ac`.
+
+Attempt 48 used Windows and Orin `6ac2236`; it stopped after 187.94 seconds on
+a critical-video wait. All 31 input windows matched, including three nonzero
+brake windows; all 187 sampled logical paths were DC, and WSS delivered 86
+accepted copies first. Sender ICE-sink marker maximum gaps were 54 and 44 ms,
+while the corresponding last receiver ICE-source markers preceded withdrawal
+by approximately 559 ms. This repeats the attempt-46 boundary, but does not
+identify the responsible network segment or prove kernel packet delivery.
+Post-stop frame-gap maxima include pipeline teardown and are not presented as
+measurement-window latency. Evidence: `ui-compact-48-6ac-6ac`.
+
+Attempt 49 used Windows and Orin `6ac2236` and stopped after 421.89 seconds on
+a critical-video wait. All 70 input windows matched, including seven nonzero
+brake windows; all 420 sampled logical paths were DC and WSS delivered 190
+accepted copies first. Sender ICE-sink marker maximum gaps were 52 and 48 ms;
+receiver ICE-source markers were last observed approximately 504 and 551 ms
+before withdrawal. No diagnostic source or marker drops were recorded. This
+again constrains the observation to the interval between those probes, not a
+specific network segment or kernel packet-delivery result. Evidence:
+`ui-compact-49-6ac-6ac`.
+
+Attempt 50 used Windows and Orin `6ac2236`, stopping after 205.12 seconds on
+a control-link wait. All 34 input windows matched, including three nonzero
+brake windows; all 204 sampled logical paths were DC, while WSS delivered 100
+accepted copies first. The Windows gateway probe timed out at 400 ms near
+the wait and adjacent samples were 2--4 ms. The two recorded receiver frame
+marker gaps reached approximately 580 ms. Of 273 sender DTLS records in the
+surrounding window, 266 matched unambiguously at the vehicle kernel; eight
+approximate corrected delays exceeded 100 ms, with a maximum of 332 ms. The
+records are encrypted and cannot be assigned to specific control commands;
+the correlation does not identify the entire cause. Evidence:
+`ui-compact-50-6ac-6ac`.
+
+Attempt 51 used Windows and Orin `6ac2236`; it stopped after 54.15 seconds on
+a critical-video wait. All nine input windows matched, including one nonzero
+brake window; all 54 sampled logical paths were DC and WSS delivered 15
+accepted copies first. Sender ICE-sink marker maximum gaps were 44 and 45 ms;
+receiver ICE-source markers were last observed approximately 556 ms before
+withdrawal. Neither bounded trace reported drops. Maximum post-stop frame-gap
+statistics include teardown and are not treated as measurement latency.
+Evidence: `ui-compact-51-6ac-6ac`.
+
+Attempt 52 used Windows and Orin `6ac2236`; it stopped after 90.62 seconds on
+a critical-video wait. Of 15 input windows, 14 matched; the final forward-right
+window was interrupted, and one brake window contained a nonzero request.
+All 90 sampled logical paths were DC; WSS delivered 56 accepted copies first.
+Post-stop frame-gap maxima include teardown. Evidence: `ui-compact-52-6ac-6ac`.
+
+Attempt 53 used Windows and Orin `6ac2236` and stopped after 96.60 seconds on
+a control-link wait. All 16 input windows matched, including one nonzero
+brake window. Logical control was DC in 94 samples and WSS in two, while the
+selected media pair remained direct; WSS delivered 54 accepted copies first.
+The application DTLS trace reported one drop, so no packet-loss conclusion is
+drawn from that trace. Evidence: `ui-compact-53-6ac-6ac`.
+
+Attempt 54 used Windows and Orin `6ac2236` and stopped after 7.11 seconds on
+a critical-video wait. The only scheduled input window matched; all eight
+sampled logical paths were DC and WSS delivered five accepted copies first.
+The optional Linux AF_PACKET SOCK_DGRAM capture was filtered to outbound RTP
+frame-ending headers between the two test IPv6 addresses and recorded metadata
+only, never payload. Around the vehicle wait (approximately +/- 1 second), it
+observed 60 markers per stream, with maximum gaps 39.8 and 37.4 ms. The
+corresponding Windows ICE-source markers were approximately 516 ms old at
+withdrawal. The packet socket and bounded trace reported no drops. AF_PACKET
+outgoing observation precedes confirmed NIC transmission; this narrows the
+interval to after that tap and before the Windows ICE source, and does not
+prove packet delivery or isolate either host or any network segment. Evidence:
+`ui-compact-54-6ac-6ac`.
+
+Attempt 55 used Windows and Orin `6ac2236` and stopped after 1,585.31 seconds
+on a control-link wait. All 264 input windows matched, including 29 nonzero
+brake windows. Logical control was DC in 1,574 samples and WSS in three; the
+selected media pair remained direct. WSS delivered 792 accepted copies first
+and DC 30,014. Accepted-result RTT p99 was 60 ms and max 363 ms, excluding
+missing or rejected results. Around the wait the Windows gateway probe rose
+to 222 ms and then timed out at 400 ms; adjacent probes were 2--3 ms. Of 377
+unambiguously matched encrypted DTLS records in the surrounding window, 23
+had approximate corrected delays over 100 ms and the maximum was 350 ms.
+The RTP kernel metadata capture reported zero socket or limit drops. These
+observations correlate but cannot attribute individual encrypted control
+commands or identify the sole faulty segment. Evidence:
+`ui-compact-55-6ac-6ac`.
+
+Attempt 56 used Windows and Orin `6ac2236`; it stopped after 1,044.35 seconds
+on a control-link wait. All 174 input windows matched, including 19 nonzero
+brake windows. The complete logs show multiple control-link braking waits
+and two client safety-stop episodes. The selected media pair remained direct;
+logical control was DC in 1,036 observations and WSS in three. Accepted
+copies arrived first via DC 19,873 times and WSS 448 times. Accepted-result
+RTT p99 was 62 ms and max 500 ms, excluding missing or rejected results.
+Evidence: `ui-compact-56-6ac-6ac`.
