@@ -338,6 +338,7 @@ struct Window {
       dc_send_trace = Json::array(); dc_send_trace_dropped = 0;
     };
     std::unique_ptr<detail::NativeControlCourier> courier;
+    std::uint64_t mirrored_media_received = 0, mirrored_media_ready_after = 0;
     auto* channel = receiver.control_channel();
     if (!channel || !render->health) throw std::runtime_error("mock control requires scoped channel and critical video");
     // The input lease must not wait for signaling or the transport bridge.
@@ -691,11 +692,12 @@ struct Window {
             const auto envelope = Json::parse(*bytes, nullptr, false);
             if (envelope.is_object() && envelope.value("event", "") == "mock_media_status_v1") {
               if (direct_udp) {
+                ++mirrored_media_received;
                 const auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
-                static_cast<void>(gate->observe(envelope.value("status", Json::object()),
+                if (gate->observe(envelope.value("status", Json::object()),
                     static_cast<std::int64_t>(bench_now_ms()), wall_ms + sync.value("offset_ms", std::int64_t{0}),
-                    clock_ok ? sync.value("uncertainty_ms", std::int64_t{999}) : 999));
+                    clock_ok ? sync.value("uncertainty_ms", std::int64_t{999}) : 999)) ++mirrored_media_ready_after;
               }
               continue;
             }
@@ -932,6 +934,8 @@ struct Window {
         const Json evidence{{"event", "native_mock_observation"}, {"monotonic_ms", now_ms},
             {"video_ready", video_health.ready}, {"remote_media_ready", gate->ready(now_ms)},
             {"remote_media_reason", gate->reason(now_ms)},
+            {"mock_mirrored_media_received", mirrored_media_received},
+            {"mock_mirrored_media_ready_after", mirrored_media_ready_after},
             {"focused", focused}, {"clock_ready", clock_ok}, {"clock_uncertainty_ms", sync.value("uncertainty_ms", -1)},
             {"sctp_direct_udp", channel->direct_udp(mock_local_ip, mock_peer_ip)}, {"control_path", transport.value("path", "unknown")},
             {"mock_dual_control", transport.value("mock_dual_control", false)},

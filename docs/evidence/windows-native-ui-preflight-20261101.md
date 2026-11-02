@@ -974,3 +974,26 @@ withdrawal the last receiver markers and decoded frames were approximately
 not explain the later withdrawal. The outbound tap does not prove NIC
 transmission or identify the failing network segment. CAN remained down.
 Evidence: `ui-compact-65-6ac-6ac`.
+
+Attempt 66 used Windows and Orin `6ac2236` and stopped after 1,201.13 seconds
+on a vehicle control-link wait. Of 200 input windows, 199 matched; the final
+reverse window was interrupted, and 22 brake windows had nonzero requests.
+All selected media-pair samples remained direct; logical control was DC in
+1,190 samples and WSS in five. DC delivered 22,951 accepted copies first and
+WSS 365; accepted-result RTT p99 was 55 ms and max 451 ms, excluding missing
+and rejected results. Clock uncertainty was at most 14 ms and CAN remained
+down. This run did not meet the continuous 30-minute gate. Evidence:
+`ui-compact-66-6ac-6ac`.
+
+Attempt 67 used Windows and Orin `0e0617b` and stopped after 6.07 seconds on
+a critical-video wait. Its first forward input was interrupted; no brake
+window completed. All six sampled logical paths were DC, with 58 accepted
+copies arriving first via DC and 54 via WSS. Clock uncertainty was at most
+16 ms and CAN remained down. Around the vehicle wait (+/- 1 second), the
+outbound AF_PACKET tap saw 61 and 59 RTP markers with maximum gaps of 38.3 ms
+on both streams, while receiver markers and decoded frames were approximately
+508--513 ms old at client withdrawal. No socket capture drops were reported.
+The tap does not establish NIC transmission or identify the failing segment;
+the media-status mirror was not separately instrumented in this build, and
+the evidence does not establish whether it contributed to this failure.
+Evidence: `ui-compact-67-0e-0e`.
