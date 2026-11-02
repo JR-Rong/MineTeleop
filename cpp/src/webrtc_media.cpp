@@ -691,7 +691,7 @@ struct VehicleMediaRuntime::Impl {
     std::atomic<std::uint64_t> dropped{0};
     std::atomic<std::uint64_t> encoded_queue_backpressure{0};
     // Enabled only for traced, isolated mock runs; no RTP contents are kept.
-    std::atomic<std::uint64_t> mock_rtp_output_buffers{0};
+    std::atomic<std::uint64_t> mock_rtp_output_events{0};
     std::atomic<std::int64_t> mock_last_rtp_output_steady_ms{0};
     std::atomic<bool> source_sequence_valid{false};
     std::atomic<std::uint64_t> source_sequence{0};
@@ -3398,7 +3398,7 @@ struct VehicleMediaRuntime::Impl {
           {"captured_frames", lane->captured.load()}, {"encoded_frames", lane->encoded.load()},
             {"last_capture_age_ms", last_capture > 0 ? Json(std::max<std::int64_t>(0, sampled_at_monotonic_ms - last_capture)) : Json(nullptr)},
             {"last_encoded_age_ms", last_encoded > 0 ? Json(std::max<std::int64_t>(0, sampled_at_monotonic_ms - last_encoded)) : Json(nullptr)},
-            {"mock_rtp_output_buffers", lane->mock_rtp_output_buffers.load()},
+            {"mock_rtp_output_events", lane->mock_rtp_output_events.load()},
             {"mock_last_rtp_output_age_ms", last_mock_rtp > 0 ? Json(std::max<std::int64_t>(0, sampled_at_monotonic_ms - last_mock_rtp)) : Json(nullptr)},
             {"recovery_encoded_baseline", lane->video_wait_encoded_baseline.load()},
             {"encoded_queue_backpressure_count", lane->encoded_queue_backpressure.load()},
@@ -4245,7 +4245,7 @@ struct VehicleMediaRuntime::Impl {
         gst_pad_add_probe(rtp_src_pad, static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
             +[](GstPad*, GstPadProbeInfo*, gpointer data) -> GstPadProbeReturn {
               auto* current = static_cast<Lane*>(data);
-              current->mock_rtp_output_buffers.fetch_add(1, std::memory_order_relaxed);
+              current->mock_rtp_output_events.fetch_add(1, std::memory_order_relaxed);
               current->mock_last_rtp_output_steady_ms.store(steady_now_ms(), std::memory_order_relaxed);
               return GST_PAD_PROBE_OK;
             }, lane.get(), nullptr);

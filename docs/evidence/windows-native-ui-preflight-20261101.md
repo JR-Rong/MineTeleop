@@ -591,3 +591,12 @@ sender-to-kernel delays above 100 ms and a maximum of 334 ms. These concurrent
 observations do not locate all queueing to the Wi-Fi link. The 1,000 kbps
 trial did not eliminate the control-path interruption. Evidence:
 `ui-compact-28-a606-1000`.
+
+Attempt 29 returned to 1,500 kbps per camera and stopped after 192.90 seconds
+on a critical-video braking wait. The native diagnostic counted two stale
+track withdrawals; the last recorded decoded frame on each track preceded the
+withdrawal by approximately 508 and 542 ms. All 191 sampled paths were direct
+DC. Thirty-one of 32 scheduled input windows matched; the interrupted
+forward-left window had no local key sample or accepted intent, while three
+brake windows contained nonzero brake. This run failed uninterrupted-control
+acceptance. Evidence: `ui-compact-29-a606-1500`.
