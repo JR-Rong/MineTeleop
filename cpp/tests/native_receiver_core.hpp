@@ -7,6 +7,7 @@
 #include "mine_teleop/detail/gstreamer_decoder.hpp"
 #include "mine_teleop/detail/native_control_channel.hpp"
 #include "mine_teleop/detail/dtls_record_trace.hpp"
+#include "mine_teleop/detail/rtp_marker.hpp"
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/sdp/sdp.h>
@@ -392,15 +393,12 @@ struct ArrivalTimes {
   // nicesrc still carries SRTP: inspect only the clear RTP header, never payload.
   static void record_wire_buffer(ArrivalTimes& self, GstBuffer* buffer) {
     std::array<std::uint8_t, 12> header{};
-    if (!buffer || gst_buffer_extract(buffer, 0, header.data(), header.size()) != header.size() ||
-        (header[0] & 0xc0U) != 0x80U || (header[1] & 0x80U) == 0 ||
-        (header[1] >= 192U && header[1] <= 223U)) return;
-    const auto ssrc = (static_cast<std::uint32_t>(header[8]) << 24) |
-        (static_cast<std::uint32_t>(header[9]) << 16) |
-        (static_cast<std::uint32_t>(header[10]) << 8) | header[11];
+    if (!buffer || gst_buffer_extract(buffer, 0, header.data(), header.size()) != header.size()) return;
+    const auto ssrc = detail::rtp_marker_ssrc(header);
+    if (!ssrc) return;
     const auto now = bench_now_ms();
     std::lock_guard lock(self.mutex);
-    if (self.wire_marker_events.size() < 131072) self.wire_marker_events.emplace_back(ssrc, now);
+    if (self.wire_marker_events.size() < 131072) self.wire_marker_events.emplace_back(*ssrc, now);
     else ++self.wire_marker_events_dropped;
   }
   static GstPadProbeReturn record_wire(GstPad*, GstPadProbeInfo* info, gpointer data) {

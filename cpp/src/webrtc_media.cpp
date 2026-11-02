@@ -8,6 +8,7 @@
 #include "mine_teleop/detail/diagnostic_queue.hpp"
 #include "mine_teleop/detail/ice_diagnostics.hpp"
 #include "mine_teleop/detail/ice_route_policy.hpp"
+#include "mine_teleop/detail/gstreamer_rtp_marker.hpp"
 #include "mine_teleop/detail/gstreamer_ice_servers.hpp"
 #include <agent.h>
 
@@ -3385,6 +3386,7 @@ struct VehicleMediaRuntime::Impl {
     bool soft_brake_applied_this_transition = false;
     Json control_snapshot;
     Json critical_lanes;
+    Json mock_ice_output_markers = Json::object();
     std::int64_t sampled_at_monotonic_ms = 0;
     const auto sample_readiness = [&] {
       sampled_at_monotonic_ms = steady_now_ms();
@@ -3424,6 +3426,14 @@ struct VehicleMediaRuntime::Impl {
             {"failure_count", lane->failure_count.load()}, {"camera_faulted", lane->camera_faulted.load()},
             {"disabled", lane->disabled.load()}});
       }
+      const auto [ice_samples, ice_dropped] = mock_ice_marker_counters->snapshot();
+      auto ice_streams = Json::array();
+      for (const auto& sample : ice_samples) {
+        ice_streams.push_back({{"ssrc", sample.ssrc}, {"marker_events", sample.count},
+            {"last_marker_age_ms", sample.last_ms > 0 ? Json(std::max<std::int64_t>(0, sampled_at_monotonic_ms - sample.last_ms)) : Json(nullptr)},
+            {"max_marker_gap_ms", sample.max_gap_ms}});
+      }
+      mock_ice_output_markers = {{"streams", std::move(ice_streams)}, {"dropped_sources", ice_dropped}};
     };
     try {
       std::lock_guard lock(control_mutex);
@@ -3492,6 +3502,7 @@ struct VehicleMediaRuntime::Impl {
                {"time_sync", signaling.time_sync_status().to_json()},
                {"readiness_sampled_at_monotonic_ms", sampled_at_monotonic_ms},
                {"critical_lanes", std::move(critical_lanes)},
+               {"mock_ice_output_markers", std::move(mock_ice_output_markers)},
                {"control_snapshot", std::move(control_snapshot)},
                {"soft_brake_request_active", soft_brake_request_active},
                {"soft_brake_applied_this_transition", soft_brake_applied_this_transition},
@@ -4157,6 +4168,11 @@ struct VehicleMediaRuntime::Impl {
       auto* transport = pipeline;
       pipeline = gst_pipeline_new(nullptr);
       gst_bin_add(GST_BIN(pipeline), transport);
+    }
+    mock_ice_marker_counters->clear();
+    if (config.runtime.control_log_commands && config.vehicle_id.starts_with("test_bench_") &&
+        config.vehicle_adapter.type == "mock") {
+      detail::install_ice_output_marker_probe(pipeline, mock_ice_marker_counters);
     }
     webrtc = gst_bin_get_by_name(GST_BIN(pipeline), "webrtc");
     if (webrtc == nullptr) {
@@ -5582,6 +5598,7 @@ struct VehicleMediaRuntime::Impl {
   NiceAgent* ice_agent{nullptr};
   GstElement* pipeline{nullptr};
   GstElement* webrtc{nullptr};
+  const std::shared_ptr<detail::RtpMarkerCounters> mock_ice_marker_counters = std::make_shared<detail::RtpMarkerCounters>();
   detail::ControlTransportFence control_transport_fence;
   detail::DirectAuthorityLease direct_authority;
   bool direct_authority_stop_failed{false}; // control_mutex; terminal until new runtime/session setup

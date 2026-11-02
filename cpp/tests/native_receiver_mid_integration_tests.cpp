@@ -1,5 +1,6 @@
 // Synthetic two-camera WebRTC loopback: no device, signaling or vehicle control.
 #include "native_receiver_core.hpp"
+#include "mine_teleop/detail/gstreamer_rtp_marker.hpp"
 #include <gio/gnetworking.h>
 #include <gst/video/video.h>
 #include <set>
@@ -12,6 +13,8 @@ struct Sender {
   GstWebRTCDataChannel* channel{};
   std::atomic<bool> channel_open{false}, channel_received{false};
   std::mutex mutex;
+  std::shared_ptr<mine_teleop::detail::RtpMarkerCounters> ice_markers =
+      std::make_shared<mine_teleop::detail::RtpMarkerCounters>();
   std::deque<Json> candidates;
   Sender() {
     GError* error = nullptr;
@@ -25,6 +28,7 @@ struct Sender {
       "application/x-rtp,media=video,encoding-name=H264,payload=97,ssrc=(uint)1000000002 ! queue ! peer.", &error);
     if (error) { const std::string text = error->message; g_clear_error(&error); throw std::runtime_error(text); }
     require(pipeline != nullptr, "synthetic sender unavailable");
+    mine_teleop::detail::install_ice_output_marker_probe(pipeline, ice_markers);
     peer = gst_bin_get_by_name(GST_BIN(pipeline), "peer");
     require(peer != nullptr, "sender peer unavailable");
     GObject* ice = nullptr;
@@ -117,6 +121,18 @@ int main(int argc, char** argv) {
     require(header_events.at("events_ssrc_clock_ms").size() == 1 &&
             header_events.at("events_ssrc_clock_ms").at(0).at(0) == 0x12345678U,
             "ICE-source RTP marker classifier accepted a non-marker header");
+    mine_teleop::detail::RtpMarkerCounters counters;
+    counters.observe(1, 10); counters.observe(2, 11); counters.observe(1, 40);
+    const auto [samples, dropped] = counters.snapshot();
+    require(samples.size() == 2 && dropped == 0 && samples[0].count == 2 &&
+            samples[0].last_ms == 40 && samples[0].max_gap_ms == 30,
+            "bounded sender marker counters do not retain stream gaps");
+    for (std::uint32_t ssrc = 3; ssrc <= 17; ++ssrc) counters.observe(ssrc, 41);
+    require(counters.snapshot().first.size() == 16 && counters.snapshot().second == 1,
+            "sender marker counter exceeded its source limit");
+    counters.clear();
+    require(counters.snapshot().first.empty() && counters.snapshot().second == 0,
+            "sender marker counters were not reset for the next pipeline");
     const bool swap_identity = argc == 2 && std::string_view(argv[1]) == "--swap-identity";
     const bool software = argc == 2 && std::string_view(argv[1]) == "--software-frames";
     require(argc == 1 || swap_identity || software, "unknown fixture argument");
@@ -204,6 +220,12 @@ int main(int argc, char** argv) {
     require(wire.at("dropped") == 0 && (swap_identity ||
             (wire_sources.contains(1000000001U) && wire_sources.contains(1000000002U))),
             "synthetic streams did not produce bounded ICE-source marker observations");
+    const auto [sent_markers, sent_dropped] = sender.ice_markers->snapshot();
+    std::set<std::uint32_t> sent_sources;
+    for (const auto& sample : sent_markers) sent_sources.insert(sample.ssrc);
+    require(sent_dropped == 0 && (swap_identity ||
+            (sent_sources.contains(1000000001U) && sent_sources.contains(1000000002U))),
+            "synthetic streams did not produce bounded sender ICE-sink markers");
     require(swap_identity ? rejected_swap : passed, "two decoded tracks did not retain their negotiated camera identities");
     require(pair.is_object() && pair.value("local_address", "") == "127.0.0.1" &&
             pair.value("remote_address", "") == "127.0.0.1" && pair.value("local_transport", "") == "udp" &&

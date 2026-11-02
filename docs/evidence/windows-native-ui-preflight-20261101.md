@@ -731,3 +731,40 @@ approximately 523 ms before withdrawal, with no diagnostic marker drops. The
 accepted control-result RTT p99 was 62 ms and maximum 86 ms, so this is not
 proof that control packets or the entire Wi-Fi link stopped during the same
 interval. Evidence: `ui-compact-41-6a8-6193`.
+
+Attempt 42, using Windows `6a8fd48` and Orin `6193b9b`, completed 1,800.88
+seconds with no recorded client safety-stop episode or vehicle braking wait.
+All 300 scheduled input windows matched; the nine scenarios were represented
+and all 33 brake windows contained a nonzero request. All 1,791 sampled
+logical paths were DC and the selected pair was direct, but 1,660 accepted
+copies arrived over WSS first and 33,111 over DC first. Accepted-result RTT
+p50/p95/p99/max was 50/62/72/97 ms; excluded rejected or missing results
+are not represented in that distribution. Maximum sampled time uncertainty
+was 16 ms; CAN was DOWN. The Orin process required forced termination during
+post-window teardown, so the ended process code was -9; this was after the
+measurement and is not evidence of graceful shutdown. Values are zero-limited
+mock commands, not real-vehicle actuation. Earlier attempts failed, so this
+one successful window does not establish repeatable stability. Evidence:
+`ui-compact-42-6a8-6193`.
+
+Attempt 43 used Windows `d07ea8e` and stopped after 174.72 seconds on a
+critical-video wait. Of 29 input windows, 28 matched; the final reverse window
+was interrupted, and three brake windows contained nonzero requests. All 174
+sampled logical paths were DC; WSS delivered 64 accepted copies first. Both
+last ICE-source RTP frame-ending markers and jitter-input markers preceded the
+client withdrawal by approximately 559 ms; neither bounded probe dropped
+markers. At the vehicle wait, RTP payloader-output maximum gaps were 48 and
+42 ms, with latest events 30 and 32 ms old. Accepted-result RTT p99 was 67 ms
+and max 80 ms. This places the observed video marker gap before the ICE
+source callback and after the sender payloader probe; it does not distinguish
+sender WebRTC buffering, the network, or receiver socket delivery. It does
+not establish a complete absence of network packets. Evidence:
+`ui-compact-43-d07-6193`.
+
+Attempt 44 stopped after 66.36 seconds on a control-link wait; all 11 input
+windows matched, including one nonzero brake window. All 66 sampled logical
+paths were DC; WSS delivered 27 accepted copies first. Accepted-result RTT
+p99 was 57 ms and max 417 ms. The two receiver matched-marker frame-gap
+maxima were approximately 514 and 524 ms, although the recorded braking
+cause was control link. These observations do not establish that a particular
+video packet or command caused the wait. Evidence: `ui-compact-44-d07-6193`.
