@@ -4240,6 +4240,8 @@ struct VehicleMediaRuntime::Impl {
         return false;
       }
       isolate_bundled_rtp_lane_eos(rtp_src_pad, stop_requested);
+      lane->mock_rtp_output_events.store(0, std::memory_order_relaxed);
+      lane->mock_last_rtp_output_steady_ms.store(0, std::memory_order_relaxed);
       if (config.runtime.control_log_commands && config.vehicle_id.starts_with("test_bench_") &&
           config.vehicle_adapter.type == "mock") {
         gst_pad_add_probe(rtp_src_pad, static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
