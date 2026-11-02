@@ -997,3 +997,53 @@ The tap does not establish NIC transmission or identify the failing segment;
 the media-status mirror was not separately instrumented in this build, and
 the evidence does not establish whether it contributed to this failure.
 Evidence: `ui-compact-67-0e-0e`.
+
+Attempt 68 used Windows and Orin `0e0617b` and stopped after 271.03 seconds on
+a critical-video wait. All 45 input windows matched, including five with a
+nonzero brake request. All 269 sampled logical paths were DC; DC delivered
+5,096 accepted copies first and WSS 126. Clock uncertainty was at most 15 ms
+and CAN remained down. Around the vehicle wait (+/- 1 second), the outbound
+AF_PACKET tap saw 59 markers per stream with maximum gaps of 38.8 and 40.1 ms
+and no reported socket drops. The last receiver markers and decoded frames
+were approximately 517 ms old at initial client withdrawal. This identifies a
+boundary, not a specific failing network component. Evidence:
+`ui-compact-68-0e-0e`.
+
+Attempt 69 used Windows and Orin `0e0617b` and stopped after 1,530.97 seconds
+on a control-link wait. Of 255 input windows, 254 matched; the final left
+window was interrupted, and 28 brake windows had nonzero requests. Selected
+media-pair samples remained direct; logical control was DC in 1,520 samples
+and WSS in three. DC delivered 28,815 accepted copies first, WSS 819, and one
+accepted copy lacked carrier attribution. Accepted-result RTT p99 was 65 ms
+and max 532 ms, excluding missing and rejected results. Clock uncertainty was
+at most 15 ms and CAN remained down. The Orin process required forced
+termination during teardown after the failed window. Evidence:
+`ui-compact-69-0e-0e`.
+
+Attempt 70 used Windows `5dcf964` and the Orin `0e0617b` runtime (the vehicle
+source is identical between these commits). It stopped after 120.16 seconds
+on a control-link wait. All 20 input windows matched, including two nonzero
+brake windows. All sampled media pairs were direct; logical control was DC in
+118 observations and WSS in two. Clock uncertainty was at most 14 ms and CAN
+remained down. The new direct media-status mirror was observed: 118 messages
+were received by the end and the remote-media gate remained ready through the
+control-link stop. This validates delivery in this run, not recovery during a
+signaling outage. Near the wait, the vehicle received successive batches of
+DC and WSS copies after roughly 250--300 ms driver-to-callback delays; older
+commands were rejected as expired and the callback mutex wait was 0--1 ms.
+The observations do not identify the network segment causing the delay.
+Evidence: `ui-compact-70-5dc-0e`.
+
+Attempt 71 used Windows `5dcf964` and Orin `0e0617b` and stopped after
+522.47 seconds on a control-link wait. Of 87 input windows, 86 matched; the
+final forward-right window was interrupted, and nine brake windows had
+nonzero requests. All media-pair samples remained direct; logical control
+was DC in 516 observations and WSS in four. Clock uncertainty was at most
+16 ms and CAN remained down. The client received 411 mirrored media statuses,
+after which the counter stopped growing while WSS status still kept the remote
+media gate ready. Vehicle telemetry traces show DataChannel buffered bytes
+rising from zero to over 9 MB while full approximately 4.8 KB telemetry
+continued to be published. The mirror's sender explicitly skips a nonempty
+buffer; this is consistent with the observed counter stall, but its exact
+cause was not instrumented in this build. The Orin process required forced
+termination during teardown. Evidence: `ui-compact-71-5dc-0e`.

@@ -1,4 +1,5 @@
 #include "mine_teleop/detail/native_mock_media_gate.hpp"
+#include "mine_teleop/detail/mock_dc_backpressure.hpp"
 #include "mine_teleop/detail/native_mock_input_sequence.hpp"
 #include "mine_teleop/detail/native_mock_profile_retry.hpp"
 #include "mine_teleop/detail/native_mock_profile_state.hpp"
@@ -62,6 +63,23 @@ void test_mirrored_media_evidence() {
   auto missing = native_mock_media_evidence(status(19000, 7, 7));
   missing["lanes"][0].erase("send_waiting_idr");
   require(!gate.observe(missing, 9100, 19000, 25), "missing critical field admitted");
+}
+void test_mock_dc_backpressure_fails_closed() {
+  using namespace mine_teleop::detail;
+  const auto limit = kMockDcBackpressureBytes;
+  require(!mock_skip_dc_telemetry(true, true, limit - 1) && mock_skip_dc_telemetry(true, true, limit),
+          "telemetry backpressure boundary changed");
+  require(!mock_skip_dc_telemetry(false, true, limit) && !mock_skip_dc_telemetry(true, false, limit),
+          "telemetry copy dropped outside isolated mock or without WSS");
+  require(mock_skip_dc_result(true, true, true, "accepted", true, limit) &&
+          mock_skip_dc_result(true, true, false, "mock_dual_duplicate", true, limit),
+          "replaceable mock result not suppressed");
+  require(!mock_skip_dc_result(false, true, true, "accepted", true, limit) &&
+          !mock_skip_dc_result(true, false, true, "accepted", true, limit) &&
+          !mock_skip_dc_result(true, true, false, "transport_command_expired", true, limit) &&
+          !mock_skip_dc_result(true, true, true, "accepted", false, limit) &&
+          !mock_skip_dc_result(true, true, true, "accepted", true, limit - 1),
+          "critical, rejected or unmirrored result was suppressed");
 }
 void test_neutral_refresh_sequence() {
   mine_teleop::detail::NativeMockInputSequence sequence;
@@ -375,6 +393,6 @@ void test_mock_gamepad_neutral_and_profile_limits() {
   require(input.throttle == 0 && input.steering == 0, "zero mock limits produced nonzero motion intent");
 }
 }
-int main() { try { test_gate(); test_mirrored_media_evidence(); test_neutral_refresh_sequence(); test_profile_retry_stays_bounded_and_needs_live_guards(); test_profile_requires_new_manual_confirmation_after_invalidation(); test_mock_gear_confirmation_requires_forwarded_intent_and_new_feedback(); test_dtls_header_trace_is_bounded_and_excludes_payloads(); test_mock_keyboard_rearms_only_after_release(); test_vehicle_rearm_withdraws_motion_and_preserves_brake(); test_mock_direction_combinations_require_gear_confirmation(); test_live_clock_keyboard_and_media_guard(); test_mock_gamepad_neutral_and_profile_limits();
+int main() { try { test_gate(); test_mirrored_media_evidence(); test_mock_dc_backpressure_fails_closed(); test_neutral_refresh_sequence(); test_profile_retry_stays_bounded_and_needs_live_guards(); test_profile_requires_new_manual_confirmation_after_invalidation(); test_mock_gear_confirmation_requires_forwarded_intent_and_new_feedback(); test_dtls_header_trace_is_bounded_and_excludes_payloads(); test_mock_keyboard_rearms_only_after_release(); test_vehicle_rearm_withdraws_motion_and_preserves_brake(); test_mock_direction_combinations_require_gear_confirmation(); test_live_clock_keyboard_and_media_guard(); test_mock_gamepad_neutral_and_profile_limits();
   std::cout << "PASS scoped mock media, input renewal, keyboard and clock guard\n"; return 0; }
 catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; } }

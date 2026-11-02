@@ -2,6 +2,7 @@
 #include "mine_teleop/detail/control_transport.hpp"
 #include "mine_teleop/detail/mock_compact_control.hpp"
 #include "mine_teleop/detail/mock_compact_telemetry.hpp"
+#include "mine_teleop/detail/mock_dc_backpressure.hpp"
 #include "mine_teleop/detail/native_mock_media_gate.hpp"
 #include "mine_teleop/detail/direct_authority.hpp"
 #include "mine_teleop/detail/emergency_stop.hpp"
@@ -1740,8 +1741,19 @@ struct VehicleMediaRuntime::Impl {
           if (!native_feedback || mock_dual) wake_native_control_feedback();
         }
         if (native_feedback && via_wss) *native_feedback = result_message;
-        const bool dc_send_invoked = control_link_open && control_channel && via_dc &&
+        bool dc_send_invoked = control_link_open && control_channel && via_dc &&
             (transport != ControlMessageTransport::DataChannel || control_channel == channel);
+        bool dc_backpressure_skipped = false;
+        if (dc_send_invoked && mock_dual) {
+          guint64 buffered_bytes = 0;
+          g_object_get(control_channel, "buffered-amount", &buffered_bytes, nullptr);
+          const bool ordinary_command = !command.estop && !message.contains("emergency_stop") &&
+              !message.contains("feedback_request") && message.contains("control_transport") &&
+              message.at("control_transport").value("action", "") == "command";
+          dc_backpressure_skipped = detail::mock_skip_dc_result(mock_dual, via_wss,
+              result_message.value("accepted", false), result_message.value("reason", ""), ordinary_command, buffered_bytes);
+          if (dc_backpressure_skipped) dc_send_invoked = false;
+        }
         const auto dc_send_started = steady_now_ms();
         if (dc_send_invoked)
           gst_webrtc_data_channel_send_string(control_channel, result_message.dump().c_str());
@@ -1757,7 +1769,8 @@ struct VehicleMediaRuntime::Impl {
                 {"result_mutex_wait_ms", publish_lock_acquired - publish_started},
                 {"result_prepare_ms", dc_send_started - publish_lock_acquired},
                 {"dc_send_call_ms", publish_completed - dc_send_started},
-                {"dc_send_invoked", dc_send_invoked}, {"wss_mailbox_updated", via_wss}});
+                {"dc_send_invoked", dc_send_invoked}, {"dc_backpressure_skipped", dc_backpressure_skipped},
+                {"wss_mailbox_updated", via_wss}});
           } catch (...) { note_control_trace_drop(); }
         }
       }};
@@ -3092,15 +3105,19 @@ struct VehicleMediaRuntime::Impl {
     }
     if (control_channel != nullptr && control_link_open &&
         (!control_transport_fence.negotiated() || control_transport_fence.path() == detail::ControlPath::DataChannel)) {
-      gst_webrtc_data_channel_send_string(control_channel, message.dump().c_str());
       // The isolated mock can race the very same telemetry snapshot over the
       // authenticated signaling path. Keep its original identity, sequence and
       // source time; the receiver must not refresh health on duplicates.
-      if (mock_dual_control_enabled() && message.value("event", "") == "vehicle_telemetry" &&
+      const bool telemetry_mirror = mock_dual_control_enabled() && message.value("event", "") == "vehicle_telemetry" &&
           cloud_control_authority_live_locked() &&
           (!message.contains("session_id") || message.at("session_id") == signaling.session_id()) &&
           (!message.contains("vehicle_id") || message.at("vehicle_id") == config.vehicle_id) &&
-          (!message.contains("driver_id") || message.at("driver_id") == signaling.driver_id())) {
+          (!message.contains("driver_id") || message.at("driver_id") == signaling.driver_id());
+      guint64 buffered_bytes = 0;
+      if (telemetry_mirror) g_object_get(control_channel, "buffered-amount", &buffered_bytes, nullptr);
+      if (!detail::mock_skip_dc_telemetry(mock_dual_control_enabled(), telemetry_mirror, buffered_bytes))
+        gst_webrtc_data_channel_send_string(control_channel, message.dump().c_str());
+      if (telemetry_mirror) {
         pending_control_status["vehicle_telemetry"] = message;
         wake_native_control_feedback();
       }
