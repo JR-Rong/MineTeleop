@@ -104,7 +104,7 @@ jobs:
           & (Join-Path $PWD 'build/windows-control-x64/Release/mine-teleop-windows-viewer-observation-tests.exe')
           if ($LASTEXITCODE -ne 0) { throw 'native viewer observation test failed' }
           & (Join-Path $PWD 'build/windows-control-x64/Release/mine-teleop-native-control-channel-tests.exe')
-          if ($LASTEXITCODE -ne 0) { throw 'native DataChannel loopback test failed' }
+          if ($LASTEXITCODE -ne 0) { throw "native DataChannel loopback test failed: exit code $LASTEXITCODE" }
           & (Join-Path $PWD 'build/windows-control-x64/Release/mine-teleop-native-receiver-mid-integration-tests.exe')
           if ($LASTEXITCODE -ne 0) { throw 'native camera MID loopback test failed or required plugins are missing' }
           & (Join-Path $PWD 'build/windows-control-x64/Release/mine-teleop-native-receiver-mid-integration-tests.exe') --swap-identity

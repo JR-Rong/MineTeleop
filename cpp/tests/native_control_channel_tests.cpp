@@ -116,10 +116,12 @@ std::optional<std::vector<std::uint8_t>> compact_fixture(bool dual = false) {
 }
 }
 int main(int argc, char** argv) {
+  std::cerr << "DataChannel loopback: initializing GStreamer\n" << std::flush;
   gst_init(&argc, &argv);
   // libnice parses numeric addresses through getaddrinfo; on Windows this
   // must run after Winsock initialization even for 127.0.0.1.
   g_networking_init();
+  std::cerr << "DataChannel loopback: initializing peers\n" << std::flush;
   try {
     using mine_teleop::detail::native_direct_udp_candidate;
     require(native_direct_udp_candidate("host", "udp") && native_direct_udp_candidate("srflx", "UDP") &&
@@ -131,6 +133,7 @@ int main(int argc, char** argv) {
     catch (const std::invalid_argument&) { rejected_null = true; }
     require(rejected_null, "null peer must be rejected");
     Peer a, b;
+    std::cerr << "DataChannel loopback: peers initialized\n" << std::flush;
 #if GST_CHECK_VERSION(1, 22, 0)
     NativeControlChannel courier(b.rtc, {"fixture", 1, "attempt"});
     require(!courier.ready() && !courier.direct_udp() && !courier.send("before-open"), "unopened channel accepted send");

@@ -623,3 +623,17 @@ This single snapshot proves the diagnostics were connected and the packers
 were outputting near the vehicle's observation, but does not prove the
 packers were continuous during the prior receive-side gap. Evidence:
 `ui-compact-31-a606-6548`.
+
+Attempt 32 used Orin `6193b9b`, with a cumulative maximum interval between
+RTP payloader output events. It stopped after 294.56 seconds on a critical
+video wait; the native client counted two stale tracks and all 49 input
+windows matched, including five brake windows. Through the vehicle wait, the
+maximum payloader-output event gaps were 52 and 48 ms, and each last output
+was 11--16 ms old; the last accepted command was 47 ms old. The most recent
+receiver-local matched marker and decoded observations for each track were
+about 550 ms before the native withdrawal. The sender probe observes output
+from the payloader, not packet transmission; receiver marker records exist
+only for observations correlated through the receiver pipeline. This narrows
+the interruption to after sender payloader output and before fresh decoded
+frame evidence, without proving which queue, network segment or receiver
+component caused it. Evidence: `ui-compact-32-a606-6193`.
