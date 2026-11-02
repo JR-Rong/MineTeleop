@@ -1066,3 +1066,149 @@ was at most 16 ms and CAN remained down. The sampled send buffer peaked at
 2,190 bytes and the result backpressure counter remained zero; therefore this
 run did not exercise the new 32 KiB backpressure. Evidence:
 `ui-compact-73-5dc-18e`.
+
+Attempt 74 used Windows `5dcf964` and Orin `2736d4c` and stopped after
+1,716.59 seconds on a control-link wait. Of 286 input windows, 285 matched;
+the final reverse-left window was interrupted, and 31 brake windows had
+nonzero requests. All sampled media pairs were direct; logical control was DC
+in 1,703 observations and WSS in five. DC delivered 31,412 accepted command
+copies first and WSS 1,572. Clock uncertainty was at most 17 ms and CAN
+remained down. After only nine mirrored media-status messages reached the
+client, the vehicle DataChannel buffer continued to grow to 6,946,066 bytes,
+and 33,140 replaceable result copies were skipped due to backpressure.
+Control feedback then depended on the WSS path; ICE selection and the logical
+DC label alone do not prove a healthy reverse DataChannel. Evidence:
+`ui-compact-74-5dc-273`.
+
+Attempt 75 used Windows `5dcf964` and Orin `1277928` and stopped after
+1,110.33 seconds on a control-link wait. Of 185 input windows, 184 matched;
+the final forward-left window was interrupted, and 20 brake windows had
+nonzero requests. All sampled media pairs remained direct; logical control was
+DC in 1,101 samples and WSS in three. Clock uncertainty was at most 17 ms and
+CAN remained down. The sampled DataChannel buffer peaked at 2,190 bytes and
+none of the telemetry, VCU snapshot or result backpressure counters advanced;
+the large backlog was not reproduced, so this attempt does not validate the
+new snapshot backpressure. Around the wait, 372 unambiguously matched DTLS
+records yielded 13 approximate Windows-nicesink-to-Orin-kernel delays over
+100 ms, with a maximum of 465 ms; these are encrypted records, not individual
+commands, and host-clock uncertainty applies. One Windows Wi-Fi gateway ping
+timed out near the same event, with adjacent samples 2--4 ms. This
+correlation does not locate a single failing segment. Evidence:
+`ui-compact-75-5dc-127`.
+
+Attempt 76 used Windows `5dcf964` and Orin `1277928` and stopped after
+415.63 seconds. All 69 input windows matched, including seven nonzero brake
+windows; the vehicle logged two control-link waits. All 413 sampled logical
+paths and media pairs were DC/direct; DC delivered 7,933 accepted copies
+first and WSS 121. The sampled send buffer peaked at 2,187 bytes; none of the
+backpressure counters advanced. Around the first wait, 12 of 274 matched DTLS
+records had approximate Windows-nicesink-to-Orin-kernel delays over 100 ms,
+with a maximum of 322 ms. Gateway probes near the wait included 46 ms and a
+subsequent timeout; correlation does not isolate the failing segment. Clock
+uncertainty was at most 15 ms and CAN remained down. Evidence:
+`ui-compact-76-5dc-127`.
+
+Attempt 77 used Windows `5dcf964` and Orin `1277928` and stopped after
+1,638.45 seconds on a control-link wait. All 273 input windows matched,
+including 30 nonzero brake windows. All 1,630 sampled logical paths and
+media pairs were DC/direct; DC delivered 31,377 accepted copies first and WSS
+460. The sampled send buffer peaked at 2,190 bytes, with no backpressure
+counter increments. Of 246 matched encrypted DTLS records around the wait,
+five showed approximate Windows-nicesink-to-Orin-kernel delays over 100 ms,
+with maximum 333 ms. These measurements do not identify a failing network
+segment. Clock uncertainty was at most 17 ms and CAN remained down. Evidence:
+`ui-compact-77-5dc-127`.
+
+Attempt 78 used Windows `5dcf964` and Orin `1277928` and stopped after
+6.11 seconds. The vehicle recorded a critical-video wait followed by a
+control-link wait. The single forward input window matched; no brake window
+completed. All seven sampled logical paths and media pairs were DC/direct.
+The sampled send buffer was zero and no backpressure counters advanced.
+Clock uncertainty was at most 16 ms and CAN remained down. Evidence:
+`ui-compact-78-5dc-127`.
+
+Attempt 79 used Windows `5dcf964` and Orin `1277928` and stopped after
+852.76 seconds. The vehicle recorded two control-link waits; all 142 input
+windows matched, including 15 nonzero brake windows. All sampled media pairs
+were direct; logical control was DC in 846 observations and WSS in three.
+The send buffer peaked at 2,190 bytes and no backpressure counters advanced.
+Of 375 unambiguously matched encrypted DTLS records around the first wait,
+11 had approximate Windows-nicesink-to-Orin-kernel delay over 100 ms, with
+maximum 381 ms. This does not locate a failing network segment. Clock
+uncertainty was at most 17 ms and CAN remained down. Evidence:
+`ui-compact-79-5dc-127`.
+
+Attempt 80 used Windows `5dcf964` and Orin `1277928` and was interrupted after
+109.76 seconds when the native viewer lost foreground focus. Windows Terminal
+and ApplicationFrameHost appeared in the foreground-process trace. All 18
+input windows matched, including two nonzero brake windows; the vehicle then
+recorded a critical-video wait. This deliberately fail-closed focus withdrawal
+is not a 30-minute result and does not establish a network-path failure.
+Evidence: `ui-compact-80-5dc-127`.
+
+Attempt 81 used Windows `5dcf964` and Orin `1277928` and stopped after
+132.04 seconds on a control-link wait. All 22 input windows matched,
+including two nonzero brake windows. All media-pair samples were direct;
+logical control was DC in 130 observations and WSS in two. Clock uncertainty
+was at most 15 ms and CAN remained down. Evidence: `ui-compact-81-5dc-127`.
+
+Attempt 82 used Windows `5dcf964` and Orin `1277928` and stopped after
+156.37 seconds on a critical-video wait. All 26 input windows matched,
+including two nonzero brake windows. All 156 sampled logical paths and media
+pairs were DC/direct. Clock uncertainty was at most 15 ms and CAN remained
+down. Evidence: `ui-compact-82-5dc-127`.
+
+Attempt 83 used Windows `5dcf964` and Orin `1277928` and stopped after
+378.92 seconds. The vehicle logged a critical-video wait followed by a
+control-link wait. All 63 input windows matched, including seven nonzero
+brake windows; all 377 sampled logical paths and media pairs were DC/direct.
+The sampled send buffer peaked at 2,189 bytes and no backpressure counters
+advanced. Clock uncertainty was at most 16 ms and CAN remained down.
+Evidence: `ui-compact-83-5dc-127`.
+
+Attempt 84 used Windows `5dcf964` and Orin `1277928` and stopped after
+54.12 seconds on a critical-video wait. All nine input windows matched,
+including one nonzero brake window. All 54 sampled logical paths and media
+pairs were DC/direct. Clock uncertainty was at most 17 ms and CAN remained
+down. Evidence: `ui-compact-84-5dc-127`.
+
+Attempt 85 used Windows `5dcf964` and Orin `1277928` and stopped after
+612.67 seconds on a control-link wait. Of 102 input windows, 101 matched;
+the final left-input window was interrupted. Eleven nonzero brake windows
+completed. All sampled media pairs were direct; logical control was DC in
+604 observations and WSS in five. The sampled send buffer peaked at 2,190
+bytes, and no backpressure counters advanced. Around the wait, 57 of 393
+unambiguously matched encrypted DTLS records had approximate Windows-nicesink
+to Orin-kernel delay over 100 ms, with p95 276 ms and maximum 301 ms. These
+are encrypted records, not individual control commands, and do not identify
+the network segment responsible. Clock uncertainty was at most 15 ms and
+CAN remained down. Evidence: `ui-compact-85-5dc-127`.
+
+Attempt 86 used Windows `5dcf964` and Orin `1277928` and stopped after
+1,056.27 seconds with two control-link waits. All 176 input windows matched,
+including 19 nonzero brake windows. All sampled media pairs were direct;
+logical control was DC in 1,050 observations and WSS in one. The sampled send
+buffer peaked at 2,190 bytes and no backpressure counters advanced. Around
+the first wait, 10 of 333 unambiguously matched encrypted DTLS records had
+approximate Windows-nicesink-to-Orin-kernel delay over 100 ms, with maximum
+366 ms. These records do not identify the failing segment or individual
+commands. Clock uncertainty was at most 17 ms and CAN remained down.
+Evidence: `ui-compact-86-5dc-127`.
+
+Attempt 87 used Windows `5dcf964` and Orin `1277928` and ended after
+74.64 seconds because the native viewer lost foreground focus; Windows
+Terminal appeared in the foreground-process trace. All 12 input windows
+matched, including one nonzero brake window. The vehicle recorded a
+critical-video wait during withdrawal. This is not a 30-minute result and
+does not establish a network-path failure. Clock uncertainty was at most
+17 ms and CAN remained down. Evidence: `ui-compact-87-5dc-127`.
+
+Attempt 88 used Windows `5dcf964` and Orin `1277928` and stopped after
+60.15 seconds on a critical-video wait. All ten input windows matched,
+including one nonzero brake window; all 60 sampled media and logical control
+paths were direct/DC. The client guard recorded focus and UI-alive loss at
+the transition, and the foreground trace showed Windows Terminal taking
+focus. The two received-video frame gaps remained below 300 ms in the local
+receiver timing export. This event therefore cannot establish a network
+video failure independently of the focus withdrawal. Clock uncertainty was
+at most 16 ms and CAN remained down. Evidence: `ui-compact-88-5dc-127`.
