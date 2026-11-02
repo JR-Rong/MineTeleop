@@ -637,3 +637,15 @@ only for observations correlated through the receiver pipeline. This narrows
 the interruption to after sender payloader output and before fresh decoded
 frame evidence, without proving which queue, network segment or receiver
 component caused it. Evidence: `ui-compact-32-a606-6193`.
+
+Attempt 33 stopped after 492.17 seconds on a control-link wait, with the
+vehicle's last valid command 500 ms old at its snapshot. All 82 input windows
+matched, including nine brake windows. The logical path was DC in 489 of 490
+observations and WSS in one; the selected media pair stayed direct. The
+Windows gateway probe timed out at 400 ms near the wait, with adjacent
+samples around 2--13 ms. At the vehicle wait the cumulative RTP output event
+gap maxima were 54 and 46 ms. In the surrounding seven seconds, 323 encrypted
+DTLS records matched unambiguously, eight approximate corrected delays were
+over 100 ms and the maximum was 353 ms. These observations cannot identify an
+individual command or conclusively assign all delay to Wi-Fi. Evidence:
+`ui-compact-33-a606-6193`.

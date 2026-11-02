@@ -137,7 +137,15 @@ int main(int argc, char** argv) {
 #if GST_CHECK_VERSION(1, 22, 0)
     NativeControlChannel courier(b.rtc, {"fixture", 1, "attempt"});
     require(!courier.ready() && !courier.direct_udp() && !courier.send("before-open"), "unopened channel accepted send");
-    a.start(true); b.start(false); a.describe(b, true); b.describe(a, false);
+    std::cerr << "DataChannel loopback: courier ready for negotiation\n" << std::flush;
+    a.start(true);
+    std::cerr << "DataChannel loopback: initiator started\n" << std::flush;
+    b.start(false);
+    std::cerr << "DataChannel loopback: responder started\n" << std::flush;
+    a.describe(b, true);
+    std::cerr << "DataChannel loopback: offer applied\n" << std::flush;
+    b.describe(a, false);
+    std::cerr << "DataChannel loopback: answer applied\n" << std::flush;
     bool sent = false, delivered = false, responded = false;
     const auto deadline = std::chrono::steady_clock::now() + 15s;
     while (std::chrono::steady_clock::now() < deadline && !a.received) {
