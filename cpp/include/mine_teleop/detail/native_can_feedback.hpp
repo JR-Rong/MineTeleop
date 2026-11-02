@@ -100,8 +100,11 @@ inline std::wstring native_can_feedback_text(const nlohmann::json& feedback, boo
   for (std::size_t i = 0; i < 4; ++i)
     out << L"转向 " << i + 1 << L"：" << array("steering_angle_deg", "steering_valid", i, 1)
         << L"°，模式 " << array("steering_mode", "steering_valid", i) << L"\r\n";
-  out << L"驻车状态：" << parking_label(array("parking_brake_status", "parking_brake_valid", 0))
-      << L" / " << parking_label(array("parking_brake_status", "parking_brake_valid", 1));
+  out << L"驻车状态：";
+  for (std::size_t i = 0; i < 4; ++i) {
+    if (i != 0) out << L" / ";
+    out << parking_label(array("parking_brake_status", "parking_brake_valid", i));
+  }
   return out.str();
 }
 

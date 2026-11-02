@@ -19,6 +19,14 @@ int main() {
       throw std::runtime_error("valid drive gear was not displayed");
     if (native_can_feedback_text(input, false).find(L"12.30") != std::wstring::npos)
       throw std::runtime_error("stale telemetry retained CAN values");
+    auto parking = input;
+    parking["parking_brake_status"] = {0, 1, 2, 9};
+    parking["parking_brake_valid"] = {true, true, true, false};
+    if (native_can_feedback_text(parking, true).find(L"驻车状态：保持 / 释放 / 已拉起 / —") == std::wstring::npos)
+      throw std::runtime_error("four parking channels or their validity were not displayed");
+    parking["parking_brake_valid"][3] = true;
+    if (native_can_feedback_text(parking, true).find(L"驻车状态：保持 / 释放 / 已拉起 / 异常(9)") == std::wstring::npos)
+      throw std::runtime_error("fourth parking channel was not displayed");
     auto unsupported = input; unsupported["supported"] = false;
     if (native_can_feedback_text(unsupported, true).find(L"12.30") != std::wstring::npos)
       throw std::runtime_error("unsupported CAN displayed fabricated values");
