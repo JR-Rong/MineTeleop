@@ -138,6 +138,12 @@ Mock-only input trace batches also record the locally armed key mask and the
 intent sequence. Different key states receive different intent revisions even
 when zero limits produce identical commands; correlate those revisions with
 vehicle `receive_apply` records. The key mask is not sent to the vehicle.
+When command tracing is enabled, the mock viewer also exports the receiver's
+bounded RTP PTS arrival and decoded-frame observations after media stops. This
+allows receiver-local jitter-input and decode gaps to be compared without
+adding work to the live control path. These observations are not kernel packet
+arrival, camera capture time, or display scan-out, and the report omits ICE
+addresses.
 The render summary separates decoded-sample callback intervals, foreground
 submission intervals, and callback-to-submission time. These are local
 measurements; they do not establish capture-to-display or physical scan-out

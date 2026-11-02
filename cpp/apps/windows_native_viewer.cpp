@@ -1268,7 +1268,24 @@ struct Window {
           std::this_thread::sleep_for(10ms);
         }
         if (control_worker.joinable()) { control_worker.request_stop(); control_worker.join(); }
-        if (receiver) receiver->stop();
+        if (receiver) {
+          receiver->stop();
+          if (mock_control && config.control_trace_commands) {
+            // The receiver already records bounded PTS-correlated packet and
+            // decode observations. Export them only after stopping media, so
+            // diagnosis cannot add work to the live frame or control path.
+            // Do not export the selected-pair addresses from the full report.
+            try {
+              const auto report = receiver->report();
+              const Json timing{{"event", "native_mock_receiver_timing"},
+                  {"scope", "receiver-local jitter input and decoded PTS; not capture or scan-out"},
+                  {"tracks", report.at("tracks")}};
+              std::fprintf(stderr, "%s\n", timing.dump().c_str()); std::fflush(stderr);
+            } catch (...) {
+              std::fprintf(stderr, "native_mock_receiver_timing_unavailable\n"); std::fflush(stderr);
+            }
+          }
+        }
       } catch (...) {
         if (connected) { try { static_cast<void>(driver.end_session("native_viewer_error")); } catch (...) {} }
         throw;
