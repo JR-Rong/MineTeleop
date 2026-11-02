@@ -600,3 +600,26 @@ DC. Thirty-one of 32 scheduled input windows matched; the interrupted
 forward-left window had no local key sample or accepted intent, while three
 brake windows contained nonzero brake. This run failed uninterrupted-control
 acceptance. Evidence: `ui-compact-29-a606-1500`.
+
+Attempt 30 stopped after 1,272.70 seconds on a control-link braking wait.
+All 212 scheduled input windows matched, including 23 brake windows with
+nonzero brake. The selected media pair was direct in all 1,267 observations;
+four observations used WSS as the logical control path. Around the vehicle
+wait, a gateway probe reached 285 ms and the next timed out at 400 ms, with
+adjacent probes around 2--3 ms. All 371 unique matched DTLS records in the
+surrounding seven-second window were accounted for, with 19 approximate
+corrected sender-to-kernel delays above 100 ms and a maximum of 339 ms. This
+correlation does not identify the delay of an individual encrypted command
+or locate all queueing. Evidence: `ui-compact-30-a606-1500`.
+
+Attempt 31 used Windows `a60609e` and the first Orin build with mock RTP
+output diagnostics, `6548d7f`. It stopped after 96.73 seconds on a
+critical-video wait; all 96 sampled logical paths were DC and 15 of 16 input
+windows matched. At the vehicle's wait snapshot, the last RTP output event
+was 9 and 10 ms old for the two cameras; camera capture and encode snapshots
+were also fresh, and the last accepted command was 51 ms old. The client
+reported two stale-track events and no window-usability or clock faults.
+This single snapshot proves the diagnostics were connected and the packers
+were outputting near the vehicle's observation, but does not prove the
+packers were continuous during the prior receive-side gap. Evidence:
+`ui-compact-31-a606-6548`.

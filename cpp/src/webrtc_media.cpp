@@ -693,6 +693,7 @@ struct VehicleMediaRuntime::Impl {
     // Enabled only for traced, isolated mock runs; no RTP contents are kept.
     std::atomic<std::uint64_t> mock_rtp_output_events{0};
     std::atomic<std::int64_t> mock_last_rtp_output_steady_ms{0};
+    std::atomic<std::int64_t> mock_rtp_output_max_gap_ms{0};
     std::atomic<bool> source_sequence_valid{false};
     std::atomic<std::uint64_t> source_sequence{0};
     std::atomic<std::uint64_t> source_sequence_gap{0};
@@ -3400,6 +3401,7 @@ struct VehicleMediaRuntime::Impl {
             {"last_encoded_age_ms", last_encoded > 0 ? Json(std::max<std::int64_t>(0, sampled_at_monotonic_ms - last_encoded)) : Json(nullptr)},
             {"mock_rtp_output_events", lane->mock_rtp_output_events.load()},
             {"mock_last_rtp_output_age_ms", last_mock_rtp > 0 ? Json(std::max<std::int64_t>(0, sampled_at_monotonic_ms - last_mock_rtp)) : Json(nullptr)},
+            {"mock_rtp_output_max_gap_ms", lane->mock_rtp_output_max_gap_ms.load()},
             {"recovery_encoded_baseline", lane->video_wait_encoded_baseline.load()},
             {"encoded_queue_backpressure_count", lane->encoded_queue_backpressure.load()},
           {"send_freshness_scope", "capture_pts_to_send_queue_source_monotonic_not_network_delivery"},
@@ -4242,13 +4244,21 @@ struct VehicleMediaRuntime::Impl {
       isolate_bundled_rtp_lane_eos(rtp_src_pad, stop_requested);
       lane->mock_rtp_output_events.store(0, std::memory_order_relaxed);
       lane->mock_last_rtp_output_steady_ms.store(0, std::memory_order_relaxed);
+      lane->mock_rtp_output_max_gap_ms.store(0, std::memory_order_relaxed);
       if (config.runtime.control_log_commands && config.vehicle_id.starts_with("test_bench_") &&
           config.vehicle_adapter.type == "mock") {
         gst_pad_add_probe(rtp_src_pad, static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
             +[](GstPad*, GstPadProbeInfo*, gpointer data) -> GstPadProbeReturn {
               auto* current = static_cast<Lane*>(data);
               current->mock_rtp_output_events.fetch_add(1, std::memory_order_relaxed);
-              current->mock_last_rtp_output_steady_ms.store(steady_now_ms(), std::memory_order_relaxed);
+              const auto now = steady_now_ms();
+              const auto previous = current->mock_last_rtp_output_steady_ms.exchange(now, std::memory_order_relaxed);
+              if (previous > 0 && now >= previous) {
+                const auto gap = now - previous;
+                auto maximum = current->mock_rtp_output_max_gap_ms.load(std::memory_order_relaxed);
+                while (gap > maximum && !current->mock_rtp_output_max_gap_ms.compare_exchange_weak(
+                           maximum, gap, std::memory_order_relaxed)) {}
+              }
               return GST_PAD_PROBE_OK;
             }, lane.get(), nullptr);
       }
