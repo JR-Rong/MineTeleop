@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <string_view>
 
 namespace mine_teleop::detail {
 
@@ -15,10 +14,9 @@ inline bool mock_skip_dc_telemetry(bool isolated_mock, bool wss_copy_available,
 }
 
 inline bool mock_skip_dc_result(bool isolated_dual_mock, bool wss_copy_available,
-                                bool accepted, std::string_view reason, bool ordinary_command,
+                                bool accepted, bool ordinary_command,
                                 std::uint64_t buffered_bytes) {
-  const bool replaceable = accepted || reason == "mock_dual_duplicate";
-  return isolated_dual_mock && wss_copy_available && replaceable && ordinary_command &&
+  return isolated_dual_mock && wss_copy_available && accepted && ordinary_command &&
       buffered_bytes >= kMockDcBackpressureBytes;
 }
 

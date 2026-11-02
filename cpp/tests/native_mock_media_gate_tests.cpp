@@ -71,14 +71,12 @@ void test_mock_dc_backpressure_fails_closed() {
           "telemetry backpressure boundary changed");
   require(!mock_skip_dc_telemetry(false, true, limit) && !mock_skip_dc_telemetry(true, false, limit),
           "telemetry copy dropped outside isolated mock or without WSS");
-  require(mock_skip_dc_result(true, true, true, "accepted", true, limit) &&
-          mock_skip_dc_result(true, true, false, "mock_dual_duplicate", true, limit),
-          "replaceable mock result not suppressed");
-  require(!mock_skip_dc_result(false, true, true, "accepted", true, limit) &&
-          !mock_skip_dc_result(true, false, true, "accepted", true, limit) &&
-          !mock_skip_dc_result(true, true, false, "transport_command_expired", true, limit) &&
-          !mock_skip_dc_result(true, true, true, "accepted", false, limit) &&
-          !mock_skip_dc_result(true, true, true, "accepted", true, limit - 1),
+  require(mock_skip_dc_result(true, true, true, true, limit), "replaceable mock result not suppressed");
+  require(!mock_skip_dc_result(false, true, true, true, limit) &&
+          !mock_skip_dc_result(true, false, true, true, limit) &&
+          !mock_skip_dc_result(true, true, false, true, limit) &&
+          !mock_skip_dc_result(true, true, true, false, limit) &&
+          !mock_skip_dc_result(true, true, true, true, limit - 1),
           "critical, rejected or unmirrored result was suppressed");
 }
 void test_neutral_refresh_sequence() {

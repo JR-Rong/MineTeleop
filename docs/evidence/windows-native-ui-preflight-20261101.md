@@ -1047,3 +1047,12 @@ continued to be published. The mirror's sender explicitly skips a nonempty
 buffer; this is consistent with the observed counter stall, but its exact
 cause was not instrumented in this build. The Orin process required forced
 termination during teardown. Evidence: `ui-compact-71-5dc-0e`.
+
+Attempt 72 used Windows `5dcf964` and Orin `0e0617b` and stopped after
+379.99 seconds on a control-link wait. All 63 input windows matched,
+including seven nonzero brake windows. All 378 sampled logical paths were DC;
+DC delivered 7,182 accepted copies first and WSS 198. Clock uncertainty was
+at most 16 ms and CAN remained down. The sampled vehicle DataChannel buffer
+peaked at 2,189 bytes in this run, so the large backlog observed in attempt 71
+is not a necessary explanation for every stop. Evidence:
+`ui-compact-72-5dc-0e`.

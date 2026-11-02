@@ -1751,7 +1751,7 @@ struct VehicleMediaRuntime::Impl {
               !message.contains("feedback_request") && message.contains("control_transport") &&
               message.at("control_transport").value("action", "") == "command";
           dc_backpressure_skipped = detail::mock_skip_dc_result(mock_dual, via_wss,
-              result_message.value("accepted", false), result_message.value("reason", ""), ordinary_command, buffered_bytes);
+              result_message.value("accepted", false), ordinary_command, buffered_bytes);
           if (dc_backpressure_skipped) dc_send_invoked = false;
         }
         const auto dc_send_started = steady_now_ms();
