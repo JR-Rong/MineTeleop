@@ -5461,10 +5461,15 @@ struct VehicleMediaRuntime::Impl {
       errors.push_back(error);
       if (route_retry) {
         // A connected direct path can outlive the original short-lived TURN
-        // credentials. Fetch again only after the control-safe teardown.
-        check_stop();
-        ice_configuration = signaling.ice_servers();
-        check_stop();
+        // credentials. Fetch again only after the control-safe teardown. A
+        // transient signaling failure keeps the previous list rather than
+        // ending the runtime; a stop request still propagates.
+        auto [refreshed_ice, ice_refreshed] = detail::refresh_ice_configuration(
+            [this] { return signaling.ice_servers(); }, check_stop, ice_configuration);
+        if (!ice_refreshed)
+          emit_diagnostic("vehicle_ice_refresh_fallback", "ice_refresh_failed", "ice_configuration", "",
+              "Retrying with the previous ICE list; TURN credentials may be expired.", true);
+        ice_configuration = std::move(refreshed_ice);
         emit_diagnostic("vehicle_ice_relay_fallback", "ice_direct_fallback", "ice_connectivity", "",
             "A new Peer/negotiation is required; prior control readiness is not restored.", true,
             {{"fallback_count", ice_route_policy->fallbacks()}, {"next_mode", ice_route_policy->mode()}, {"safety_action", "control_closed_before_retry"}});

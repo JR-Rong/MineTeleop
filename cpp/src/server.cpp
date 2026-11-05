@@ -1806,9 +1806,10 @@ async function startFromOffer(offer){
   const offerCurrent=()=>epoch===mediaPeerEpoch&&sourceSession===nativeControlSessionId&&sourceGeneration===nativeControlSessionGeneration;
   if(refreshIce){
     let refreshed;
-    try{refreshed=await fetchIceServers()}catch(error){if(!offerCurrent())return;throw error}
+    try{refreshed=await controlLogic.refreshIceServersOrCached(fetchIceServers,iceServers,routeMode)}catch(error){if(!offerCurrent())return;throw error}
     if(!offerCurrent())return;
-    iceServers=refreshed;attemptIceServers=controlLogic.iceServersForMode(iceServers,routeMode);
+    if(!refreshed.refreshed)clientLog('webrtc_ice_refresh_fallback',{mode:routeMode,error:refreshed.error});
+    iceServers=refreshed.servers;attemptIceServers=controlLogic.iceServersForMode(iceServers,routeMode);
   }
   const nextPeer=new RTCPeerConnection({bundlePolicy:'max-bundle',iceServers:attemptIceServers,iceTransportPolicy:routeMode==='relay'?'relay':consoleConfig.ice_transport_policy});
   clientLog('webrtc_ice_route_attempt',{mode:routeMode,media_negotiation_id:nextScope.id,server_count:attemptIceServers.length});

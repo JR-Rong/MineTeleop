@@ -1,8 +1,11 @@
 #pragma once
 #include <cstdint>
+#include <exception>
+#include <nlohmann/json.hpp>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 namespace mine_teleop::detail {
 // One bounded direct attempt per runtime/session. The caller must tear down
@@ -34,4 +37,21 @@ class IceRoutePolicy {
   unsigned fallbacks_{0};
   std::optional<std::int64_t> answer_at_;
 };
+
+// Fallback attempts refresh short-lived TURN credentials. A transient
+// signaling failure keeps the previous configuration (its STUN entries still
+// work); a stop request always propagates.
+template <typename Fetch, typename Stop>
+inline std::pair<nlohmann::json, bool> refresh_ice_configuration(Fetch fetch, Stop check_stop,
+    const nlohmann::json& previous, int attempts = 3) {
+  for (int attempt = 0; attempt < attempts; ++attempt) {
+    check_stop();
+    try {
+      return {fetch(), true};
+    } catch (const std::exception&) {
+    }
+  }
+  check_stop();
+  return {previous, false};
+}
 }  // namespace mine_teleop::detail

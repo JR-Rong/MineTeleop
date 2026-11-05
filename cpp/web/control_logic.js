@@ -1428,6 +1428,18 @@
       .filter(url=>typeof url==='string' && (mode!=='direct'||!/^turns?:/i.test(url)))})).filter(server=>server.urls.length);
   }
 
+  // Renegotiation refreshes short-lived TURN credentials. A failed refresh keeps
+  // the cached list for direct/all attempts; a relay-only attempt cannot proceed.
+  async function refreshIceServersOrCached(fetchServers, cached, routeMode) {
+    try {
+      return {servers: await fetchServers(), refreshed: true};
+    } catch (error) {
+      if (routeMode === 'relay') throw error;
+      return {servers: Array.isArray(cached) ? cached : [], refreshed: false,
+        error: String(error && error.message || error)};
+    }
+  }
+
   function iceCandidateSummary(candidate) {
     const parts = String(candidate?.candidate || '').trim().split(/\s+/);
     const typeIndex = parts.indexOf('typ');
@@ -1802,6 +1814,7 @@
     iceCandidateSummary,
     iceAddressInfo,
     iceServersForMode,
+    refreshIceServersOrCached,
     iceNetworkPath,
     iceServerError,
     CONTROL_OUTCOMES,

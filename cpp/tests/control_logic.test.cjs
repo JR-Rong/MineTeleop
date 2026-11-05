@@ -2475,3 +2475,19 @@ test('ICE check summary covers truncated pairs and distinguishes absent counters
   assert.equal(path.requests_sent,43);assert.equal(path.responses_received,2);assert.equal(path.failed_pairs,1);
   assert.equal(result.pairs[1].responses_received,0);assert.equal(result.pairs[2].requests_sent,null);
 });
+
+test('renegotiation keeps cached ICE servers when the refresh fails outside relay mode', async () => {
+  const cached = [{urls: ['stun:cached.example']}];
+  const ok = await logic.refreshIceServersOrCached(async () => [{urls: ['turn:new.example']}], cached, 'all');
+  assert.deepEqual(ok, {servers: [{urls: ['turn:new.example']}], refreshed: true});
+  const fallback = await logic.refreshIceServersOrCached(async () => { throw new Error('offline'); }, cached, 'direct');
+  assert.equal(fallback.refreshed, false);
+  assert.deepEqual(fallback.servers, cached);
+  assert.equal(fallback.error, 'offline');
+  await assert.rejects(() => logic.refreshIceServersOrCached(async () => { throw new Error('offline'); }, cached, 'relay'), /offline/);
+});
+
+test('control page renegotiation uses the cached-ICE fallback helper', () => {
+  assert.match(controlPageSource, /controlLogic\.refreshIceServersOrCached\(fetchIceServers,iceServers,routeMode\)/);
+  assert.match(controlPageSource, /webrtc_ice_refresh_fallback/);
+});

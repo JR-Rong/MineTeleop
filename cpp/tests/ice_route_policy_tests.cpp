@@ -1,7 +1,9 @@
 #include "mine_teleop/detail/ice_route_policy.hpp"
 #include "mine_teleop/detail/ice_diagnostics.hpp"
 #include <iostream>
+#include <nlohmann/json.hpp>
 #include <stdexcept>
+#include <utility>
 using namespace mine_teleop::detail;
 void require(bool value, const char* why) { if (!value) throw std::runtime_error(why); }
 int main() {
@@ -34,6 +36,21 @@ int main() {
     const auto direct=ice_direct_sdp(sdp);
     require(direct.find("typ relay")==std::string::npos&&direct.find("typ host")!=std::string::npos&&direct.find("ice-ufrag:keep")!=std::string::npos,"direct filter damaged fences or IPv6 host");
     require(ice_has_turn({{"ice_servers",{{{"urls",{"stun:example.test","turn:example.test"}}}}}}),"mixed ICE URL list lost TURN");
+    int calls=0;
+    const nlohmann::json cached={{"ice_servers",{{{"urls",{"stun:cached.example"}}}}}};
+    const auto failed=refresh_ice_configuration([&]()->nlohmann::json{++calls;throw std::runtime_error("signaling down");},
+        []{},cached,3);
+    require(!failed.second&&failed.first==cached&&calls==3,"failed refresh did not keep the cached ICE list after bounded retries");
+    calls=0;
+    const auto refreshed=refresh_ice_configuration([&]()->nlohmann::json{
+          if(++calls<2) throw std::runtime_error("transient");
+          return {{"ice_servers",nlohmann::json::array()}};},
+        []{},cached,3);
+    require(refreshed.second&&refreshed.first.at("ice_servers").empty()&&calls==2,"retry did not adopt the refreshed list");
+    bool stopped=false;
+    try{static_cast<void>(refresh_ice_configuration([]()->nlohmann::json{return {};},
+        []{throw std::runtime_error("stop requested");},cached,3));}catch(const std::runtime_error&){stopped=true;}
+    require(stopped,"stop request was swallowed by the refresh helper");
     std::cout<<"PASS direct budget, connected/failed transitions, bounded fallback, dual-stack diagnostics and SDP fences\n";
     return 0;
   } catch(const std::exception& e) {std::cerr<<e.what()<<'\n';return 1;}
