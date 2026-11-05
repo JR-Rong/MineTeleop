@@ -4037,17 +4037,28 @@ struct VehicleMediaRuntime::Impl {
         {{"media_negotiation_id", state->negotiation_id}, {"pair", state->selected_pair}, {"changes", state->selected_pair_changes}});
   }
 
-  void observe_ice_agent() {
+  // Diagnostic only: the selected pair is never required to stream media.
+  // Upstream documents the libnice "agent" property as unsafe to rely on, so
+  // its absence must not fail the pipeline.
+  bool observe_ice_agent() {
     GObject* ice = nullptr;
     g_object_get(webrtc, "ice-agent", &ice, nullptr);
     if (ice) {
       if (g_object_class_find_property(G_OBJECT_GET_CLASS(ice), "agent")) g_object_get(ice, "agent", &ice_agent, nullptr);
       g_object_unref(ice);
     }
-    if (!ice_agent) throw std::runtime_error("libnice selected-pair observation unavailable");
+    if (!ice_agent) {
+      std::string negotiation;
+      { std::lock_guard lock(media_signal_state->mutex); negotiation = media_signal_state->negotiation_id; }
+      emit_diagnostic("vehicle_ice_selected_pair_unavailable", "ice_selected_pair_unavailable", "ice_connectivity", "",
+          "Media continues; selected-pair diagnostics are unavailable on this GStreamer build.", true,
+          {{"media_negotiation_id", negotiation}});
+      return false;
+    }
     auto* state = new std::shared_ptr<MediaSignalState>(media_signal_state);
     g_signal_connect_data(ice_agent, "new-selected-pair-full", G_CALLBACK(on_selected_ice_pair), state,
         +[](gpointer data, GClosure*) { delete static_cast<std::shared_ptr<MediaSignalState>*>(data); }, static_cast<GConnectFlags>(0));
+    return true;
   }
 
   void configure_ice_servers() {

@@ -317,6 +317,16 @@ def main():
     methods += section(source, "  static void on_ice_candidate(", "  static void on_control_channel_open(")
     methods += section(source, "  static void on_offer_created(", "  void emit_diagnostic(")
     methods += section(source, "  void flush_outgoing_signals()", "  void poll_bus()")
+    # Selected-pair observation is diagnostic only. Upstream documents the libnice
+    # "agent" property as unsafe to rely on, so its absence must never abort media.
+    observe = section(source, "  bool observe_ice_agent() {", "\n  }\n")
+    if "throw" in observe:
+        raise AssertionError("selected-pair observation must never abort the media pipeline")
+    if "vehicle_ice_selected_pair_unavailable" not in observe:
+        raise AssertionError("missing diagnostic when libnice selected-pair observation is unavailable")
+    call_site = section(source, "      configure_ice_servers();", "    } catch (const std::exception& error) {")
+    if "observe_ice_agent();" not in call_site:
+        raise AssertionError("ICE agent observation call site moved unexpectedly")
     unit = args.output / "actual-vehicle-methods-mock.cpp"
     definitions = "#define HAS_MEDIA_SCOPE_STATUS\n" if "media_scope_status()" in source else ""
     if args.race_only:
