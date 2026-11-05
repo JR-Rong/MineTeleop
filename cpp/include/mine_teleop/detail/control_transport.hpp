@@ -12,6 +12,11 @@ namespace mine_teleop::detail {
 inline constexpr std::string_view kControlTransportCapability = "native-control-transport-v1";
 inline constexpr std::string_view kMockDualControlCapability = "mock-dual-control-v1";
 inline constexpr std::string_view kMockWssDcMirrorCapability = "mock-wss-dc-mirror-v1";
+// Isolated zero-speed mock bench only. Removed together with the dual-path mock.
+inline bool isolated_mock_control_allowed(bool explicitly_enabled, std::string_view vehicle,
+                                          std::string_view adapter, double max_speed_kph) {
+  return explicitly_enabled && vehicle.starts_with("test_bench_") && adapter == "mock" && max_speed_kph == 0.0;
+}
 // The caller must verify the message MAC and independent control authority.
 // The signed attempt binds this mock-only extra carrier to the current peer.
 inline bool mock_wss_dc_mirror_allowed(bool enabled, std::string_view attempt, const Json& value) {

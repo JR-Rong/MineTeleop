@@ -1,7 +1,5 @@
 #include "mine_teleop/detail/control_transport.hpp"
 #include "mine_teleop/detail/control_transport_sender.hpp"
-#include "mine_teleop/detail/mock_compact_control.hpp"
-#include "mine_teleop/detail/mock_compact_telemetry.hpp"
 #include "control_time_fixture.hpp"
 #include "mine_teleop/server.hpp"
 
@@ -41,24 +39,6 @@ namespace {
 using namespace mine_teleop;
 using namespace mine_teleop::detail;
 void expect(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
-void mock_telemetry_summary_preserves_safety_fields() {
-  Json full = {{"event", "vehicle_telemetry"}, {"protocol_version", 1},
-      {"vehicle_id", "test_bench_001"}, {"driver_id", "driver"}, {"session_id", "session"},
-      {"seq", 42}, {"sent_at_utc_ms", 12345}, {"control_status_seq", 44},
-      {"safety_state", "CONTROL_ACTIVE"}, {"control_timing", {{"control_braking_wait", true},
-          {"driver_critical_video_ready", false}, {"rearm_required", true}, {"last_valid_control_age_ms", 201}}},
-      {"speed_mps", 0.0}, {"gear", "N"}, {"estop", false}, {"stop_source", ""},
-      {"stop_reason", ""}, {"stop_sequence", 0}, {"control_limits", {{"large", std::string(4000, 'x')}}}};
-  const auto compact = mock_compact_telemetry(full);
-  expect(compact && compact->at("mock_telemetry_summary") == true && compact->dump().size() <= 1200,
-      "mock telemetry summary was not bounded");
-  for (const auto* field : {"vehicle_id", "driver_id", "session_id", "seq", "sent_at_utc_ms",
-      "control_status_seq", "safety_state", "control_timing", "speed_mps", "gear", "estop",
-      "stop_source", "stop_reason", "stop_sequence"})
-    expect(compact->at(field) == full.at(field), "mock telemetry changed a safety or identity field");
-  full.erase("control_timing");
-  expect(!mock_compact_telemetry(full), "incomplete mock telemetry became a summary");
-}
 template<class F> void throws(F action) { bool failed = false; try { action(); } catch (const std::exception&) { failed = true; } expect(failed, "invalid protocol accepted"); }
 ControlCommand command(std::uint64_t seq, std::int64_t now) {
   ControlCommand value; value.vehicle_id = "vehicle-001"; value.driver_id = "driver-001";
@@ -226,59 +206,6 @@ Json response(const Json& frame, bool accepted = true, bool selected = false) {
       {"transport_admitted", true}, {"transport_selected", selected},
       {"authority_epoch", frame.contains("control_transport") ? frame.at("control_transport").at("epoch") : Json(0)},
       {"control_transport", frame.value("control_transport", Json(nullptr))}};
-}
-void compact_mock_wire_preserves_the_signed_command() {
-  expect(mock_compact_control_allowed(true, "test_bench_001", "mock", 0.0) &&
-      !mock_compact_control_allowed(false, "test_bench_001", "mock", 0.0) &&
-      !mock_compact_control_allowed(true, "test_bench_001", "can", 0.0) &&
-      !mock_compact_control_allowed(true, "test_bench_001", "mock", 1.0) &&
-      !mock_compact_control_allowed(true, "vehicle-001", "mock", 0.0),
-      "compact wire escaped the explicitly enabled zero-speed mock scope");
-  const std::string key = "01234567890123456789012345678901";
-  auto frame = payload(7, 123456789); frame["intent_requires_fresh_input"] = false;
-  frame["control_transport"] = stamp(3, 2, ControlPath::DataChannel, 5);
-  frame["native_mac"] = transport_message_mac(frame, key, false);
-  const MockCompactScope scope{"vehicle-001", "driver-001", "session-001", "fixture", "media-a"};
-  const auto bytes = encode_mock_compact_control(frame);
-  expect(bytes && bytes->size() < 150, "compact signed mock command did not fit the budget");
-  const auto decoded = decode_mock_compact_control(*bytes, scope);
-  expect(decoded && decoded->dump() == frame.dump() && verify_transport_message(*decoded, key, false),
-      "compact mock command changed the signed bytes");
-  auto dual = frame;
-  dual["mock_dual_control"] = kMockDualControlCapability;
-  dual["native_mac"] = transport_message_mac(dual, key, false);
-  expect(!encode_mock_compact_control(dual), "legacy compact capability accepted dual extension");
-  const auto dual_bytes = encode_mock_compact_control(dual, true);
-  expect(dual_bytes && dual_bytes->size() < 150, "negotiated compact dual command did not fit the budget");
-  const auto dual_decoded = decode_mock_compact_control(*dual_bytes, scope);
-  expect(dual_decoded && dual_decoded->dump() == dual.dump() && verify_transport_message(*dual_decoded, key, false),
-      "compact dual command changed the signed bytes");
-  for (std::size_t i = 0; i < dual_bytes->size(); ++i) {
-    auto changed = *dual_bytes; changed[i] ^= 1;
-    const auto tampered = decode_mock_compact_control(changed, scope);
-    expect(!tampered || !verify_transport_message(*tampered, key, false), "tampered compact dual command was authenticated");
-  }
-  auto unknown_dual = dual; unknown_dual["mock_dual_control"] = "unknown";
-  expect(!encode_mock_compact_control(unknown_dual, true), "unknown dual capability accepted");
-  for (std::size_t i = 0; i < bytes->size(); ++i) {
-    auto forged = *bytes; forged[i] ^= 1;
-    const auto tampered = decode_mock_compact_control(forged, scope);
-    expect(!tampered || !verify_transport_message(*tampered, key, false), "tampered compact command was authenticated");
-  }
-  auto other = scope; other.session = "session-other";
-  const auto replay = decode_mock_compact_control(*bytes, other);
-  expect(replay && !verify_transport_message(*replay, key, false), "compact command escaped its session");
-  auto forged = *bytes; forged.resize(4);
-  expect(!decode_mock_compact_control(forged, scope), "truncated compact command was decoded");
-  auto extra = frame; extra["unexpected_extension"] = 1;
-  expect(!encode_mock_compact_control(extra), "unknown signed field was silently discarded");
-  extra = dual; extra["unexpected_extension"] = 1;
-  expect(!encode_mock_compact_control(extra, true), "compact dual wire silently discarded an unknown signed field");
-  extra = frame; extra["control_transport"]["path"] = "wss";
-  expect(!encode_mock_compact_control(extra), "compact wire accepted a non-direct command");
-  extra["mock_wss_dc_mirror"] = kMockWssDcMirrorCapability;
-  extra["mock_wss_dc_attempt"] = "media-a";
-  expect(!encode_mock_compact_control(extra, true), "WSS-owned mirror lost its signed extension in compact encoding");
 }
 void late_dc_results_withdraw_publication_in_result_handler() {
   DriverConfig config; config.driver_id = "driver-001"; config.signaling_url = "http://127.0.0.1:1";
@@ -618,8 +545,6 @@ void real_service_switch_does_not_disable_watchdog() {
 }  // namespace
 int main() {
   try {
-    mock_telemetry_summary_preserves_safety_fields();
-    compact_mock_wire_preserves_the_signed_command();
     publication_is_owned_only_by_its_current_dc_epoch();
     late_dc_results_withdraw_publication_in_result_handler();
     failed_direct_trials_back_off_and_exhaust_per_attempt();
@@ -628,6 +553,6 @@ int main() {
     confirmed_profile_permits_only_one_new_bounded_dc_budget();
     version_scope_and_expiry(); single_receiver_epoch_replay_and_emergency(); explicit_dc_mirror_races_remain_fenced(); mirror_ingress_ack_never_advances_active_ack(); wss_owned_dc_mirror_preserves_epoch_and_freshness(); exact_result_and_neutral_qualification();
     slower_dc_and_lost_selection(); cloud_ingress_without_vehicle_result_can_only_start_a_neutral_trial(); healthy_proven_p2p_is_preferred_to_a_faster_cloud_backup(); signatures_bind_native_bytes_and_vehicle_results(); private_signing_material_is_not_public_session_state(); bounded_status_rejects_unsupported_kinds_and_scope_mismatch(); real_service_switch_does_not_disable_watchdog();
-    std::cout << "19 control transport cases passed; real common safety service, no sockets\n";
+    std::cout << "17 control transport cases passed; real common safety service, no sockets\n";
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

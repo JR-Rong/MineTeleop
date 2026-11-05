@@ -9,7 +9,6 @@
 #include "mine_teleop/detail/native_mock_keyboard.hpp"
 #include "mine_teleop/detail/native_can_feedback.hpp"
 #include "mine_teleop/detail/native_control_courier.hpp"
-#include "mine_teleop/detail/mock_compact_control.hpp"
 #include "mine_teleop/detail/native_viewer_observation.hpp"
 #include "mine_teleop/detail/native_operator_readouts.hpp"
 #include "mine_teleop/detail/native_identity_input.hpp"
@@ -305,7 +304,7 @@ struct Window {
                         const Json& session, const std::string& attempt,
                         const std::shared_ptr<RenderSession>& render,
                         const std::shared_ptr<detail::NativeMockMediaGate>& gate,
-                        bool compact_control, bool compact_dual, bool wss_dc_mirror,
+                        bool wss_dc_mirror,
                         std::stop_token parent, std::stop_token stop) {
     const std::string session_id = session.at("session_id").get<std::string>();
     const auto generation = session.at("control_session_generation").get<std::uint64_t>();
@@ -740,14 +739,13 @@ struct Window {
             [&](const std::string& bytes) {
               const auto started = static_cast<std::int64_t>(bench_now_ms());
               const auto frame = Json::parse(bytes, nullptr, false);
-              const auto compact = compact_control ? detail::encode_mock_compact_control(frame, compact_dual) : std::nullopt;
-              const bool queued = compact ? channel->send_mock_compact(*compact) : channel->send(bytes);
+              const bool queued = channel->send(bytes);
               if (config.control_trace_commands) {
                 if (frame.is_object() && frame.contains("seq") && frame.at("seq").is_number_unsigned()) {
                   if (dc_send_trace.size() < 128)
                     dc_send_trace.push_back({{"seq", frame.at("seq")}, {"started_monotonic_ms", started},
                         {"completed_monotonic_ms", static_cast<std::int64_t>(bench_now_ms())}, {"queued", queued},
-                        {"wire_format", compact ? "mock-cbor" : "json"}, {"wire_bytes", compact ? compact->size() : bytes.size()}});
+                        {"wire_format", "json"}, {"wire_bytes", bytes.size()}});
                   else ++dc_send_trace_dropped;
                 }
               }
@@ -1185,10 +1183,6 @@ struct Window {
               options.display = false;
               options.ice_servers = payload.value("ice_servers", ice);
               options.ice_route_mode = payload.value("ice_route_mode", "all");
-              const bool compact_control = mock_control &&
-                  payload.value("mock_compact_control", "") == detail::kMockCompactControl;
-              const bool compact_dual = compact_control &&
-                  payload.value("mock_compact_dual_control", "") == detail::kMockCompactDualControl;
               const bool wss_dc_mirror = mock_control &&
                   payload.value("mock_wss_dc_mirror", "") == detail::kMockWssDcMirrorCapability;
               if (mock_control) {
@@ -1218,9 +1212,9 @@ struct Window {
                 mock_gate = std::make_shared<detail::NativeMockMediaGate>(
                     session.at("session_id").get<std::string>(), vehicle.vehicle_id, negotiation, render->cameras);
                 auto* target = receiver.get();
-                control_worker = std::jthread([this, &driver, target, vehicle, config, session, negotiation, render, compact_control, compact_dual, wss_dc_mirror,
+                control_worker = std::jthread([this, &driver, target, vehicle, config, session, negotiation, render, wss_dc_mirror,
                                                 gate = mock_gate, stop_token](std::stop_token token) {
-                  try { run_mock_control(driver, *target, vehicle, config, session, negotiation, render, gate, compact_control, compact_dual, wss_dc_mirror, stop_token, token); }
+                  try { run_mock_control(driver, *target, vehicle, config, session, negotiation, render, gate, wss_dc_mirror, stop_token, token); }
                   catch (const std::exception& error) {
                     const std::string_view detail = error.what();
                     const char* category = detail.find("mock input worker failed") != std::string_view::npos ? "input_worker" :
