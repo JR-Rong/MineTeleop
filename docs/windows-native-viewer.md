@@ -104,32 +104,20 @@ was blank; a repeat displayed the expected layout, so a transient capture or
 paint issue is not ruled out. The earlier 30-minute mock result used a different
 viewer build and does not validate this UI change under live video load.
 
-An additional dual-control experiment requires the vehicle process to set
-`MINE_TELEOP_MOCK_DUAL_CONTROL=1`; the vehicle advertises it only for a
-`test_bench_` identity, mock adapter and zero speed. The mock native viewer
-then sends the same authenticated, sequenced command via its DC and the cloud
-WSS path while the logical control path is DC. With the separately negotiated
-`mock-wss-dc-mirror-v1` capability, a confirmed WSS epoch may also send the
-same signed command over the current DataChannel. The mirror cannot select an
-epoch, extend freshness or replace cloud authority, and is published only after
-the WSS send succeeds. Older peers retain WSS-only behavior after fallback.
-The receiver admits the first fresh copy and rejects duplicates and
-older commands without reapplying them or refreshing safety; an ingress ACK is
-not vehicle receipt. While the cloud authority is live, the same bounded
-vehicle telemetry snapshot is also offered over WSS; duplicate or delayed
-snapshots cannot advance the viewer's telemetry sequence or source time. A
-selected direct media path and all existing authority,
-video, input and clock gates remain required. The paths may share the same
-Wi-Fi and cellular links and cannot guarantee independence or bounded delay.
-This is an isolated experiment, not a production transport or safety claim.
+The earlier dual-path experiment (the same signed command sent over both the
+DataChannel and the cloud WSS path, DataChannel copies of vehicle telemetry and
+media status, and a compact CBOR command format) has been removed. Every mock
+command now travels only on the single selected path, and the comparison
+results recorded with that experiment are obsolete; see the notes at the top of
+the affected files in `docs/evidence/`.
 
-When the vehicle explicitly advertises the newer mock compact-dual capability,
-the native viewer can encode the signed dual-control extension in its compact
-DataChannel message. The vehicle reconstructs the exact original signed JSON
-before the existing MAC, session, sequence and freshness checks. With an older
-peer, an unknown extension or an unsupported format, the sender falls back to
-JSON. This capability is restricted to the existing isolated zero-speed mock;
-it does not alter the full telemetry format or authorize production use.
+Mock control is enabled only when the vehicle's own offer carries
+`isolated_mock_bench_capability: "isolated-mock-bench-v1"`. The vehicle
+advertises it only when its configuration is a `test_bench_` identity on the
+mock adapter with `max_speed_kph: 0` and `field_safety.commissioning_mode:
+bench`. Without it the viewer refuses to start control, and view-only mode
+remains available. A local YAML check is not evidence that the remote vehicle is
+isolated.
 
 With `logging.control_trace_commands` enabled, mock mode batches a bounded
 record of command sequence, local DataChannel enqueue start/end and outcome.

@@ -1,5 +1,8 @@
 # Windows / Orin 5G control follow-up, 2026-10-31
 
+> **Partly obsolete (2026-11-05):** Sections that use the compact CBOR format or DataChannel/WSS copies of commands, telemetry or media status describe features that have been removed from the code, and their comparisons no longer apply. The remaining sections are unaffected history.
+> **部分失效（2026-11-05）：** 使用紧凑 CBOR 格式，或 DC/WSS 命令、遥测、媒体状态副本的章节，对应功能已从代码中删除，其对比结论不再适用；其余章节仍是有效的历史记录。
+
 This is mock-only evidence. The Orin used two physical cameras and the mock
 adapter at zero configured speed. CAN remained down; its media route to the
 Windows WLAN endpoint used the cellular IPv6 interface. VPN settings and the

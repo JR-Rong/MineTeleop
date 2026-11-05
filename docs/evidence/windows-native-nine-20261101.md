@@ -1,5 +1,8 @@
 # Windows native nine-input mock tests, 2026-11-01
 
+> **Obsolete (2026-11-05):** This record compares runs that used the DataChannel/WSS control and telemetry copies, which have been removed from the code. Its comparison does not apply to the current implementation and is kept as history only.
+> **已失效（2026-11-05）：** 本记录对比的 DC/WSS 控制与遥测副本已从代码中删除，对比结论不适用于当前实现，仅作历史参考。
+
 These results are for an isolated `test_bench_` session with the mock adapter,
 CAN down, two cameras, zero speed, zero torque and zero steering limit. The
 Windows client used Wi-Fi; the Orin media route used its separate 5G IPv6

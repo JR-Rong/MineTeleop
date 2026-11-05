@@ -1,5 +1,8 @@
 # Windows / Orin 5G native compact-control and full-telemetry test
 
+> **Obsolete (2026-11-05):** This record describes the compact CBOR control and telemetry experiment, which has been removed from the code. Its results do not apply to the current implementation and are kept as history only.
+> **已失效（2026-11-05）：** 本记录对应的紧凑 CBOR 控制/遥测实验已从代码中删除，结论不适用于当前实现，仅作历史参考。
+
 This is one isolated mock-only window, not real-vehicle acceptance. Windows
 used Wi-Fi, Orin used its independently routed cellular IPv6 interface, and the
 native viewer checked the exact non-relay UDP endpoints. Two physical cameras
