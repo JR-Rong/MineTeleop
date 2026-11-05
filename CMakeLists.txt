@@ -498,6 +498,15 @@ if(MINE_TELEOP_BUILD_TESTS OR MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
   find_package(Python3 COMPONENTS Interpreter REQUIRED)
   add_test(NAME mine-teleop-native-mock-input-analysis-tests
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/native_mock_input_analyze.test.py)
+  # The bounded keep-alive server is a production behavior of the control client
+  # on every platform, so its regression must not be Windows-workflow-only.
+  if(TARGET mine-teleop-control)
+    add_test(NAME mine-teleop-control-http-keepalive-tests
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/control_http_keepalive.test.py"
+        $<TARGET_FILE:mine-teleop-control>)
+    set_tests_properties(mine-teleop-control-http-keepalive-tests PROPERTIES
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 60)
+  endif()
   if(TARGET mine-teleop-native-receiver-probe)
     add_test(NAME mine-teleop-native-control-channel-tests COMMAND mine-teleop-native-control-channel-tests)
     set_tests_properties(mine-teleop-native-control-channel-tests PROPERTIES TIMEOUT 30)
