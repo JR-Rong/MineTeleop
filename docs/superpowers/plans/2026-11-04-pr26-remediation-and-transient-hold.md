@@ -529,73 +529,13 @@ git add -A cpp CMakeLists.txt
 git commit -m "Remove the experimental DC/WSS mock mirror" -m "Co-Authored-By: Claude <noreply@anthropic.com>"
 ```
 
-## Task 8：删除 DC 媒体状态镜像，修复 mock 媒体门控的旧副本撤销（B4）
+## Task 8：恢复 mock 媒体门控的单载体形态（已改写，原为 B4 补丁）
 
-**Files:**
-- Modify: `cpp/src/webrtc_media.cpp`、`cpp/apps/windows_native_viewer.cpp`、`cpp/include/mine_teleop/detail/native_mock_media_gate.hpp`
-- Test: `cpp/tests/native_mock_media_gate_tests.cpp`
-
-- [ ] **Step 1：写失败的门控测试**
-
-在 `native_mock_media_gate_tests.cpp` 中加入（测试自带状态构造 lambda，不依赖文件中的其他辅助函数；`require` 使用文件已有的同名函数）：
-
-```cpp
-void stale_copy_does_not_revoke_newer_evidence() {
-  using mine_teleop::detail::NativeMockMediaGate;
-  NativeMockMediaGate gate("session-1", "test_bench_001", "media-a", {"front", "rear"});
-  const auto status = [](std::int64_t reported, std::uint64_t sample) {
-    return nlohmann::json{{"session_id", "session-1"}, {"vehicle_id", "test_bench_001"}, {"adapter_type", "mock"},
-        {"mock_control_diagnostic", false}, {"reported_at_utc_ms", reported},
-        {"media_negotiation", {{"id", "media-a"}, {"answer_applied", true}}},
-        {"time_sync", {{"synchronized", true}, {"uncertainty_ms", 10}}},
-        {"lanes", nlohmann::json::array({
-            {{"camera_id", "front"}, {"critical_for_control", true}, {"lane_state", "active"}, {"send_waiting_idr", false},
-             {"send_invalid_sample_blocked", false}, {"send_last_sample_id_ns", sample}, {"fresh_send_frames", sample}},
-            {{"camera_id", "rear"}, {"critical_for_control", true}, {"lane_state", "active"}, {"send_waiting_idr", false},
-             {"send_invalid_sample_blocked", false}, {"send_last_sample_id_ns", sample}, {"fresh_send_frames", sample}}})}};
-  };
-  require(!gate.observe(status(1000, 1), 10, 1000, 10), "first observation cannot prove advancing samples");
-  require(gate.observe(status(2000, 2), 20, 2000, 10), "advancing evidence not admitted");
-  // A late copy of an older status that was never validated (its other copy was skipped).
-  require(gate.observe(status(1500, 1), 30, 2010, 10), "stale copy revoked newer valid evidence");
-  require(gate.ready(30), "gate not ready after ignoring the stale copy");
-}
-```
-
-在 `main()` 中调用。
-
-- [ ] **Step 2：运行，确认失败**
-
-Run: Task 0 Step 2（`mine-teleop-native-mock-media-gate-tests`）。
-Expected: FAIL，`stale copy revoked newer valid evidence`。
-
-- [ ] **Step 3：修复门控**
-
-在 `NativeMockMediaGate::observe` 中，紧接着"重复副本"判断之后、`ready_ = false;` 之前插入：
-
-```cpp
-      // Strictly older evidence carries no new information; it can arrive late
-      // over a slower carrier. Ignore it instead of revoking newer evidence.
-      if (initialized_ && status.is_object() && status.contains("reported_at_utc_ms") &&
-          status.at("reported_at_utc_ms").is_number_integer() &&
-          status.at("reported_at_utc_ms").get<std::int64_t>() < last_reported_)
-        return ready_locked(monotonic_ms);
-```
-
-- [ ] **Step 4：删除 DC 媒体状态镜像**
-  - `webrtc_media.cpp`：删除运行循环中 `if (mock_dual_control_enabled()) { const auto payload = Json{{"event", "mock_media_status_v1"}, ...} }` 整块；删除 `#include "mine_teleop/detail/native_mock_media_gate.hpp"`。
-  - `windows_native_viewer.cpp`：courier 的 `receive` lambda 中删除 `mock_media_status_v1` 的识别和 `gate->observe(...)` 分支，直接 `return channel->pop();`；删除 `mirrored_media_received`、`mirrored_media_ready_after` 两个计数器及其在 evidence 中的输出。门控继续由 WSS 的 `media_status`（`windows_native_viewer.cpp` 约 1249 行）驱动。
-- [ ] **Step 5：运行**
-
-Run: 本部分开头的 grep → 无输出；Task 0 Step 2。
-Expected：全部通过。
-
-- [ ] **Step 6：提交**
-
-```bash
-git add -A cpp
-git commit -m "Ignore stale mock media copies and drop the DC status mirror" -m "Co-Authored-By: Claude <noreply@anthropic.com>"
-```
+执行时确认：门控里的重复副本记账（`native_mock_media_evidence`、`validated_`、重复副本放行）是提交 `0e0617b`
+"Mirror scoped mock media evidence on direct channel" 为了接受 DC 上的第二份媒体状态才加的。DC 媒体状态镜像在
+Task 7 删除后，不会再有重复或过期副本到达，原计划的"忽略过期副本"补丁不可达，按 YAGNI 不做。
+本任务改为：对 `0e0617b` 在门控头文件和门控测试上的改动做反向应用（`git show 0e0617b -- <两个文件> | git apply -R`），
+恢复单载体的原始行为，并删除 `test_mirrored_media_evidence`。Task 7 里已先行删除车端和 viewer 的 DC 媒体状态镜像（见下）。
 
 ## Task 9：统一隔离 mock 判定（A6）与车端 mock 证明（B6）
 
@@ -3113,3 +3053,26 @@ git commit -m "Index PR #26 evidence files" -m "Co-Authored-By: Claude <noreply@
 - [ ] **Step 1：全量验证**：Task 0 Step 2 的两条命令；`grep -rnE "mock_dual|MockDual|mock_wss_dc|MockWssDc|mock_compact|MockCompact|NativeMirrorIngressAcks|mock_media_status_v1|mock_dc_backpressure|mock_skip_dc|send_mock_compact|wss_dc_mirror" cpp CMakeLists.txt` 无输出；`git status` 干净。
 - [ ] **Step 2：按 superpowers:verification-before-completion 汇报**：每一项都附命令输出；列出跳过和未执行的项（例如 netem 被跳过、Windows CI 未推送、现场验收未做），不得把它们算作通过。
 - [ ] **Step 3：询问合并方式**（审查 D3）：向用户确认 PR 合并时采用 squash 还是保留提交历史；本计划不改写任何已推送的提交。
+
+
+---
+
+## 执行偏差记录（阶段 2，Task 6–11）
+
+- **Task 6：** 按计划，外加 Step 0 把 `isolated_mock_control_allowed` 暂移到 `control_transport.hpp`。额外发现并修改 `control_tests.cpp`
+  里"云端原样转发 offer 扩展字段"的用例：先保留 `mock_wss_dc_mirror`，Task 7 换成中性的 `extension_probe`。通道测试在 GStreamer 1.20
+  （本地与 CI 实际走的分支）上只剩"拒绝建立控制通道"的 fail-closed 检查。
+- **Task 7：** 车端和 viewer 的"DC 媒体状态镜像"（原属 Task 8）提前并入本任务，因为它依赖被删除的 `mock_dual_control_enabled()`，
+  否则该提交无法编译。集成测试夹具构造函数变为 `Fixture(direct, feedback, product, mode, defer_owner)`；`feedback_vehicle_method_tests.cpp`
+  的夹具要同步删除假的 `g_object_get`、`buffered_bytes` 和相关局部变量（`.inc` 由 `extract_feedback_vehicle_method.py` 从 `webrtc_media.cpp`
+  抽取，源码改动会直接改变被测代码）。顺带删除了 `<cstdlib>`（仅为 `getenv` 引入）。`control_transport_tests` 的用例数实际是 16。
+  发布过滤的 WSS 路径保护与"页面不能给已签名字节加字段"两条断言以中性形式保留。
+- **Task 8：** 见上，改为恢复而不是打补丁。
+- **Task 9：** 车端以 `isolated_mock_bench_attested()` / `isolated_mock_trace()` 两个成员实现；Python 假 `Impl` 用一个可开关的
+  `attested` 成员，另加源码契约检查：实现必须使用共享谓词，且 `webrtc_media.cpp` 里不得再出现 `starts_with("test_bench_")`。
+- **Task 10：** 守卫放在 `cpp/tests/owned_callback_guard.hpp`（与 `native_receiver_core.hpp` 同目录），Task 23 一起移动。macOS 分支用本机 vcpkg 的
+  GStreamer/libnice 头文件做了语法检查（`/tmp/mt-tools/mac-syntax.sh`），Linux 构建覆盖非 macOS 分支。
+- **Task 11：** 只有 `windows-native-viewer.md` 和 4 个证据文件需要处理；`native-receiver-bench.md` 等里的"镜像/dual"是 Homebrew 镜像、
+  双栈 IP 等无关含义，未改。
+- **未验证项：** `cpp/apps/windows_native_viewer.cpp` 在阶段 2 被修改（Task 6、7、9），本机没有 Windows 工具链，只做了定界符平衡检查；
+  必须推送后由 Windows 工作流编译验证（Task 29，需用户同意推送）。
