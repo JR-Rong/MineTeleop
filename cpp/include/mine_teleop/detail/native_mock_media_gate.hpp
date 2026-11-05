@@ -3,7 +3,6 @@
 #include <nlohmann/json.hpp>
 #include <chrono>
 #include <cstdint>
-#include <initializer_list>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -12,39 +11,6 @@
 #include <vector>
 
 namespace mine_teleop::detail {
-
-// Keep only evidence consumed by the gate; absent and malformed fields stay
-// absent or malformed so the regular validation remains fail closed.
-inline nlohmann::json native_mock_media_evidence(const nlohmann::json& status) {
-  using Json = nlohmann::json;
-  if (!status.is_object()) return status;
-  Json result = Json::object();
-  for (const auto* key : {"session_id", "vehicle_id", "adapter_type", "mock_control_diagnostic",
-                          "reported_at_utc_ms", "media_negotiation", "time_sync"})
-    if (status.contains(key)) result[key] = status.at(key);
-  if (status.contains("lanes")) {
-    result["lanes"] = status.at("lanes");
-    if (result["lanes"].is_array()) {
-      for (auto& lane : result["lanes"]) {
-        if (!lane.is_object()) continue;
-        Json selected = Json::object();
-        for (const auto* key : {"camera_id", "critical_for_control", "lane_state", "send_waiting_idr",
-                                "send_invalid_sample_blocked", "send_last_sample_id_ns", "fresh_send_frames"})
-          if (lane.contains(key)) selected[key] = lane.at(key);
-        lane = std::move(selected);
-      }
-    }
-  }
-  // The status may contain large unrelated negotiation/clock fields.
-  for (const auto& [key, fields] : std::initializer_list<std::pair<const char*, std::vector<const char*>>>{
-           {"media_negotiation", {"id", "answer_applied"}}, {"time_sync", {"synchronized", "uncertainty_ms"}}}) {
-    if (!result.contains(key) || !result[key].is_object()) continue;
-    Json selected = Json::object();
-    for (const auto* field : fields) if (result[key].contains(field)) selected[field] = result[key].at(field);
-    result[key] = std::move(selected);
-  }
-  return result;
-}
 
 // Neutral mock bench only: remote status remains independent evidence from
 // local frame submission. Callers must also enforce peer/session, renderer,
@@ -63,19 +29,9 @@ class NativeMockMediaGate {
   bool observe(const Json& status, std::int64_t monotonic_ms, std::int64_t synchronized_utc_ms,
                std::int64_t uncertainty_ms) {
     std::lock_guard lock(mutex_);
+    ready_ = false;
+    reason_ = "scope";
     try {
-      const auto evidence = native_mock_media_evidence(status);
-      // A previously validated identical observation may arrive over the
-      // other path, even after a newer observation. It never renews the TTL
-      // or restores readiness after a failure.
-      if (monotonic_ms >= 0 && synchronized_utc_ms >= 0 && uncertainty_ms >= 0 && uncertainty_ms <= 25 &&
-          evidence.contains("reported_at_utc_ms") && evidence.at("reported_at_utc_ms").is_number_integer()) {
-        const auto reported = evidence.at("reported_at_utc_ms").get<std::int64_t>();
-        if (reported >= synchronized_utc_ms - 3000 - uncertainty_ms && reported <= synchronized_utc_ms + uncertainty_ms)
-          for (const auto& previous : validated_) if (evidence == previous) return ready_locked(monotonic_ms);
-      }
-      ready_ = false;
-      reason_ = "scope";
       if (!status.is_object() || monotonic_ms < 0 || synchronized_utc_ms < 0 || uncertainty_ms < 0 || uncertainty_ms > 25 ||
           status.value("session_id", "") != session_ || status.value("vehicle_id", "") != vehicle_ ||
           status.value("adapter_type", "") != "mock" || status.value("mock_control_diagnostic", true) ||
@@ -108,12 +64,10 @@ class NativeMockMediaGate {
       ids_ = std::move(next);
       initialized_ = true;
       last_reported_ = reported;
-      if (validated_.size() == 4) validated_.erase(validated_.begin());
-      validated_.push_back(evidence);
       reason_ = advancing ? "ready" : "not_advancing";
       if (advancing) { last_good_ms_ = monotonic_ms; ready_ = true; }
       return ready_;
-    } catch (const Json::exception&) { ready_ = false; reason_ = "malformed"; return false; }
+    } catch (const Json::exception&) { reason_ = "malformed"; return false; }
   }
   bool ready(std::int64_t now_ms) const {
     std::lock_guard lock(mutex_);
@@ -136,7 +90,6 @@ class NativeMockMediaGate {
   const std::string session_, vehicle_, attempt_;
   mutable std::mutex mutex_;
   std::map<std::string, std::uint64_t> ids_;
-  std::vector<Json> validated_;
   std::int64_t last_good_ms_{}, last_reported_{};
   bool initialized_{}, ready_{};
   std::string reason_{"waiting"};
