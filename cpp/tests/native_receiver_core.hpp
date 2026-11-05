@@ -8,6 +8,7 @@
 #include "mine_teleop/detail/native_control_channel.hpp"
 #include "mine_teleop/detail/dtls_record_trace.hpp"
 #include "mine_teleop/detail/rtp_marker.hpp"
+#include "owned_callback_guard.hpp"
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/sdp/sdp.h>
@@ -667,7 +668,9 @@ class Receiver {
 #ifdef __APPLE__
     if (!options_.local_interface.empty()) {
       interface_binding_ = std::make_unique<InterfaceBinding>(options_.local_interface);
-      g_signal_connect(nice_, "new-candidate-full", G_CALLBACK(InterfaceBinding::on_candidate), interface_binding_.get());
+      binding_guard_->bind(interface_binding_.get());
+      g_signal_connect_data(nice_, "new-candidate-full", G_CALLBACK(on_binding_candidate_guarded),
+          new std::shared_ptr<BindingGuard>(binding_guard_), release_guard<BindingGuard>, GConnectFlags(0));
     }
 #else
     if (!options_.local_interface.empty()) throw std::runtime_error("native interface pinning is macOS-only");
@@ -680,22 +683,25 @@ class Receiver {
     }
     if (options_.ice_transport == "tcp") g_object_set(nice_, "ice-udp", FALSE, nullptr);
     else if (options_.ice_transport == "udp") g_object_set(nice_, "ice-tcp", FALSE, nullptr);
-    g_signal_connect(nice_, "new-selected-pair-full", G_CALLBACK(on_pair), this);
+    nice_guard_->bind(this);
+    g_signal_connect_data(nice_, "new-selected-pair-full", G_CALLBACK(on_pair_guarded),
+        new std::shared_ptr<PairGuard>(nice_guard_), release_guard<PairGuard>, GConnectFlags(0));
     if (gst_element_set_state(pipeline_, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE)
       throw std::runtime_error("receiver failed to start");
   }
   void stop() {
     if (stopped_.exchange(true)) return;
+    // libnice calls back from its own thread, which stopping the pipeline does
+    // not join. Retiring the guards waits for a callback that is already running
+    // and turns every later one into a no-op, so ~Receiver cannot race a callback.
+    nice_guard_->retire();
+#ifdef __APPLE__
+    binding_guard_->retire();
+#endif
     if (control_channel_) control_channel_->retire();
     g_signal_handlers_disconnect_by_data(peer_, this);
     g_signal_handlers_disconnect_by_data(pipeline_, this);
     gst_element_set_state(pipeline_, GST_STATE_NULL);
-    if (nice_) {
-      g_signal_handlers_disconnect_by_data(nice_, this);
-#ifdef __APPLE__
-      if (interface_binding_) g_signal_handlers_disconnect_by_data(nice_, interface_binding_.get());
-#endif
-    }
     std::vector<std::shared_ptr<Track>> tracks;
     { std::lock_guard lock(mutex_); tracks = tracks_; }
     for (auto& track : tracks) track->stop();
@@ -837,6 +843,21 @@ class Receiver {
     }
     return "unknown";
   }
+  using PairGuard = detail::OwnedCallbackGuard<Receiver>;
+  template <typename Guard>
+  static void release_guard(gpointer data, GClosure*) { delete static_cast<std::shared_ptr<Guard>*>(data); }
+  static void on_pair_guarded(NiceAgent* agent, guint stream, guint component, NiceCandidate* local,
+                              NiceCandidate* remote, gpointer data) {
+    const auto guard = *static_cast<std::shared_ptr<PairGuard>*>(data);
+    guard->call([&](Receiver& self) { on_pair(agent, stream, component, local, remote, &self); });
+  }
+#ifdef __APPLE__
+  using BindingGuard = detail::OwnedCallbackGuard<InterfaceBinding>;
+  static void on_binding_candidate_guarded(NiceAgent* agent, NiceCandidate* candidate, gpointer data) {
+    const auto guard = *static_cast<std::shared_ptr<BindingGuard>*>(data);
+    guard->call([&](InterfaceBinding& binding) { InterfaceBinding::on_candidate(agent, candidate, &binding); });
+  }
+#endif
   static void on_pair(NiceAgent* agent, guint stream, guint component, NiceCandidate* local, NiceCandidate* remote, gpointer data) {
     auto& self = *static_cast<Receiver*>(data);
     if (!local || !remote) return;
@@ -996,8 +1017,10 @@ class Receiver {
   Options options_;
   GstElement* pipeline_{}, *peer_{};
   NiceAgent* nice_{};
+  std::shared_ptr<PairGuard> nice_guard_{std::make_shared<PairGuard>()};
 #ifdef __APPLE__
   std::unique_ptr<InterfaceBinding> interface_binding_;
+  std::shared_ptr<BindingGuard> binding_guard_{std::make_shared<BindingGuard>()};
 #endif
   std::atomic<bool> stopped_{false};
   std::string negotiation_, error_;
