@@ -322,6 +322,11 @@ curl -fsS http://127.0.0.1:8080/health
   `full_scale_motor_torque_nm × max_throttle`，新语义中 `full_scale_motor_torque_nm` 本身就是唯一上限。
   例如旧 `41.25 × 0.10 ≈ 4.125 Nm/路`，不得原样保留 `41.25 Nm`。要从旧有效上限起步并
   重做隔离台架标定；缺少新版非 mock 必填安全字段时应保持启动失败，不得补默认值绕过。
+- 从车端 YAML 删除 `ice.stun_servers` / `ice.turn_servers`。这两个键从未被车端读取，现在
+  出现即拒绝启动，错误为 `vehicle ice.stun_servers/turn_servers are unsupported`，避免继续
+  静默忽略。STUN/TURN 地址改由信令服务 `--stun-urls` / `--turn-urls` 配置，车端和页面从认证
+  后的信令接口取得同一份 ICE 列表。使用仓库内打包配置部署的车辆不受影响；自维护配置请先运行
+  `./bin/mine-teleop-run config-check --config <你的配置>`，看到上述错误即按本条处理。
 
 升级与回滚时还要遵守：
 
