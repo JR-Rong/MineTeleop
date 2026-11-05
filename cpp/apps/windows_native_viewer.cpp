@@ -1,6 +1,7 @@
 // Windows bench viewer: native video with an explicitly isolated mock mode.
 #include "native_receiver_core.hpp"
 #include "mine_teleop/detail/native_video_health.hpp"
+#include "mine_teleop/detail/isolated_mock_bench.hpp"
 #include "mine_teleop/detail/native_mock_media_gate.hpp"
 #include "mine_teleop/detail/native_mock_input_sequence.hpp"
 #include "mine_teleop/detail/native_mock_profile_retry.hpp"
@@ -1157,6 +1158,10 @@ struct Window {
               options.ice_servers = payload.value("ice_servers", ice);
               options.ice_route_mode = payload.value("ice_route_mode", "all");
               if (mock_control) {
+                // Local YAML cannot prove the remote vehicle is an isolated mock
+                // bench. Only the vehicle's own attestation may enable control.
+                if (!detail::isolated_mock_bench_offer(payload))
+                  throw std::runtime_error("车端未声明隔离 mock 台架，已拒绝开启控制；请改用只读观看");
                 options.local_addresses = {mock_local_ip};
                 options.remote_addresses = {mock_peer_ip};
                 options.address_family = mock_ip_family;

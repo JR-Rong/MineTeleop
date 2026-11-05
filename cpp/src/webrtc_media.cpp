@@ -6,6 +6,7 @@
 #include "mine_teleop/detail/diagnostic_queue.hpp"
 #include "mine_teleop/detail/ice_diagnostics.hpp"
 #include "mine_teleop/detail/ice_route_policy.hpp"
+#include "mine_teleop/detail/isolated_mock_bench.hpp"
 #include "mine_teleop/detail/gstreamer_rtp_marker.hpp"
 #include "mine_teleop/detail/gstreamer_ice_servers.hpp"
 #include <agent.h>
@@ -1160,6 +1161,17 @@ struct VehicleMediaRuntime::Impl {
         nullptr);
   }
 
+  // The single definition of the isolated zero-speed mock bench. It gates the
+  // bench-only diagnostics below and is the attestation, carried in the offer,
+  // that a native mock client requires before it will send any control.
+  bool isolated_mock_bench_attested() const {
+    return detail::isolated_mock_bench(config.vehicle_id, config.vehicle_adapter.type,
+        config.field_safety.max_speed_kph, config.field_safety.commissioning_mode);
+  }
+  bool isolated_mock_trace() const {
+    return config.runtime.control_log_commands && isolated_mock_bench_attested();
+  }
+
   static void on_offer_created(GstPromise* promise, gpointer user_data) {
     const auto* context = static_cast<MediaOfferContext*>(user_data);
     const auto state = context->state;
@@ -1234,6 +1246,7 @@ struct VehicleMediaRuntime::Impl {
     state->pending.emplace_back("webrtc_offer", Json{
          {"type", "offer"},
          {"control_transport_capability", self->signaling.transport_mac_key().size() >= 32 ? detail::kControlTransportCapability : std::string_view{}},
+         {"isolated_mock_bench_capability", self->isolated_mock_bench_attested() ? detail::kIsolatedMockBenchCapability : std::string_view{}},
          {"emergency_stop_capability", self->config.runtime.experimental_direct_authority_max_ms > 0 && self->signaling.transport_mac_key().size() >= 32 ? detail::kEmergencyStopCapability : std::string_view{}},
          {"feedback_transport_capability", self->config.runtime.experimental_direct_authority_max_ms > 0 && self->signaling.transport_mac_key().size() >= 32 ? detail::kFeedbackTransportCapability : std::string_view{}},
          {"sdp", text == nullptr ? "" : text},
@@ -3064,8 +3077,7 @@ struct VehicleMediaRuntime::Impl {
     // Bench-only metadata: distinguish a stopped telemetry producer from a
     // status lost after publication. Never log the telemetry payload itself.
     const auto trace_now = steady_now_ms();
-    if (config.runtime.control_log_commands && config.vehicle_id.starts_with("test_bench_") &&
-        config.vehicle_adapter.type == "mock" && trace_now - last_mock_telemetry_trace_ms >= 1000) {
+    if (isolated_mock_trace() && trace_now - last_mock_telemetry_trace_ms >= 1000) {
       guint64 buffered_bytes = 0;
       if (control_channel) g_object_get(control_channel, "buffered-amount", &buffered_bytes, nullptr);
       enqueue_control_trace({{"stage", "mock_telemetry_publish"}, {"seq", sequence},
@@ -4101,8 +4113,7 @@ struct VehicleMediaRuntime::Impl {
       gst_bin_add(GST_BIN(pipeline), transport);
     }
     mock_ice_marker_counters->clear();
-    if (config.runtime.control_log_commands && config.vehicle_id.starts_with("test_bench_") &&
-        config.vehicle_adapter.type == "mock") {
+    if (isolated_mock_trace()) {
       detail::install_ice_output_marker_probe(pipeline, mock_ice_marker_counters);
     }
     webrtc = gst_bin_get_by_name(GST_BIN(pipeline), "webrtc");
@@ -4192,8 +4203,7 @@ struct VehicleMediaRuntime::Impl {
       lane->mock_rtp_output_events.store(0, std::memory_order_relaxed);
       lane->mock_last_rtp_output_steady_ms.store(0, std::memory_order_relaxed);
       lane->mock_rtp_output_max_gap_ms.store(0, std::memory_order_relaxed);
-      if (config.runtime.control_log_commands && config.vehicle_id.starts_with("test_bench_") &&
-          config.vehicle_adapter.type == "mock") {
+      if (isolated_mock_trace()) {
         gst_pad_add_probe(rtp_src_pad, static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
             +[](GstPad*, GstPadProbeInfo*, gpointer data) -> GstPadProbeReturn {
               auto* current = static_cast<Lane*>(data);

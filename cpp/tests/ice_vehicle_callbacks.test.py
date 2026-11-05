@@ -37,7 +37,8 @@ PRELUDE = r'''
 #include <utility>
 #include <nlohmann/json.hpp>
 #include "mine_teleop/detail/ice_diagnostics.hpp"
-namespace detail { using mine_teleop::detail::ice_candidate_summary; using mine_teleop::detail::ice_direct_sdp; }
+#include "mine_teleop/detail/isolated_mock_bench.hpp"
+namespace detail { using mine_teleop::detail::ice_candidate_summary; using mine_teleop::detail::ice_direct_sdp; using mine_teleop::detail::isolated_mock_bench_offer; using mine_teleop::detail::kIsolatedMockBenchCapability; }
 using Json=nlohmann::json;
 namespace detail { constexpr std::string_view kControlTransportCapability = "native-control-transport-v1"; constexpr std::string_view kEmergencyStopCapability = "native-stop-only-v1"; constexpr std::string_view kFeedbackTransportCapability = "native-feedback-transport-v1"; }
 using guint=unsigned;using guint8=unsigned char;using gchar=char;using gpointer=void*;
@@ -98,6 +99,8 @@ struct Signaling {Json incoming={{"messages",Json::array()}};std::vector<std::pa
 struct Impl {
 '''
 MEMBERS = r'''
+  bool attested=false;
+  bool isolated_mock_bench_attested() const {return attested;}
   struct { struct { int experimental_direct_authority_max_ms=0; bool mock_control_diagnostic=false; } runtime; } config;
   void flush_control_status() {} // Control status has separate protocol/service coverage.
   void process_control_management(const Json&,const Json&) {}
@@ -150,6 +153,16 @@ void case_order() {
 #ifdef HAS_MEDIA_SCOPE_STATUS
   expect(impl.signaling.sent[0].second.value("legacy_bootstrap_allowed",false),"producer bootstrap declaration missing");
 #endif
+}
+void case_isolated_mock_attestation() {
+  for (bool attested : {false,true}) {
+    Impl impl;impl.attested=attested;GstElement peer;activate(impl,peer);negotiate(impl,peer);
+    complete(peer);impl.flush_outgoing_signals();
+    expect(impl.signaling.sent.size()==1&&impl.signaling.sent[0].first=="webrtc_offer","attestation offer missing");
+    expect(impl.signaling.sent[0].second.value("isolated_mock_bench_capability","")==
+        (attested?std::string(detail::kIsolatedMockBenchCapability):std::string{}),"isolated mock bench attestation mismatch");
+    expect(detail::isolated_mock_bench_offer(impl.signaling.sent[0].second)==attested,"attestation did not satisfy the viewer predicate");
+  }
 }
 void case_late_callbacks() {
   Impl impl;GstElement old,replacement;activate(impl,old);negotiate(impl,old);auto state=impl.media_signal_state;
@@ -262,7 +275,7 @@ void case_direct_filter_and_fresh_fallback() {
   expect(replacement.added.size()==1,"fresh fallback did not admit TURN");
 }
 int main(){int failed=0;const std::vector<std::pair<const char*,void(*)()>> cases={
-  {"ICE-VEHICLE-MOCK-001",case_order},{"ICE-VEHICLE-MOCK-002",case_late_callbacks},
+  {"ICE-VEHICLE-MOCK-001",case_order},{"ICE-VEHICLE-MOCK-ATTEST",case_isolated_mock_attestation},{"ICE-VEHICLE-MOCK-002",case_late_callbacks},
   {"ICE-VEHICLE-MOCK-003",case_remote_order},{"ICE-VEHICLE-MOCK-004",case_legacy_retry},
   {"ICE-VEHICLE-MOCK-005",case_stale_invalid_answer},{"ICE-VEHICLE-MOCK-006",case_bounded_pending}};
   auto selected=cases;
@@ -305,6 +318,13 @@ def main():
         raise AssertionError("selected-pair observation must never abort the media pipeline")
     if "vehicle_ice_selected_pair_unavailable" not in observe:
         raise AssertionError("missing diagnostic when libnice selected-pair observation is unavailable")
+    attested = section(source, "  bool isolated_mock_bench_attested() const {", "\n  }\n")
+    for needle in ("detail::isolated_mock_bench(", "config.vehicle_id", "config.vehicle_adapter.type",
+                   "config.field_safety.max_speed_kph", "config.field_safety.commissioning_mode"):
+        if needle not in attested:
+            raise AssertionError(f"isolated mock bench attestation no longer uses {needle}")
+    if 'starts_with("test_bench_")' in source:
+        raise AssertionError("scattered bench identity check; use isolated_mock_bench_attested()")
     call_site = section(source, "      configure_ice_servers();", "    } catch (const std::exception& error) {")
     if "observe_ice_agent();" not in call_site:
         raise AssertionError("ICE agent observation call site moved unexpectedly")
