@@ -33,41 +33,87 @@
 
 ## Task 0：本地验证环境与基线
 
-**Files:** 无（不提交）
+**Files:** 无（不提交）。以下脚本放在仓库之外（`/tmp/mt-tools/`），因为本机的 Docker 引擎是 Colima，**不共享任何宿主机目录**（bind mount 得到空目录），所以源码要用 tar 流写入命名卷。
 
-- [ ] **Step 1：构建与 CI 同款的 Ubuntu 22.04 测试镜像**（只需一次；Dockerfile 从标准输入读取，不把仓库作为构建上下文）
+- [ ] **Step 1：构建与 CI 同款的 Ubuntu 22.04 测试镜像**（只需一次）。完整测试构建要求 Node（`CMakeLists.txt:667` 的 `find_program(... REQUIRED)`），Ubuntu 22.04 自带的 Node 12 跑不了 `.mjs` 和 `?.` 语法的测试，所以从官方站点下载 Node 22 并校验 SHA-256：
 
 ```bash
 docker build -t mine-teleop-native-ci:22.04 - <<'EOF'
 FROM ubuntu:22.04
 ARG DEBIAN_FRONTEND=noninteractive
+ARG NODE_VERSION=22.20.0
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      build-essential cmake pkg-config iproute2 coturn openssl ca-certificates python3 \
+      build-essential cmake pkg-config iproute2 coturn openssl ca-certificates python3 curl xz-utils \
       libunwind-dev libcurl4-openssl-dev libssl-dev libyaml-cpp-dev nlohmann-json3-dev libjpeg-dev \
       libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev libnice-dev \
       gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
       gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-nice \
     && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    case "$(dpkg --print-architecture)" in amd64) node_arch=x64 ;; arm64) node_arch=arm64 ;; *) exit 1 ;; esac; \
+    base="https://nodejs.org/dist/v${NODE_VERSION}"; file="node-v${NODE_VERSION}-linux-${node_arch}.tar.xz"; \
+    mkdir /tmp/node-download; cd /tmp/node-download; \
+    curl -fsSLO "$base/$file"; curl -fsSLO "$base/SHASUMS256.txt"; \
+    grep " $file\$" SHASUMS256.txt | sha256sum -c -; \
+    tar -xJf "$file" -C /usr/local --strip-components=1; \
+    cd /; rm -rf /tmp/node-download; node --version
 EOF
 ```
 
-Expected：最后输出 `naming to docker.io/library/mine-teleop-native-ci:22.04`。
+Expected：构建成功；`docker run --rm mine-teleop-native-ci:22.04 node --version` 输出 `v22.20.0`。
 
-- [ ] **Step 2：定义本地全量验证命令**（后续每个任务都用这两条；构建目录放在命名卷里，可增量编译）
+- [ ] **Step 2：创建两个辅助脚本**
 
-原生构建 + 全部 CTest（与 CI 的 native 任务同参数；`--network none` 满足"只有回环口"的要求；`NET_ADMIN` 供 netem 测试使用）：
+`/tmp/mt-tools/native-sync.sh`：把源码目录镜像进命名卷 `mine-teleop-native-src`。只发送内容有变化的文件，并用 `tar -m` 解包，使这些文件的 mtime 是容器内的"现在"，因此无论宿主机与虚拟机时钟差多少，make 都恰好重编译这些文件。必须带 `--no-xattrs` 和 `COPYFILE_DISABLE=1`，否则 macOS 的 tar 会夹带 `._*` 文件进入卷：
 
 ```bash
-docker run --rm --network none --cap-add NET_ADMIN \
-  -v "$PWD":/src -v mine-teleop-native-build:/build -w /src mine-teleop-native-ci:22.04 bash -euc '
+#!/usr/bin/env bash
+set -euo pipefail
+export LC_ALL=C
+src="$1"; vol=mine-teleop-native-src
+state="/tmp/mt-logs/manifest.$vol"; new="$(mktemp)"
+cd "$src"
+docker volume inspect "$vol" >/dev/null 2>&1 || rm -f "$state"
+touch "$state"
+if [ -e .git ]; then
+  git ls-files -z -c -o --exclude-standard | while IFS= read -r -d '' f; do [ -f "$f" ] && printf '%s\0' "$f"; done
+else
+  find . -type f -print | sed 's#^\./##' | tr '\n' '\0'
+fi | xargs -0 shasum -a 256 | sort > "$new"
+changed="$(comm -13 <(sort "$state") "$new" | cut -c67-)"
+removed="$(comm -23 <(cut -c67- "$state" | sort) <(cut -c67- "$new" | sort))"
+docker volume create "$vol" >/dev/null
+if [ -n "$changed" ]; then
+  printf '%s\n' "$changed" | tr '\n' '\0' | COPYFILE_DISABLE=1 tar --no-xattrs --null -T - -cf - \
+    | docker run --rm -i -v "$vol":/src ubuntu:22.04 tar -xmf - -C /src
+fi
+if [ -n "$removed" ]; then
+  printf '%s\n' "$removed" | docker run --rm -i -v "$vol":/src ubuntu:22.04 \
+    sh -c 'cd /src; while IFS= read -r f; do rm -f -- "$f"; done'
+fi
+mv "$new" "$state"
+echo "sync: $(printf '%s' "$changed" | grep -c . || true) changed/new, $(printf '%s' "$removed" | grep -c . || true) removed"
+```
+
+`/tmp/mt-tools/native-check.sh <源码目录> [ctest 参数...]`：同步后，在无网络容器里按 CI 的参数构建全部原生测试目标并运行 CTest（`NET_ADMIN` 只为 netem 测试）：
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+src="$1"; shift
+/tmp/mt-tools/native-sync.sh "$src"
+exec docker run --rm --network none --cap-add NET_ADMIN \
+  -v mine-teleop-native-src:/src -v mine-teleop-native-build:/build -w /src mine-teleop-native-ci:22.04 bash -euc '
     cmake -S /src -B /build -DCMAKE_BUILD_TYPE=Debug \
       -DMINE_TELEOP_BUILD_TESTS=ON -DMINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS=ON \
       -DMINE_TELEOP_BUILD_VEHICLE_RUNTIME=ON -DMINE_TELEOP_BUILD_BENCH_PROBES=ON \
       -DMINE_TELEOP_BUILD_VENDOR_CAMERA_BRIDGES=OFF -DMINE_TELEOP_BUILD_ARAVIS_CAMERA_BRIDGE=OFF \
       -DMINE_TELEOP_FETCH_MISSING_DEPS=OFF
-    cmake --build /build --parallel 6
-    ctest --test-dir /build --output-on-failure --timeout 180'
+    cmake --build /build --parallel 8
+    ctest --test-dir /build --output-on-failure --timeout 180 "$@"' _ "$@"
 ```
+
+后文所有"Task 0 Step 2 的 Docker 命令"都指 `/tmp/mt-tools/native-check.sh "$PWD"`（要只跑部分测试，在后面加 `-R <正则>`）。注意：基线运行期间不要再同步源码，也不要同时启动第二个使用这两个卷的容器。
 
 宿主机上的纯 Python/JS 回归：
 
@@ -75,9 +121,9 @@ docker run --rm --network none --cap-add NET_ADMIN \
 python3 scripts/test/run_offline_regressions.py
 ```
 
-- [ ] **Step 3：在当前 HEAD 上跑一次两条命令，记录基线**
+- [ ] **Step 3：在干净的当前 HEAD 上跑一次基线**。工作区若已有未提交修改，先用 `git archive HEAD | tar -x -C /tmp/mt-baseline` 导出干净副本，再对该目录运行 `native-check.sh`，不要在带修改的工作区上跑基线。
 
-Expected：全部通过。如果有失败，把失败用例名记到工作笔记里，后续任务不得新增失败，也不得把基线失败算作通过。
+Expected：记录通过、失败、跳过的测试名单作为基线。后续任务不得新增失败，也不得把基线失败或跳过的项算作通过。
 
 ---
 
@@ -130,9 +176,11 @@ Expected: FAIL，提示找不到 `  bool observe_ice_agent() {`。
       g_object_unref(ice);
     }
     if (!ice_agent) {
+      std::string negotiation;
+      { std::lock_guard lock(media_signal_state->mutex); negotiation = media_signal_state->negotiation_id; }
       emit_diagnostic("vehicle_ice_selected_pair_unavailable", "ice_selected_pair_unavailable", "ice_connectivity", "",
           "Media continues; selected-pair diagnostics are unavailable on this GStreamer build.", true,
-          {{"media_negotiation_id", media_signal_state->negotiation_id}});
+          {{"media_negotiation_id", negotiation}});
       return false;
     }
     auto* state = new std::shared_ptr<MediaSignalState>(media_signal_state);
@@ -280,10 +328,12 @@ inline std::pair<nlohmann::json, bool> refresh_ice_configuration(Fetch fetch, St
 替换为：
 
 ```cpp
-        auto [refreshed_ice, refreshed] = detail::refresh_ice_configuration(
-            [this] { return signaling.ice_servers(); }, [this] { check_stop(); }, ice_configuration);
-        if (!refreshed) emit_diagnostic("vehicle_ice_refresh_fallback", "ice_refresh_failed", "ice_configuration", "",
-            "Retrying with the previous ICE list; TURN credentials may be expired.", true, {});
+        // check_stop is a local [&] lambda in the media loop, so pass it directly.
+        auto [refreshed_ice, ice_refreshed] = detail::refresh_ice_configuration(
+            [this] { return signaling.ice_servers(); }, check_stop, ice_configuration);
+        if (!ice_refreshed)
+          emit_diagnostic("vehicle_ice_refresh_fallback", "ice_refresh_failed", "ice_configuration", "",
+              "Retrying with the previous ICE list; TURN credentials may be expired.", true);
         ice_configuration = std::move(refreshed_ice);
 ```
 
@@ -340,53 +390,12 @@ git add cpp/include/mine_teleop/detail/ice_route_policy.hpp cpp/src/webrtc_media
 git commit -m "Fall back to cached ICE servers when a refresh fails" -m "Co-Authored-By: Claude <noreply@anthropic.com>"
 ```
 
-## Task 4：DC 试探预算重置的回归测试（A7）
+## Task 4：DC 试探预算重置的回归测试（A7）——已被现有测试覆盖，跳过
 
-**Files:**
-- Test: `cpp/tests/control_transport_tests.cpp`
-
-本任务给已有行为补测试，测试应当一次通过；如果失败，说明 `note_result` 的现有实现与 PR 描述不符，需要先停下来分析。
-
-- [ ] **Step 1：写测试**
-
-在 `control_transport_tests.cpp` 中 `baseline()` 定义之后加入，并在 `main()` 里调用：
-
-```cpp
-// One DC trial rejected only because the session profile was not ready, then
-// a fresh accepted neutral WSS result: the failed-trial count resets exactly once.
-std::uint64_t profile_blocked_trial(ControlTransportSender& sender, std::uint64_t seq, std::int64_t now) {
-  expect(sender.consider_dc("media-a", now, 5000), "DC trial was not offered");
-  auto frame = payload(seq, now); sender.decorate(frame); sender.note_sent(frame, ControlPath::DataChannel, now);
-  auto rejected = response(frame, false, true); rejected["reason"] = "session_profile_not_ready";
-  static_cast<void>(sender.note_result(rejected, now + 40, 5000));
-  expect(sender.observe(false, "media-a", now + 50, 5000) && sender.path() == ControlPath::Wss,
-      "failed DC trial did not fall back to WSS");
-  auto select = payload(seq + 1, now + 60); sender.decorate(select); sender.note_sent(select, ControlPath::Wss, now + 60);
-  expect(sender.note_result(response(select, true, true), now + 100, 5000).matched, "WSS reselection not matched");
-  return seq + 2;
-}
-void profile_blocked_dc_trial_earns_one_extra_budget() {
-  ControlTransportSender sender; sender.set_data_channel_is_p2p(true); baseline(sender);
-  auto seq = profile_blocked_trial(sender, 4, 200);
-  expect(sender.status().at("failed_dc_trials") == 0, "profile recovery did not reset the failed-trial count");
-  seq = profile_blocked_trial(sender, seq, 30000);
-  expect(sender.status().at("failed_dc_trials") == 1, "profile recovery reset the trial budget more than once");
-}
-```
-
-`payload()` 生成的命令 throttle/steering 为 0（`command()` 辅助函数未设置），满足"中性"条件。`profile_blocked_trial` 第二次调用的时间（30000）用来越过试探退避。
-
-- [ ] **Step 2：运行**
-
-Run: Task 0 Step 2（`mine-teleop-control-transport-tests`）。
-Expected：PASS。
-
-- [ ] **Step 3：提交**
-
-```bash
-git add cpp/tests/control_transport_tests.cpp
-git commit -m "Cover the one-time DC trial budget after profile readiness" -m "Co-Authored-By: Claude <noreply@anthropic.com>"
-```
+执行时发现 `cpp/tests/control_transport_tests.cpp` 已有 `confirmed_profile_permits_only_one_new_bounded_dc_budget()`，
+它完整覆盖该行为：耗尽 3 次预算；未确认 profile、运动命令被接受、过期的 WSS 接受都不重置预算；
+一次新鲜的中性 WSS 接受恰好授予一个新的有界预算；第二轮预算同样有上限。重复加测试没有价值，本任务不写代码、不提交。
+审查时认为"缺测试"是错误的；A7 剩下的工作只是在 PR 说明里把它列为生产行为变化（Task 27）。
 
 ## Task 5：`ice.*` 拒绝启动的升级说明（A2）
 
@@ -431,6 +440,7 @@ grep -rnE "mock_dual|MockDual|mock_wss_dc|MockWssDc|mock_compact|MockCompact|Nat
 - Modify: `cpp/src/webrtc_media.cpp`、`cpp/include/mine_teleop/detail/native_control_channel.hpp`、`cpp/apps/windows_native_viewer.cpp`
 - Test: `cpp/tests/control_transport_tests.cpp`、`cpp/tests/native_control_channel_tests.cpp`、`cpp/tests/ice_vehicle_callbacks.test.py`、`cpp/tests/ice_gstreamer_init.test.py`
 
+- [ ] **Step 0：先搬走仍被使用的谓词。** `mock_compact_control.hpp` 里还定义了 `isolated_mock_control_allowed(...)`，它在 Task 7 之前仍被 `webrtc_media.cpp` 的 `mock_dual_control_enabled()` 使用。删除头文件之前，把这一个函数原样移到 `control_transport.hpp`（`kMockWssDcMirrorCapability` 附近、`mock_wss_dc_mirror_allowed` 之前），这样每个提交都能编译。Task 7 删除 `mock_dual_control_enabled()` 时一并删除它。
 - [ ] **Step 1：删除车端紧凑格式代码**（`webrtc_media.cpp`）
   - 删除 `#include "mine_teleop/detail/mock_compact_control.hpp"` 和 `#include "mine_teleop/detail/mock_compact_telemetry.hpp"`。
   - 删除成员函数 `mock_compact_control_enabled()` 和静态回调 `on_control_message_data(...)`，以及 `g_signal_connect(channel, "on-message-data", G_CALLBACK(on_control_message_data), this);` 这一行。
@@ -851,18 +861,21 @@ void budget_count_time_and_window() {
   }
   require(count.set_cause(TransientCause::LateCommands, true, 6000) == TransientHoldAction::Escalate &&
       count.escalation_reason() == "budget_count_exceeded", "seventh hold within the window was not escalated");
+  // Each hold lasts 650 ms. Four completed holds use 2600 ms of the 3000 ms budget,
+  // so the fifth hold must escalate mid-hold (at +450 ms), not at the next entry.
   TransientHoldPolicy time(enabled());
-  bool escalated = false;
-  for (int i = 0; i < 6 && !escalated; ++i) {
+  int escalated_at = -1;
+  for (int i = 0; i < 6 && escalated_at < 0; ++i) {
     const std::int64_t t = i * 2000;
-    if (time.set_cause(TransientCause::ControlGap, true, t) == TransientHoldAction::Escalate) { escalated = true; break; }
-    for (std::int64_t step = 50; step <= 650 && !escalated; step += 50)
-      escalated = time.tick(t + step) == TransientHoldAction::Escalate;
-    if (escalated) break;
+    if (time.set_cause(TransientCause::ControlGap, true, t) == TransientHoldAction::Escalate) { escalated_at = i; break; }
+    for (std::int64_t step = 50; step <= 650 && escalated_at < 0; step += 50)
+      if (time.tick(t + step) == TransientHoldAction::Escalate) escalated_at = i;
+    if (escalated_at >= 0) break;
     time.set_cause(TransientCause::ControlGap, false, t + 650);
     time.note_fresh_command(t + 650); time.note_fresh_command(t + 660);
   }
-  require(escalated && time.escalation_reason() == "budget_time_exceeded", "cumulative hold time budget not enforced");
+  require(escalated_at == 4 && time.escalation_reason() == "budget_time_exceeded",
+      "cumulative hold time budget was not enforced mid-hold on the fifth hold");
   TransientHoldPolicy window(enabled());
   for (int i = 0; i < 6; ++i) {
     const std::int64_t t = i * 1000;
