@@ -39,7 +39,7 @@ PRELUDE = r'''
 #include "mine_teleop/detail/ice_diagnostics.hpp"
 namespace detail { using mine_teleop::detail::ice_candidate_summary; using mine_teleop::detail::ice_direct_sdp; }
 using Json=nlohmann::json;
-namespace detail { constexpr std::string_view kControlTransportCapability = "native-control-transport-v1"; constexpr std::string_view kEmergencyStopCapability = "native-stop-only-v1"; constexpr std::string_view kFeedbackTransportCapability = "native-feedback-transport-v1"; constexpr std::string_view kMockDualControlCapability = "mock-dual-control-v1"; constexpr std::string_view kMockWssDcMirrorCapability = "mock-wss-dc-mirror-v1"; }
+namespace detail { constexpr std::string_view kControlTransportCapability = "native-control-transport-v1"; constexpr std::string_view kEmergencyStopCapability = "native-stop-only-v1"; constexpr std::string_view kFeedbackTransportCapability = "native-feedback-transport-v1"; }
 using guint=unsigned;using guint8=unsigned char;using gchar=char;using gpointer=void*;
 struct GstSDPMessage {std::string text;};
 struct GstWebRTCSessionDescription {GstSDPMessage* sdp;};
@@ -98,8 +98,6 @@ struct Signaling {Json incoming={{"messages",Json::array()}};std::vector<std::pa
 struct Impl {
 '''
 MEMBERS = r'''
-  bool dual_enabled=false;
-  bool mock_dual_control_enabled() const {return dual_enabled;}
   struct { struct { int experimental_direct_authority_max_ms=0; bool mock_control_diagnostic=false; } runtime; } config;
   void flush_control_status() {} // Control status has separate protocol/service coverage.
   void process_control_management(const Json&,const Json&) {}
@@ -152,17 +150,6 @@ void case_order() {
 #ifdef HAS_MEDIA_SCOPE_STATUS
   expect(impl.signaling.sent[0].second.value("legacy_bootstrap_allowed",false),"producer bootstrap declaration missing");
 #endif
-}
-void case_mock_offer() {
-  for (bool dual : {false,true}) {
-    Impl impl;impl.dual_enabled=dual;GstElement peer;activate(impl,peer);negotiate(impl,peer);
-    complete(peer);impl.flush_outgoing_signals();
-    expect(impl.signaling.sent.size()==1&&impl.signaling.sent[0].first=="webrtc_offer","mock offer missing");
-    expect(impl.signaling.sent[0].second.value("mock_dual_control","")==
-        (dual?std::string(detail::kMockDualControlCapability):std::string{}),"mock dual capability advertisement mismatch");
-    expect(impl.signaling.sent[0].second.value("mock_wss_dc_mirror","")==
-        (dual?std::string(detail::kMockWssDcMirrorCapability):std::string{}),"mock WSS/DC mirror capability advertisement mismatch");
-  }
 }
 void case_late_callbacks() {
   Impl impl;GstElement old,replacement;activate(impl,old);negotiate(impl,old);auto state=impl.media_signal_state;
@@ -275,7 +262,7 @@ void case_direct_filter_and_fresh_fallback() {
   expect(replacement.added.size()==1,"fresh fallback did not admit TURN");
 }
 int main(){int failed=0;const std::vector<std::pair<const char*,void(*)()>> cases={
-  {"ICE-VEHICLE-MOCK-001",case_order},{"ICE-VEHICLE-MOCK-OFFER",case_mock_offer},{"ICE-VEHICLE-MOCK-002",case_late_callbacks},
+  {"ICE-VEHICLE-MOCK-001",case_order},{"ICE-VEHICLE-MOCK-002",case_late_callbacks},
   {"ICE-VEHICLE-MOCK-003",case_remote_order},{"ICE-VEHICLE-MOCK-004",case_legacy_retry},
   {"ICE-VEHICLE-MOCK-005",case_stale_invalid_answer},{"ICE-VEHICLE-MOCK-006",case_bounded_pending}};
   auto selected=cases;

@@ -5119,7 +5119,7 @@ void test_mac_runtime_uses_websocket_signaling() {
       "vehicle-secret-1",
       "webrtc_offer",
       {{"type", "offer"}, {"sdp", "v=0\r\n"}, {"media_tracks", mine_teleop::Json::array()},
-       {"mock_wss_dc_mirror", "mock-wss-dc-mirror-v1"}});
+       {"extension_probe", "preserved"}});
   offer["connection_generation"] = vehicle_generation;
   static_cast<void>(http.post_json_response(base + "/signaling/" + session_id + "/messages", offer));
   const auto pushed = driver.poll_signaling();
@@ -5128,7 +5128,7 @@ void test_mac_runtime_uses_websocket_signaling() {
       pushed.at("messages").at(0).value("type", "") == "webrtc_offer",
       "websocket push delivered the wrong signaling type");
   const auto& offer_payload = pushed.at("messages").at(0).at("payload");
-  expect(offer_payload.value("mock_wss_dc_mirror", "") == "mock-wss-dc-mirror-v1",
+  expect(offer_payload.value("extension_probe", "") == "preserved",
       "signaling did not preserve offer capability fields");
 
   const auto answer = driver.send_webrtc_answer({{"type", "answer"}, {"sdp", "v=0\r\n"}});

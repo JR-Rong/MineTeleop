@@ -304,7 +304,6 @@ struct Window {
                         const Json& session, const std::string& attempt,
                         const std::shared_ptr<RenderSession>& render,
                         const std::shared_ptr<detail::NativeMockMediaGate>& gate,
-                        bool wss_dc_mirror,
                         std::stop_token parent, std::stop_token stop) {
     const std::string session_id = session.at("session_id").get<std::string>();
     const auto generation = session.at("control_session_generation").get<std::uint64_t>();
@@ -337,7 +336,6 @@ struct Window {
       dc_send_trace = Json::array(); dc_send_trace_dropped = 0;
     };
     std::unique_ptr<detail::NativeControlCourier> courier;
-    std::uint64_t mirrored_media_received = 0, mirrored_media_ready_after = 0;
     auto* channel = receiver.control_channel();
     if (!channel || !render->health) throw std::runtime_error("mock control requires scoped channel and critical video");
     // The input lease must not wait for signaling or the transport bridge.
@@ -685,26 +683,7 @@ struct Window {
       const bool clock_ok = sync.value("synchronized", false) && sync.value("uncertainty_ms", 999) <= 25 &&
           sync.value("uncertainty_ms", -1) >= 0 && status.at("time_sync_readiness").value("ready", false);
       const bool direct_udp = channel->direct_udp(mock_local_ip, mock_peer_ip);
-      const auto receive = [&]() -> std::optional<std::string> {
-        while (auto bytes = channel->pop()) {
-          if (bytes->size() <= 4096 && bytes->find("mock_media_status_v1") != std::string::npos) {
-            const auto envelope = Json::parse(*bytes, nullptr, false);
-            if (envelope.is_object() && envelope.value("event", "") == "mock_media_status_v1") {
-              if (direct_udp) {
-                ++mirrored_media_received;
-                const auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                if (gate->observe(envelope.value("status", Json::object()),
-                    static_cast<std::int64_t>(bench_now_ms()), wall_ms + sync.value("offset_ms", std::int64_t{0}),
-                    clock_ok ? sync.value("uncertainty_ms", std::int64_t{999}) : 999)) ++mirrored_media_ready_after;
-              }
-              continue;
-            }
-          }
-          return bytes;
-        }
-        return std::nullopt;
-      };
+      const auto receive = [&]() -> std::optional<std::string> { return channel->pop(); };
       const auto video_health = render->health->snapshot_now();
       const bool focused = IsWindowVisible(hwnd) && !IsIconic(hwnd) && GetForegroundWindow() == hwnd;
       if (!focused) for (const auto& id : render->cameras) static_cast<void>(render->health->set_usable(id, 1, false));
@@ -718,7 +697,7 @@ struct Window {
         while (receive()) {}
       } else {
         const detail::NativeCourierScope current{{session_id, generation, attempt}, owner, current_epoch};
-        if (!courier) courier = std::make_unique<detail::NativeControlCourier>(current, wss_dc_mirror);
+        if (!courier) courier = std::make_unique<detail::NativeControlCourier>(current);
         detail::NativeControlCourier::Io io{
             [&] {
               auto bytes = receive();
@@ -859,7 +838,7 @@ struct Window {
         const auto transport = native.at("control_transport");
         const auto path = transport.value("path", "unknown");
         const bool selecting = transport.value("selecting", true);
-        const auto control_path = selecting ? L"切换中" : transport.value("mock_dual_control", false) ? L"双路已发送" :
+        const auto control_path = selecting ? L"切换中" :
             path == "dc" ? L"DataChannel" :
             path == "wss" ? L"WSS 回退" : L"未知";
         const auto time_uncertainty = sync.value("uncertainty_ms", -1);
@@ -932,12 +911,8 @@ struct Window {
         const Json evidence{{"event", "native_mock_observation"}, {"monotonic_ms", now_ms},
             {"video_ready", video_health.ready}, {"remote_media_ready", gate->ready(now_ms)},
             {"remote_media_reason", gate->reason(now_ms)},
-            {"mock_mirrored_media_received", mirrored_media_received},
-            {"mock_mirrored_media_ready_after", mirrored_media_ready_after},
             {"focused", focused}, {"clock_ready", clock_ok}, {"clock_uncertainty_ms", sync.value("uncertainty_ms", -1)},
             {"sctp_direct_udp", channel->direct_udp(mock_local_ip, mock_peer_ip)}, {"control_path", transport.value("path", "unknown")},
-            {"mock_dual_control", transport.value("mock_dual_control", false)},
-            {"mock_dual_last_vehicle_path", transport.value("mock_dual_last_vehicle_path", Json(nullptr))},
             {"control_selecting", transport.value("selecting", true)}, {"intent_fresh", native.value("intent_fresh", false)},
             {"control_failed_dc_trials", transport.value("failed_dc_trials", 0)},
             {"feedback_path", feedback.is_object() ? feedback.value("path", "unknown") : "unknown"},
@@ -966,7 +941,6 @@ struct Window {
           last_result_seq = seq;
           const Json result{{"event", "native_mock_vehicle_result"}, {"monotonic_ms", now_ms},
               {"command_seq", seq}, {"command_path", latency.value("command_path", Json(nullptr))},
-              {"vehicle_received_path", latency.value("vehicle_received_path", Json(nullptr))},
               {"round_trip_ms", latency.value("round_trip_ms", Json(nullptr))},
               {"accepted", latency.value("accepted", Json(nullptr))}};
           std::fprintf(stderr, "%s\n", result.dump().c_str());
@@ -1024,7 +998,6 @@ struct Window {
       config.receive_only = !mock_control;
       config.defer_control_bootstrap = mock_control;
       config.mock_idle_direct_reprobe = mock_control;
-      config.mock_dual_control = mock_control;
       config.max_time_sync_uncertainty_ms = vehicle.field_safety.max_time_sync_uncertainty_ms;
       config.time_sync_interval_ms = vehicle.field_safety.time_sync_interval_ms;
       config.time_sync_samples = vehicle.field_safety.time_sync_samples;
@@ -1183,8 +1156,6 @@ struct Window {
               options.display = false;
               options.ice_servers = payload.value("ice_servers", ice);
               options.ice_route_mode = payload.value("ice_route_mode", "all");
-              const bool wss_dc_mirror = mock_control &&
-                  payload.value("mock_wss_dc_mirror", "") == detail::kMockWssDcMirrorCapability;
               if (mock_control) {
                 options.local_addresses = {mock_local_ip};
                 options.remote_addresses = {mock_peer_ip};
@@ -1212,9 +1183,9 @@ struct Window {
                 mock_gate = std::make_shared<detail::NativeMockMediaGate>(
                     session.at("session_id").get<std::string>(), vehicle.vehicle_id, negotiation, render->cameras);
                 auto* target = receiver.get();
-                control_worker = std::jthread([this, &driver, target, vehicle, config, session, negotiation, render, wss_dc_mirror,
+                control_worker = std::jthread([this, &driver, target, vehicle, config, session, negotiation, render,
                                                 gate = mock_gate, stop_token](std::stop_token token) {
-                  try { run_mock_control(driver, *target, vehicle, config, session, negotiation, render, gate, wss_dc_mirror, stop_token, token); }
+                  try { run_mock_control(driver, *target, vehicle, config, session, negotiation, render, gate, stop_token, token); }
                   catch (const std::exception& error) {
                     const std::string_view detail = error.what();
                     const char* category = detail.find("mock input worker failed") != std::string_view::npos ? "input_worker" :
@@ -1234,7 +1205,7 @@ struct Window {
                   }
                 });
               }
-              report(mock_control ? L"已提交媒体应答，等待双路和 mock 安全条件。" : L"已提交媒体应答，等待画面；仅观看，控制禁用。");
+              report(mock_control ? L"已提交媒体应答，等待 mock 安全条件。" : L"已提交媒体应答，等待画面；仅观看，控制禁用。");
             } else if (type == "ice_candidate") {
               phase = "remote_candidate";
               if (receiver) receiver->candidate(payload);

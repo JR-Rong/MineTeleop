@@ -86,114 +86,6 @@ void single_receiver_epoch_replay_and_emergency() {
   expect(admit(value, cmd, nullptr, ControlPath::Wss, 1200).admitted, "epoch blocked fresh WSS ESTOP");
   expect(!admit(value, cmd, nullptr, ControlPath::Wss, 1200).admitted, "duplicate ESTOP renewed the receiver");
 }
-void explicit_dc_mirror_races_remain_fenced() {
-  expect(mock_dual_sender_allowed(true, false, "test_bench_a", true, true) &&
-      !mock_dual_sender_allowed(false, false, "test_bench_a", true, true) &&
-      !mock_dual_sender_allowed(true, true, "test_bench_a", true, true) &&
-      !mock_dual_sender_allowed(true, false, "vehicle-a", true, true) &&
-      !mock_dual_sender_allowed(true, false, "test_bench_a", false, true) &&
-      !mock_dual_sender_allowed(true, false, "test_bench_a", true, false),
-      "mock dual mode escaped its explicit negotiated bench scope");
-  auto wire = stamp(1, 0, ControlPath::DataChannel, 1);
-  const auto check = [&](ControlTransportFence& value, const ControlCommand& cmd, ControlPath path,
-                         std::int64_t now, bool enabled = true, bool authority = true,
-                         std::string_view attempt = "media-a") {
-    return value.admit(cmd, &wire, path, attempt, now, 100000, 200, authority, false, enabled);
-  };
-  auto disabled = fence(); auto first = command(1, 1000);
-  expect(!check(disabled, first, ControlPath::Wss, 1000, false).admitted,
-      "legacy receiver admitted unnegotiated mirror");
-  expect(!check(disabled, first, ControlPath::Wss, 1201).admitted,
-      "expired mirror bypassed freshness");
-  expect(!check(disabled, first, ControlPath::Wss, 1000, true, false).admitted,
-      "mirror bypassed revoked authority");
-  expect(!check(disabled, first, ControlPath::Wss, 1000, true, true, "media-b").admitted,
-      "mirror bypassed media generation");
-  expect(check(disabled, first, ControlPath::Wss, 1000).changed,
-      "fresh mirrored neutral selection was not admitted");
-  expect(!check(disabled, first, ControlPath::DataChannel, 1001).admitted,
-      "duplicate direct copy was admitted after WSS won");
-  auto next = command(2, 1050); wire["action"] = "command";
-  expect(check(disabled, next, ControlPath::DataChannel, 1050).admitted,
-      "direct copy was not admitted after WSS selection");
-  expect(!check(disabled, next, ControlPath::Wss, 1051).admitted,
-      "duplicate WSS copy was admitted after DC won");
-  auto newer = command(4, 1100);
-  expect(check(disabled, newer, ControlPath::Wss, 1100).admitted, "newer mirror was rejected");
-  auto delayed = command(3, 1090);
-  expect(!check(disabled, delayed, ControlPath::DataChannel, 1101).admitted,
-      "reordered older direct command was admitted");
-  auto wss = stamp(2, 1, ControlPath::Wss, 5); auto fallback = command(5, 1150);
-  expect(disabled.admit(fallback, &wss, ControlPath::Wss, "media-a", 1150, 100000, 200, true).changed,
-      "WSS fallback selection failed");
-  auto old = command(6, 1151);
-  expect(!check(disabled, old, ControlPath::Wss, 1151).admitted,
-      "mirror revived a retired DC epoch");
-  auto stop = command(6, 1152); stop.estop = true;
-  expect(disabled.admit(stop, nullptr, ControlPath::Wss, "media-a", 1152, 100000, 200, true).admitted,
-      "WSS emergency was blocked by mirrored control");
-  expect(!check(disabled, old, ControlPath::DataChannel, 1153).admitted,
-      "delayed direct copy superseded the emergency sequence");
-}
-void mirror_ingress_ack_never_advances_active_ack() {
-  NativeMirrorIngressAcks mirror;
-  NativeControlAcknowledgementWindow active;
-  active.note_sent(1, 100);
-  mirror.note_sent(2);
-  expect(mirror.consume(2), "mirror acknowledgement was not recognized");
-  expect(mirror.consume(2), "duplicate mirror acknowledgement lost its identity");
-  expect(!mirror.consume(1), "ordinary acknowledgement was misclassified as a mirror");
-  expect(active.pending_count() == 1 && active.oldest_sequence() == 1,
-      "mirror ingress acknowledgement advanced active control health");
-  expect(active.acknowledge_through(1, 150), "ordinary acknowledgement failed");
-  for (std::uint64_t seq = 3; seq < 3 + NativeMirrorIngressAcks::kMaxPending; ++seq)
-    mirror.note_sent(seq);
-  expect(!mirror.can_send(), "unacknowledged mirror queue was not bounded");
-  expect(mirror.consume(3) && mirror.can_send(), "mirror queue did not recover on ingress acknowledgement");
-  mirror.reset();
-  expect(!mirror.consume(2) && mirror.can_send(), "retired mirror identities survived reset");
-}
-void wss_owned_dc_mirror_preserves_epoch_and_freshness() {
-  Json identity{{"mock_wss_dc_mirror", kMockWssDcMirrorCapability}, {"mock_wss_dc_attempt", "media-a"},
-      {"control_transport", {{"path", "wss"}}}, {"estop", false}};
-  expect(mock_wss_dc_mirror_allowed(true, "media-a", identity) &&
-      !mock_wss_dc_mirror_allowed(false, "media-a", identity) &&
-      !mock_wss_dc_mirror_allowed(true, "media-b", identity) &&
-      !mock_wss_dc_mirror_allowed(true, "", identity), "mock WSS mirror escaped its negotiated attempt");
-  auto bad = identity; bad["estop"] = true;
-  expect(!mock_wss_dc_mirror_allowed(true, "media-a", bad), "ordinary mirror accepted emergency input");
-  bad = identity; bad["control_transport"]["path"] = "dc";
-  expect(!mock_wss_dc_mirror_allowed(true, "media-a", bad), "ordinary mirror accepted the wrong logical path");
-  const std::string key = "01234567890123456789012345678901";
-  identity["native_mac"] = transport_message_mac(identity, key, false);
-  expect(verify_transport_message(identity, key, false), "mock WSS mirror signature failed");
-  identity["mock_wss_dc_attempt"] = "media-b";
-  expect(!verify_transport_message(identity, key, false), "mock WSS mirror attempt was not signed");
-  auto value = fence();
-  auto select = stamp(1, 0, ControlPath::Wss, 1);
-  auto first = command(1, 1000);
-  expect(!value.admit(first, &select, ControlPath::DataChannel, "media-a", 1000, 100000, 200,
-      true, false, false, true).admitted, "DC mirror selected a WSS epoch");
-  expect(value.admit(first, &select, ControlPath::Wss, "media-a", 1000, 100000, 200, true).changed,
-      "WSS selection did not establish its own epoch");
-  auto wire = stamp(1, 0, ControlPath::Wss, 1, false);
-  auto next = command(2, 1050);
-  expect(!value.admit(next, &wire, ControlPath::DataChannel, "media-a", 1050, 100000, 200, true).admitted,
-      "unnegotiated DC mirror was admitted");
-  expect(!value.admit(next, &wire, ControlPath::DataChannel, "media-a", 1251, 100000, 200,
-      true, false, false, true).admitted, "expired DC mirror bypassed freshness");
-  expect(!value.admit(next, &wire, ControlPath::DataChannel, "media-a", 1050, 100000, 200,
-      false, false, false, true).admitted, "DC mirror bypassed cloud authority");
-  expect(value.admit(next, &wire, ControlPath::DataChannel, "media-a", 1050, 100000, 200,
-      true, false, false, true).admitted, "fresh negotiated DC mirror was not admitted");
-  expect(!value.admit(next, &wire, ControlPath::Wss, "media-a", 1051, 100000, 200, true).admitted,
-      "WSS duplicate was applied after the DC copy");
-  auto new_epoch = stamp(2, 1, ControlPath::DataChannel, 3);
-  expect(value.admit(command(3, 1100), &new_epoch, ControlPath::DataChannel, "media-a", 1100,
-      100000, 200, true).changed, "new direct selection failed");
-  expect(!value.admit(command(4, 1101), &wire, ControlPath::DataChannel, "media-a", 1101,
-      100000, 200, true, false, false, true).admitted, "mirror revived a retired WSS epoch");
-}
 Json payload(std::uint64_t seq, std::int64_t now) {
   auto value = command(seq, now).to_json(); value["intent_seq"] = seq + 100;
   value["intent_fresh"] = true; return value;
@@ -449,8 +341,8 @@ void signatures_bind_native_bytes_and_vehicle_results() {
   expect(!verify_transport_message(forged, key, false), "page could forge actuation");
   forged = frame; forged["control_transport"]["epoch"] = 2;
   expect(!verify_transport_message(forged, key, false), "page could forge a new epoch");
-  forged = frame; forged["mock_dual_control"] = kMockDualControlCapability;
-  expect(!verify_transport_message(forged, key, false), "page could add a mirror capability to signed bytes");
+  forged = frame; forged["unsigned_extension"] = "added-by-page";
+  expect(!verify_transport_message(forged, key, false), "page could add a field to signed bytes");
   forged = frame; forged["throttle"] = 0; // JS parse/stringify can change 0.0 to 0.
   expect(!verify_transport_message(forged, key, false), "raw-byte courier requirement was lost");
   auto result = response(frame); result["vehicle_mac"] = transport_message_mac(result, key, true);
@@ -551,8 +443,8 @@ int main() {
     mock_idle_reprobe_is_fenced_fresh_and_once_per_attempt();
     mock_idle_reprobe_requires_all_fresh_neutral_guards();
     confirmed_profile_permits_only_one_new_bounded_dc_budget();
-    version_scope_and_expiry(); single_receiver_epoch_replay_and_emergency(); explicit_dc_mirror_races_remain_fenced(); mirror_ingress_ack_never_advances_active_ack(); wss_owned_dc_mirror_preserves_epoch_and_freshness(); exact_result_and_neutral_qualification();
+    version_scope_and_expiry(); single_receiver_epoch_replay_and_emergency(); exact_result_and_neutral_qualification();
     slower_dc_and_lost_selection(); cloud_ingress_without_vehicle_result_can_only_start_a_neutral_trial(); healthy_proven_p2p_is_preferred_to_a_faster_cloud_backup(); signatures_bind_native_bytes_and_vehicle_results(); private_signing_material_is_not_public_session_state(); bounded_status_rejects_unsupported_kinds_and_scope_mismatch(); real_service_switch_does_not_disable_watchdog();
-    std::cout << "17 control transport cases passed; real common safety service, no sockets\n";
+    std::cout << "16 control transport cases passed; real common safety service, no sockets\n";
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

@@ -1,5 +1,4 @@
 #include "mine_teleop/detail/native_mock_media_gate.hpp"
-#include "mine_teleop/detail/mock_dc_backpressure.hpp"
 #include "mine_teleop/detail/native_mock_input_sequence.hpp"
 #include "mine_teleop/detail/native_mock_profile_retry.hpp"
 #include "mine_teleop/detail/native_mock_profile_state.hpp"
@@ -63,38 +62,6 @@ void test_mirrored_media_evidence() {
   auto missing = native_mock_media_evidence(status(19000, 7, 7));
   missing["lanes"][0].erase("send_waiting_idr");
   require(!gate.observe(missing, 9100, 19000, 25), "missing critical field admitted");
-}
-void test_mock_dc_backpressure_fails_closed() {
-  using namespace mine_teleop::detail;
-  const auto limit = kMockDcBackpressureBytes;
-  require(!mock_skip_dc_snapshot(true, true, true, limit - 1) && mock_skip_dc_snapshot(true, true, true, limit),
-          "telemetry backpressure boundary changed");
-  require(!mock_skip_dc_snapshot(false, true, true, limit) && !mock_skip_dc_snapshot(true, false, true, limit) &&
-          !mock_skip_dc_snapshot(true, true, false, limit),
-          "telemetry copy dropped outside isolated mock or without WSS");
-  Json vcu{{"event", "vcu_handshake_status"}, {"result", "status_update"}, {"adapter_ready", true},
-      {"status", {{"state", "unsupported"}, {"supported", false}, {"ready", false}, {"requested", false},
-          {"handshake_revoked", false}, {"disarming", false}, {"vmc_fault_code_valid", false}, {"speed_valid", false}}}};
-  require(mock_replaceable_vcu_snapshot(vcu), "stable unsupported mock snapshot was not replaceable");
-  auto bad = vcu; bad["status"]["state"] = "fault";
-  require(!mock_replaceable_vcu_snapshot(bad), "fault VCU status marked replaceable");
-  bad = vcu; bad["status"]["handshake_revoked"] = true;
-  require(!mock_replaceable_vcu_snapshot(bad), "revoked VCU status marked replaceable");
-  bad = vcu; bad["status"].erase("disarming");
-  require(!mock_replaceable_vcu_snapshot(bad), "incomplete VCU status marked replaceable");
-  bad = vcu; bad["status"]["vmc_fault_code_valid"] = true;
-  require(!mock_replaceable_vcu_snapshot(bad), "valid VCU fault evidence marked replaceable");
-  bad = vcu; bad["issue_code"] = "fault";
-  require(!mock_replaceable_vcu_snapshot(bad), "VCU status with issue marked replaceable");
-  bad = vcu; bad["result"] = "connect";
-  require(!mock_replaceable_vcu_snapshot(bad), "VCU action result marked replaceable");
-  require(mock_skip_dc_result(true, true, true, true, limit), "replaceable mock result not suppressed");
-  require(!mock_skip_dc_result(false, true, true, true, limit) &&
-          !mock_skip_dc_result(true, false, true, true, limit) &&
-          !mock_skip_dc_result(true, true, false, true, limit) &&
-          !mock_skip_dc_result(true, true, true, false, limit) &&
-          !mock_skip_dc_result(true, true, true, true, limit - 1),
-          "critical, rejected or unmirrored result was suppressed");
 }
 void test_neutral_refresh_sequence() {
   mine_teleop::detail::NativeMockInputSequence sequence;
@@ -408,6 +375,6 @@ void test_mock_gamepad_neutral_and_profile_limits() {
   require(input.throttle == 0 && input.steering == 0, "zero mock limits produced nonzero motion intent");
 }
 }
-int main() { try { test_gate(); test_mirrored_media_evidence(); test_mock_dc_backpressure_fails_closed(); test_neutral_refresh_sequence(); test_profile_retry_stays_bounded_and_needs_live_guards(); test_profile_requires_new_manual_confirmation_after_invalidation(); test_mock_gear_confirmation_requires_forwarded_intent_and_new_feedback(); test_dtls_header_trace_is_bounded_and_excludes_payloads(); test_mock_keyboard_rearms_only_after_release(); test_vehicle_rearm_withdraws_motion_and_preserves_brake(); test_mock_direction_combinations_require_gear_confirmation(); test_live_clock_keyboard_and_media_guard(); test_mock_gamepad_neutral_and_profile_limits();
+int main() { try { test_gate(); test_mirrored_media_evidence(); test_neutral_refresh_sequence(); test_profile_retry_stays_bounded_and_needs_live_guards(); test_profile_requires_new_manual_confirmation_after_invalidation(); test_mock_gear_confirmation_requires_forwarded_intent_and_new_feedback(); test_dtls_header_trace_is_bounded_and_excludes_payloads(); test_mock_keyboard_rearms_only_after_release(); test_vehicle_rearm_withdraws_motion_and_preserves_brake(); test_mock_direction_combinations_require_gear_confirmation(); test_live_clock_keyboard_and_media_guard(); test_mock_gamepad_neutral_and_profile_limits();
   std::cout << "PASS scoped mock media, input renewal, keyboard and clock guard\n"; return 0; }
 catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; } }

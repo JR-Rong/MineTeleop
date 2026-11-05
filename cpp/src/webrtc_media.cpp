@@ -1,7 +1,5 @@
 #include "mine_teleop/media.hpp"
 #include "mine_teleop/detail/control_transport.hpp"
-#include "mine_teleop/detail/mock_dc_backpressure.hpp"
-#include "mine_teleop/detail/native_mock_media_gate.hpp"
 #include "mine_teleop/detail/direct_authority.hpp"
 #include "mine_teleop/detail/emergency_stop.hpp"
 #include "mine_teleop/detail/feedback_transport.hpp"
@@ -33,7 +31,6 @@
 #include <chrono>
 #include <cctype>
 #include <condition_variable>
-#include <cstdlib>
 #include <ctime>
 #include <deque>
 #include <filesystem>
@@ -1163,12 +1160,6 @@ struct VehicleMediaRuntime::Impl {
         nullptr);
   }
 
-  bool mock_dual_control_enabled() const {
-    const char* enabled = std::getenv("MINE_TELEOP_MOCK_DUAL_CONTROL");
-    return detail::isolated_mock_control_allowed(enabled && std::string_view(enabled) == "1", config.vehicle_id,
-        config.vehicle_adapter.type, config.field_safety.max_speed_kph);
-  }
-
   static void on_offer_created(GstPromise* promise, gpointer user_data) {
     const auto* context = static_cast<MediaOfferContext*>(user_data);
     const auto state = context->state;
@@ -1243,8 +1234,6 @@ struct VehicleMediaRuntime::Impl {
     state->pending.emplace_back("webrtc_offer", Json{
          {"type", "offer"},
          {"control_transport_capability", self->signaling.transport_mac_key().size() >= 32 ? detail::kControlTransportCapability : std::string_view{}},
-         {"mock_dual_control", self->mock_dual_control_enabled() ? detail::kMockDualControlCapability : std::string_view{}},
-         {"mock_wss_dc_mirror", self->mock_dual_control_enabled() ? detail::kMockWssDcMirrorCapability : std::string_view{}},
          {"emergency_stop_capability", self->config.runtime.experimental_direct_authority_max_ms > 0 && self->signaling.transport_mac_key().size() >= 32 ? detail::kEmergencyStopCapability : std::string_view{}},
          {"feedback_transport_capability", self->config.runtime.experimental_direct_authority_max_ms > 0 && self->signaling.transport_mac_key().size() >= 32 ? detail::kFeedbackTransportCapability : std::string_view{}},
          {"sdp", text == nullptr ? "" : text},
@@ -1656,20 +1645,14 @@ struct VehicleMediaRuntime::Impl {
         throw std::invalid_argument("control result authority mismatch");
       if ((message.contains("control_transport") || message.contains("emergency_stop") || message.contains("feedback_request")) && !detail::verify_transport_message(message, signaling.transport_mac_key(), false))
         throw std::invalid_argument("native control authentication failed");
-      const bool mock_dual_dc = mock_dual_control_enabled() &&
-          message.value("mock_dual_control", "") == detail::kMockDualControlCapability &&
-          message.contains("control_transport") &&
-          message.at("control_transport").value("path", "") == "dc" && !command.estop;
       std::string current_attempt;
       { std::lock_guard scope_lock(media_signal_state->mutex); current_attempt = media_signal_state->negotiation_id; }
-      const bool mock_wss_dc = detail::mock_wss_dc_mirror_allowed(mock_dual_control_enabled(), current_attempt, message);
-      const bool mock_dual = mock_dual_dc || mock_wss_dc;
       Json result_message = {{"event", "vehicle_control_result"}, {"protocol", detail::kControlTransportCapability},
           {"session_id", command.session_id}, {"vehicle_id", command.vehicle_id}, {"driver_id", command.driver_id},
           {"command_seq", command.seq}, {"intent_seq", intent_seq}, {"accepted", false},
           {"rearm_required", false}, {"control_status_seq", 0}, {"reason", "control_not_applied"},
           {"transport_admitted", false}, {"transport_selected", false}};
-      if (config.runtime.experimental_direct_authority_max_ms > 0 || mock_dual)
+      if (config.runtime.experimental_direct_authority_max_ms > 0)
         result_message["command_received_path"] = transport == ControlMessageTransport::DataChannel ? "dc" : "wss";
       if (message.contains("control_transport")) {
         const auto stamp = detail::ControlTransportStamp::from_json(message.at("control_transport"));
@@ -1706,27 +1689,16 @@ struct VehicleMediaRuntime::Impl {
         const bool probe = selected_feedback && message.at("feedback_request").value("probe", false);
         const bool via_wss = !selected_feedback || probe || feedback_transport_fence.path() == detail::ControlPath::Wss;
         const bool via_dc = selected_feedback ? probe || feedback_transport_fence.path() == detail::ControlPath::DataChannel :
-            transport == ControlMessageTransport::DataChannel || message.contains("emergency_stop") || mock_dual;
+            transport == ControlMessageTransport::DataChannel || message.contains("emergency_stop");
         if (via_wss) {
           latest_control_result = result_message;
           // The native WSS handler already sends its own result immediately.
           // Only an asynchronous publisher needs to interrupt its receive wait.
-          if (!native_feedback || mock_dual) wake_native_control_feedback();
+          if (!native_feedback) wake_native_control_feedback();
         }
         if (native_feedback && via_wss) *native_feedback = result_message;
-        bool dc_send_invoked = control_link_open && control_channel && via_dc &&
+        const bool dc_send_invoked = control_link_open && control_channel && via_dc &&
             (transport != ControlMessageTransport::DataChannel || control_channel == channel);
-        bool dc_backpressure_skipped = false;
-        if (dc_send_invoked && mock_dual) {
-          guint64 buffered_bytes = 0;
-          g_object_get(control_channel, "buffered-amount", &buffered_bytes, nullptr);
-          const bool ordinary_command = !command.estop && !message.contains("emergency_stop") &&
-              !message.contains("feedback_request") && message.contains("control_transport") &&
-              message.at("control_transport").value("action", "") == "command";
-          dc_backpressure_skipped = detail::mock_skip_dc_result(mock_dual, via_wss,
-              result_message.value("accepted", false), ordinary_command, buffered_bytes);
-          if (dc_backpressure_skipped) dc_send_invoked = false;
-        }
         const auto dc_send_started = steady_now_ms();
         if (dc_send_invoked)
           gst_webrtc_data_channel_send_string(control_channel, result_message.dump().c_str());
@@ -1742,8 +1714,7 @@ struct VehicleMediaRuntime::Impl {
                 {"result_mutex_wait_ms", publish_lock_acquired - publish_started},
                 {"result_prepare_ms", dc_send_started - publish_lock_acquired},
                 {"dc_send_call_ms", publish_completed - dc_send_started},
-                {"dc_send_invoked", dc_send_invoked}, {"dc_backpressure_skipped", dc_backpressure_skipped},
-                {"wss_mailbox_updated", via_wss}});
+                {"dc_send_invoked", dc_send_invoked}, {"wss_mailbox_updated", via_wss}});
           } catch (...) { note_control_trace_drop(); }
         }
       }};
@@ -1953,23 +1924,12 @@ struct VehicleMediaRuntime::Impl {
             transport == ControlMessageTransport::DataChannel ? detail::ControlPath::DataChannel : detail::ControlPath::Wss,
             current_attempt, signaling.now_ms(), signaling.control_lease_expiry(), config.control.max_command_gap_ms,
             direct_authority.configured() ? direct_authority.valid(steady_now_ms()) :
-                (native_control_websocket_connected.load() && native_control_transport_cloud_capable.load()), verified_stop_only,
-            mock_dual_dc && control_link_open && control_channel,
-            mock_wss_dc && control_link_open && control_channel);
+                (native_control_websocket_connected.load() && native_control_transport_cloud_capable.load()), verified_stop_only);
         result_message["reason"] = decision.reason;
         result_message["transport_admitted"] = decision.admitted;
         result_message["transport_selected"] = decision.admitted && message.contains("control_transport") &&
             message.at("control_transport").value("action", "") == "select";
         if (!decision.admitted) {
-          if (mock_dual && decision.reason == "transport_sequence_replayed") {
-            // The authenticated competing copy consumed this identity. Do not
-            // apply it or emit a rejection that can race its actual result.
-            publish_result.publish = [] {};
-            lock.unlock();
-            queue_control_trace(nullptr, "mock_dual_duplicate", false,
-                std::nullopt, std::nullopt, std::nullopt, std::nullopt);
-            return;
-          }
           ++rejected_control_commands;
           lock.unlock();
           queue_control_trace(nullptr, decision.reason, false,
@@ -3078,26 +3038,7 @@ struct VehicleMediaRuntime::Impl {
     }
     if (control_channel != nullptr && control_link_open &&
         (!control_transport_fence.negotiated() || control_transport_fence.path() == detail::ControlPath::DataChannel)) {
-      // Mirror the original scoped status, preserving sequence and source time.
-      const auto kind = message.value("event", "");
-      const bool snapshot_mirror = mock_dual_control_enabled() &&
-          (kind == "vehicle_telemetry" || kind == "vcu_handshake_status") &&
-          cloud_control_authority_live_locked() &&
-          (!message.contains("session_id") || message.at("session_id") == signaling.session_id()) &&
-          (!message.contains("vehicle_id") || message.at("vehicle_id") == config.vehicle_id) &&
-          (!message.contains("driver_id") || message.at("driver_id") == signaling.driver_id());
-      guint64 buffered_bytes = 0;
-      if (snapshot_mirror) g_object_get(control_channel, "buffered-amount", &buffered_bytes, nullptr);
-      const bool replaceable = kind == "vehicle_telemetry" || detail::mock_replaceable_vcu_snapshot(message);
-      const bool skip_dc = detail::mock_skip_dc_snapshot(mock_dual_control_enabled(), snapshot_mirror, replaceable, buffered_bytes);
-      if (skip_dc && kind == "vehicle_telemetry") ++mock_skipped_dc_telemetry;
-      if (skip_dc && kind == "vcu_handshake_status") ++mock_skipped_dc_vcu_snapshot;
-      if (!skip_dc)
-        gst_webrtc_data_channel_send_string(control_channel, message.dump().c_str());
-      if (snapshot_mirror) {
-        pending_control_status[kind] = message;
-        wake_native_control_feedback();
-      }
+      gst_webrtc_data_channel_send_string(control_channel, message.dump().c_str());
     } else if (control_transport_fence.negotiated() || cloud_control_authority_live_locked()) {
       if ((message.contains("session_id") && message.at("session_id") != signaling.session_id()) ||
           (message.contains("vehicle_id") && message.at("vehicle_id") != config.vehicle_id) ||
@@ -3130,8 +3071,6 @@ struct VehicleMediaRuntime::Impl {
       enqueue_control_trace({{"stage", "mock_telemetry_publish"}, {"seq", sequence},
           {"event_monotonic_ms", trace_now}, {"bytes", payload_value.dump().size()},
           {"channel_buffered_bytes", buffered_bytes},
-          {"mock_skipped_dc_telemetry", mock_skipped_dc_telemetry},
-          {"mock_skipped_dc_vcu_snapshot", mock_skipped_dc_vcu_snapshot},
           {"channel_open", control_link_open.load()},
           {"feedback_path", feedback_transport_fence.negotiated() ?
               Json(std::string(detail::control_path_name(feedback_transport_fence.path()))) : Json(nullptr)},
@@ -3647,11 +3586,7 @@ struct VehicleMediaRuntime::Impl {
             signaling.driver_id(),
             signaling.session_id(),
             signaling.control_token(),
-            create_vehicle_adapter(config),
-            // The watchdog ticks every 50 ms. Give the isolated dual-path
-            // mock a new vehicle snapshot on each tick instead of every other
-            // tick; the receiver's freshness and release gates stay intact.
-            mock_dual_control_enabled() ? 40 : 100);
+            create_vehicle_adapter(config));
         control_service->start(signaling.now_ms());
         // A critical camera can fail while a vendor adapter is synchronously
         // opening.  The latch is set before it waits for this mutex, so check
@@ -5322,21 +5257,6 @@ struct VehicleMediaRuntime::Impl {
           }
           queue_signal(
               "media_status", status);
-          // Experimental, zero-speed mock only. Send the same safety evidence
-          // over the already scoped DTLS channel when it has no backlog. It
-          // must never displace or delay control feedback on a busy channel.
-          if (mock_dual_control_enabled()) {
-            const auto payload = Json{{"event", "mock_media_status_v1"},
-                {"status", detail::native_mock_media_evidence(status)}}.dump();
-            if (payload.size() <= 4096) {
-              std::lock_guard lock(control_mutex);
-              if (control_link_open && control_channel) {
-                guint64 buffered = 0;
-                g_object_get(control_channel, "buffered-amount", &buffered, nullptr);
-                if (buffered == 0) gst_webrtc_data_channel_send_string(control_channel, payload.c_str());
-              }
-            }
-          }
           next_media_status_ms = signaling.now_ms() + 1000;
         }
         if (simulate_primary_failure_after_frames > 0 && candidate_index == 0 && !simulated_failure_fired &&
@@ -5731,7 +5651,6 @@ struct VehicleMediaRuntime::Impl {
   std::optional<std::int64_t> last_vcu_status_ms;
   std::uint64_t last_vehicle_telemetry_seq{0};
   std::int64_t last_mock_telemetry_trace_ms{0};
-  std::uint64_t mock_skipped_dc_telemetry{0}, mock_skipped_dc_vcu_snapshot{0};
   std::string control_status_session_id;
   std::uint64_t control_status_seq{0};
   std::uint64_t last_control_rejection_status_seq{0};

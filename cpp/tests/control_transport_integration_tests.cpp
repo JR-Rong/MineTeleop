@@ -131,23 +131,15 @@ struct Fixture {
   bool use_native_publication{false};
   std::unique_ptr<NativeControlPublication> native_publication;
   bool use_native_courier{false};
-  bool mock_dual{false};
   bool delay_wss_results{true};
-  bool wss_dc_peer{false};
   bool drop_dc_commands{false};
   bool drop_wss_commands{false};
-  std::uint64_t dual_applied{}, dual_duplicates{}, dual_wss_applied{}, dual_dc_applied{};
-  std::uint64_t wss_dc_mirror_applied{};
-  std::int64_t last_pump_ms{-1}, max_pump_gap_ms{}, max_wss_result_lateness_ms{};
-  std::size_t max_delayed_results{};
-  std::set<std::uint64_t> dual_applied_sequences;
-  std::map<std::uint64_t, std::string> dual_frames;
   std::unique_ptr<NativeControlCourier> native_courier;
   std::deque<std::string> courier_receipts;
   explicit Fixture(bool direct = false, bool feedback = false, bool product = false,
-      std::string mode = "p2p_preferred", bool dual = false, bool defer_owner = false, bool wss_dc = true)
-      : vehicle_name(dual ? "test_bench_transport" : "transport-vehicle"),
-        feedback_enabled(feedback), direct_enabled(direct), mock_dual(dual), wss_dc_peer(dual && wss_dc) {
+      std::string mode = "p2p_preferred", bool defer_owner = false)
+      : vehicle_name("transport-vehicle"),
+        feedback_enabled(feedback), direct_enabled(direct) {
     SignalingServerConfig config;
     if (direct_enabled) {
       authority_directory = std::filesystem::temp_directory_path() / ("mine-direct-loopback-" + std::to_string(steady()));
@@ -174,7 +166,6 @@ struct Fixture {
     driver_config.driver_id = "transport-driver"; driver_config.signaling_url = base;
     dc_network_path = direct_enabled ? "p2p" : "unknown";
     driver_config.enable_experimental_direct_authority = direct_enabled;
-    driver_config.mock_dual_control = mock_dual;
     driver_config.defer_control_bootstrap = defer_owner;
     driver = std::make_unique<DriverConsoleRuntime>(driver_config, vehicle_name, "fixture-password");
     const auto connected = driver->connect(vehicle_name, "owner");
@@ -207,8 +198,6 @@ struct Fixture {
         {"connection_generation", generation}, {"type", "webrtc_offer"},
         {"payload", {{"type", "offer"}, {"sdp", "v=0\r\na=ice-ufrag:offline\r\n"},
                      {"media_negotiation_id", media_attempt}, {"control_transport_capability", kControlTransportCapability},
-                     {"mock_dual_control", mock_dual ? kMockDualControlCapability : std::string_view{}},
-                     {"mock_wss_dc_mirror", wss_dc_peer ? kMockWssDcMirrorCapability : std::string_view{}},
                      {"emergency_stop_capability", direct_enabled ? kEmergencyStopCapability : std::string_view{}},
                      {"feedback_transport_capability", feedback_enabled ? kFeedbackTransportCapability : std::string_view{}}}}});
     static_cast<void>(http.post_json_response(base + "/signaling/" + session + "/messages", offer));
@@ -303,10 +292,6 @@ struct Fixture {
     last_received_payload = payload;
     if (payload.contains("control_transport")) expect(verify_transport_message(payload, signing_key, false), "native byte authentication failed");
     const auto command = ControlCommand::from_json(payload);
-    if (mock_dual && payload.value("mock_dual_control", "") == kMockDualControlCapability) {
-      const auto [it, inserted] = dual_frames.emplace(command.seq, payload.dump());
-      expect(inserted || it->second == payload.dump(), "dual copies changed signed command bytes");
-    }
     bool verified_stop = false;
     if (payload.contains("emergency_stop")) {
       emergency_receiver.observe_latched(vehicle->safety_state() == SafetyState::Estop);
@@ -319,26 +304,15 @@ struct Fixture {
     if (!direct_enabled || command.estop || car_authority.allows(payload.value("direct_authority", Json(nullptr)), steady()))
       decision = fence.admit(command, payload.contains("control_transport") ? &payload.at("control_transport") : nullptr,
           path, media_attempt, utc(), car_control_lease_expiry, 200, direct_enabled ? car_authority.valid(steady()) : cloud_online,
-          verified_stop, mock_dual && payload.value("mock_dual_control", "") == kMockDualControlCapability,
-          mock_wss_dc_mirror_allowed(wss_dc_peer, media_attempt, payload));
-    if (mock_dual && decision.reason == "transport_sequence_replayed") { ++dual_duplicates; return Json(nullptr); }
+          verified_stop);
     if (feedback_enabled && decision.admitted && !command.estop && payload.contains("feedback_request")) {
       static_cast<void>(feedback_fence.select(payload.at("feedback_request"), car_authority.reference(), media_attempt, feedback_status_sequence));
       last_feedback_command = payload;
     }
     ReceiveResult applied;
     if (decision.admitted) {
-      if (mock_dual && (payload.value("mock_dual_control", "") == kMockDualControlCapability ||
-                        payload.value("mock_wss_dc_mirror", "") == kMockWssDcMirrorCapability)) {
-        expect(dual_applied_sequences.insert(command.seq).second, "duplicate command reached vehicle service twice");
-        ++dual_applied;
-        if (path == ControlPath::Wss) ++dual_wss_applied; else ++dual_dc_applied;
-      }
       if (decision.changed) vehicle->set_control_braking_wait(true, utc(), ControlRecoveryCause::ControlLink);
       applied = vehicle->receive_command(command, utc());
-      if (applied.accepted && mock_dual && path == ControlPath::DataChannel &&
-          payload.value("mock_wss_dc_mirror", "") == kMockWssDcMirrorCapability)
-        ++wss_dc_mirror_applied;
     }
     Json result = {{"event", "vehicle_control_result"}, {"protocol", kControlTransportCapability},
         {"session_id", session}, {"vehicle_id", vehicle_name}, {"driver_id", "transport-driver"},
@@ -356,9 +330,6 @@ struct Fixture {
       result["emergency_reset_epoch"] = emergency_receiver.reset_epoch();
       result["command_received_path"] = control_path_name(path);
     }
-    if (mock_dual && (payload.value("mock_dual_control", "") == kMockDualControlCapability ||
-                      payload.value("mock_wss_dc_mirror", "") == kMockWssDcMirrorCapability))
-      result["command_received_path"] = control_path_name(path);
     if (feedback_enabled && feedback_fence.negotiated()) result["feedback_transport"] = feedback_fence.state();
     if (verified_stop) {
       emergency_receiver.observe_latched(vehicle->safety_state() == SafetyState::Estop);
@@ -413,12 +384,6 @@ struct Fixture {
     return response;
   }
   void pump(bool dc_ready) {
-    if (mock_dual) {
-      const auto now = steady();
-      if (last_pump_ms >= 0 && now >= last_pump_ms)
-        max_pump_gap_ms = std::max(max_pump_gap_ms, now - last_pump_ms);
-      last_pump_ms = now;
-    }
     renew_authority();
     if (refresh_input && steady() - last_input >= 60) input();
     const auto received = cloud_online ? vehicle_socket.receive_json(std::chrono::milliseconds(1)) : WebSocketReceiveResult{};
@@ -435,17 +400,15 @@ struct Fixture {
       if (!dropped && result.is_object()) {
         if (feedback_enabled) route_feedback(result, payload);
         else delayed.emplace_back(steady() + (delay_wss_results ? 60 : 0), std::move(result));
-        if (mock_dual) max_delayed_results = std::max(max_delayed_results, delayed.size());
       }
     }
     while (cloud_online && !delayed.empty() && delayed.front().first <= steady()) {
-      if (mock_dual) max_wss_result_lateness_ms = std::max(max_wss_result_lateness_ms, steady() - delayed.front().first);
       vehicle_socket.send_json(delayed.front().second); delayed.pop_front();
     }
     if (ui_epoch == 0) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); return; }
     if (use_native_courier) {
       const NativeCourierScope current{{session, native_generation, media_attempt}, "owner", ui_epoch};
-      if (!native_courier) native_courier = std::make_unique<NativeControlCourier>(current, wss_dc_peer);
+      if (!native_courier) native_courier = std::make_unique<NativeControlCourier>(current);
       NativeControlCourier::Io io{
           [&]() -> std::optional<std::string> {
             if (courier_receipts.empty()) return {};
@@ -492,135 +455,8 @@ struct Fixture {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
 };
-void mock_dual_control_survives_direct_packet_loss() {
-  Fixture fixture(false, false, true, "p2p_preferred", true);
-  // This test exercises delivery via a fresh WSS copy when the DC copy is
-  // lost. A fixed artificial delay plus CI scheduling can exceed the real
-  // 200 ms safety bound, for which the correct behavior is to withdraw input;
-  // late-ACK withdrawal is exercised separately by native-control-ack tests.
-  fixture.delay_wss_results = false;
-  fixture.dc_network_path = "p2p";
-  fixture.use_native_courier = true;
-  auto deadline = steady() + 8000;
-  while (steady() < deadline) {
-    fixture.pump(true);
-    const auto state = fixture.driver->status().at("native_control").at("control_transport");
-    if (state.value("mock_dual_control", false) && !state.value("selecting", true) &&
-        !state.value("qualifying", true) && fixture.dual_applied >= 5 && fixture.dual_duplicates >= 2) break;
-  }
-  auto state = fixture.driver->status().at("native_control").at("control_transport");
-  expect(state.value("mock_dual_control", false) && !state.value("selecting", true) &&
-      !state.value("qualifying", true), "mock dual control failed to qualify");
-  expect(fixture.dual_applied >= 5 && fixture.dual_duplicates >= 2,
-      "real signaling path did not deliver authenticated duplicates");
-  const auto wss_before = fixture.dual_wss_applied;
-  fixture.last_pump_ms = steady();
-  fixture.max_pump_gap_ms = fixture.max_wss_result_lateness_ms = 0;
-  fixture.max_delayed_results = fixture.delayed.size();
-  fixture.drop_dc_commands = true;
-  deadline = steady() + 2000;
-  while (steady() < deadline) fixture.pump(true);
-  state = fixture.driver->status().at("native_control").at("control_transport");
-  if (!(fixture.dual_wss_applied > wss_before + 5 && state.value("mock_dual_control", false) &&
-      state.at("path") == "dc" && !state.value("selecting", true)))
-    throw std::runtime_error("signed vehicle results from WSS did not sustain dual control when DC copies were lost: " +
-        Json{{"wss_applied_before", wss_before}, {"wss_applied_after", fixture.dual_wss_applied},
-             {"duplicates", fixture.dual_duplicates}, {"control_transport", state},
-             {"max_pump_gap_ms", fixture.max_pump_gap_ms}, {"max_wss_result_lateness_ms", fixture.max_wss_result_lateness_ms},
-             {"max_delayed_results", fixture.max_delayed_results},
-             {"last_vehicle_rejection", fixture.first_vehicle_rejection}}.dump());
-  const auto result_latency = fixture.driver->status().at("native_control").at("vehicle_result_latency");
-  expect(result_latency.value("vehicle_received_path", "") == "wss",
-      "logical DC publication mislabeled the WSS vehicle receipt");
-  fixture.drop_dc_commands = false;
-  fixture.drop_wss_commands = true;
-  const auto dc_before = fixture.dual_dc_applied;
-  deadline = steady() + 1500;
-  while (steady() < deadline) fixture.pump(true);
-  state = fixture.driver->status().at("native_control").at("control_transport");
-  expect(fixture.dual_dc_applied > dc_before + 5 && state.value("mock_dual_control", false),
-      "direct commands did not continue when WSS copies were lost");
-  fixture.drop_dc_commands = true;
-  deadline = steady() + 2200;
-  while (steady() < deadline) {
-    fixture.pump(true);
-    std::lock_guard lock(fixture.car_mutex);
-    fixture.vehicle->tick(utc());
-  }
-  { std::lock_guard lock(fixture.car_mutex);
-    expect(fixture.vehicle->safety_state() == SafetyState::TimeoutBrake,
-        "loss of both command paths failed to trigger the existing vehicle timeout"); }
-  std::cout << "[MOCK_DUAL] native/cloud WSS with simulated independent and combined losses; no WebRTC or hardware proof\n";
-}
-void mock_wss_dc_mirror_survives_cloud_carrier_loss() {
-  Fixture fixture(false, false, true, "p2p_preferred", true);
-  fixture.dc_network_path = "p2p"; fixture.use_native_courier = true;
-  auto deadline = steady() + 8000;
-  while (steady() < deadline) {
-    fixture.pump(true);
-    const auto state = fixture.driver->status().at("native_control").at("control_transport");
-    if (state.at("path") == "dc" && !state.at("selecting").get<bool>() &&
-        !state.at("qualifying").get<bool>()) break;
-  }
-  auto state = fixture.driver->status().at("native_control").at("control_transport");
-  expect(state.at("path") == "dc" && !state.at("selecting").get<bool>(), "direct setup did not qualify");
-  fixture.dc_network_path = "unknown";
-  deadline = steady() + 4000;
-  while (steady() < deadline) {
-    fixture.pump(true);
-    state = fixture.driver->status().at("native_control").at("control_transport");
-    if (state.at("path") == "wss" && !state.at("selecting").get<bool>()) break;
-  }
-  expect(state.at("path") == "wss" && !state.at("selecting").get<bool>(), "WSS selection did not complete");
-  fixture.dc_network_path = "p2p";
-  fixture.drop_wss_commands = true; // Cloud authority and ingress remain live; only this carrier is lost.
-  deadline = steady() + 2000;
-  while (steady() < deadline && fixture.wss_dc_mirror_applied < 3) fixture.pump(true);
-  state = fixture.driver->status().at("native_control").at("control_transport");
-  expect(fixture.wss_dc_mirror_applied >= 3 && state.at("path") == "wss" && !state.at("selecting").get<bool>(),
-      "confirmed WSS epoch did not deliver fresh signed DC mirrors during WSS carrier loss");
-  fixture.drop_dc_commands = true;
-  deadline = steady() + 2200;
-  while (steady() < deadline) {
-    fixture.pump(true);
-    std::lock_guard lock(fixture.car_mutex);
-    fixture.vehicle->tick(utc());
-  }
-  { std::lock_guard lock(fixture.car_mutex);
-    expect(fixture.vehicle->safety_state() == SafetyState::TimeoutBrake,
-        "loss of both WSS-owned carriers failed to trigger the existing watchdog"); }
-  std::cout << "[MOCK_WSS_DC] confirmed WSS epoch mirrored over simulated DC with cloud authority live\n";
-}
-void legacy_mock_peer_does_not_receive_wss_dc_mirrors() {
-  Fixture fixture(false, false, true, "p2p_preferred", true, false, false);
-  fixture.dc_network_path = "p2p"; fixture.use_native_courier = true;
-  auto deadline = steady() + 8000;
-  while (steady() < deadline) {
-    fixture.pump(true);
-    const auto state = fixture.driver->status().at("native_control").at("control_transport");
-    if (state.at("path") == "dc" && !state.at("selecting").get<bool>() &&
-        !state.at("qualifying").get<bool>()) break;
-  }
-  auto state = fixture.driver->status().at("native_control").at("control_transport");
-  expect(state.at("path") == "dc" && !state.at("selecting").get<bool>(), "legacy direct setup did not qualify");
-  fixture.dc_network_path = "unknown";
-  deadline = steady() + 4000;
-  while (steady() < deadline) {
-    fixture.pump(true);
-    state = fixture.driver->status().at("native_control").at("control_transport");
-    if (state.at("path") == "wss" && !state.at("selecting").get<bool>()) break;
-  }
-  expect(state.at("path") == "wss" && !state.at("selecting").get<bool>(), "legacy WSS selection did not complete");
-  fixture.dc_network_path = "p2p";
-  const auto before = fixture.dc_commands;
-  deadline = steady() + 1000;
-  while (steady() < deadline) fixture.pump(true);
-  state = fixture.driver->status().at("native_control").at("control_transport");
-  expect(state.at("path") == "wss" && fixture.dc_commands == before && fixture.wss_dc_mirror_applied == 0,
-      "unnegotiated legacy peer received a WSS-owned DC mirror");
-}
 void native_mock_estop_reaches_vehicle_after_input_loss(bool before_owner = false) {
-  Fixture fixture(false, false, true, "p2p_preferred", false, before_owner);
+  Fixture fixture(false, false, true, "p2p_preferred", before_owner);
   fixture.dc_network_path = "p2p"; fixture.use_native_courier = true;
   auto deadline = steady() + 8000;
   if (!before_owner) {
@@ -1378,6 +1214,6 @@ void emergency_broker_delivers_after_ordinary_wss_is_already_blocked() {
 }
 }  // namespace
 int main(int argc, char** argv) {
-  try { courier_status_does_not_wait_for_signaling_poll(); if (argc > 1 && std::string_view(argv[1]) == "--mock-estop-only") { native_mock_estop_reaches_vehicle_after_input_loss(); native_mock_estop_reaches_vehicle_after_input_loss(true); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--mock-dual-only") { mock_dual_control_survives_direct_packet_loss(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--mock-wss-dc-only") { mock_wss_dc_mirror_survives_cloud_carrier_loss(); legacy_mock_peer_does_not_receive_wss_dc_mirrors(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--feedback-only") { actual_feedback_selection_is_independent_and_rejects_retired_statuses(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-courier-only") { native_courier_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-dual-video-only") { native_dual_video_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-safety-only") { native_publication_safety_interlocks(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-publication-only") { native_publication_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--outage-only") { actual_native_short_cloud_outage_and_independent_vehicle_expiry(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--product-only") { product_recovery_withdraws_unfetched_motion(); product_wss_reconnect_retires_dc_and_recovers_ack(); product_startup_and_p2p_cloud_recovery(); product_cloud_only_never_trials_dc(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } native_publication_bridge_integration(); native_courier_bridge_integration(); native_publication_safety_interlocks(); native_dual_video_bridge_integration(); integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
+  try { courier_status_does_not_wait_for_signaling_poll(); if (argc > 1 && std::string_view(argv[1]) == "--mock-estop-only") { native_mock_estop_reaches_vehicle_after_input_loss(); native_mock_estop_reaches_vehicle_after_input_loss(true); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--feedback-only") { actual_feedback_selection_is_independent_and_rejects_retired_statuses(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-courier-only") { native_courier_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-dual-video-only") { native_dual_video_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-safety-only") { native_publication_safety_interlocks(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-publication-only") { native_publication_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--outage-only") { actual_native_short_cloud_outage_and_independent_vehicle_expiry(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--product-only") { product_recovery_withdraws_unfetched_motion(); product_wss_reconnect_retires_dc_and_recovers_ack(); product_startup_and_p2p_cloud_recovery(); product_cloud_only_never_trials_dc(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } native_publication_bridge_integration(); native_courier_bridge_integration(); native_publication_safety_interlocks(); native_dual_video_bridge_integration(); integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

@@ -10,36 +10,6 @@
 
 namespace mine_teleop::detail {
 
-// Ingress acknowledgements for duplicate mock copies are bookkeeping only:
-// they do not prove vehicle receipt and cannot refresh a control watchdog.
-// The caller serializes this object with the signaling socket.
-class NativeMirrorIngressAcks {
- public:
-  static constexpr std::size_t kMaxPending = 128;
-  static constexpr std::size_t kMaxRetained = 256;
-  void reset() noexcept { entries_.clear(); pending_ = 0; }
-  [[nodiscard]] bool can_send() const noexcept {
-    return pending_ < kMaxPending && (entries_.size() < kMaxRetained || !entries_.front().pending);
-  }
-  void note_sent(std::uint64_t sequence) {
-    if (!sequence || !can_send() || (!entries_.empty() && sequence <= entries_.back().seq))
-      throw std::invalid_argument("invalid mirrored signaling sequence");
-    if (entries_.size() == kMaxRetained) entries_.pop_front();
-    entries_.push_back({sequence, true}); ++pending_;
-  }
-  bool consume(std::uint64_t sequence) noexcept {
-    const auto it = std::find_if(entries_.begin(), entries_.end(),
-        [sequence](const Entry& value) { return value.seq == sequence; });
-    if (it == entries_.end()) return false;
-    if (it->pending) { it->pending = false; --pending_; }
-    return true;
-  }
- private:
-  struct Entry { std::uint64_t seq; bool pending; };
-  std::deque<Entry> entries_;
-  std::size_t pending_{};
-};
-
 // ACK liveness follows cumulative sequence progress, independently of packet
 // latency. Retain oldest-packet timing for diagnostics and bound the backlog.
 class NativeControlAcknowledgementWindow {

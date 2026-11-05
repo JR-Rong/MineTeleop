@@ -10,24 +10,6 @@
 namespace mine_teleop::detail {
 
 inline constexpr std::string_view kControlTransportCapability = "native-control-transport-v1";
-inline constexpr std::string_view kMockDualControlCapability = "mock-dual-control-v1";
-inline constexpr std::string_view kMockWssDcMirrorCapability = "mock-wss-dc-mirror-v1";
-// Isolated zero-speed mock bench only. Removed together with the dual-path mock.
-inline bool isolated_mock_control_allowed(bool explicitly_enabled, std::string_view vehicle,
-                                          std::string_view adapter, double max_speed_kph) {
-  return explicitly_enabled && vehicle.starts_with("test_bench_") && adapter == "mock" && max_speed_kph == 0.0;
-}
-// The caller must verify the message MAC and independent control authority.
-// The signed attempt binds this mock-only extra carrier to the current peer.
-inline bool mock_wss_dc_mirror_allowed(bool enabled, std::string_view attempt, const Json& value) {
-  if (!enabled || attempt.empty() || !value.is_object()) return false;
-  try {
-    return value.value("mock_wss_dc_mirror", "") == kMockWssDcMirrorCapability &&
-        value.value("mock_wss_dc_attempt", "") == attempt && value.contains("control_transport") &&
-        value.at("control_transport").is_object() && value.at("control_transport").value("path", "") == "wss" &&
-        !value.value("estop", false);
-  } catch (const Json::exception&) { return false; }
-}
 std::string control_transport_mac(std::string_view value, std::string_view key);
 inline std::string transport_message_mac(const Json& value, std::string_view key, bool vehicle_result) {
   auto unsigned_value = value;
@@ -190,8 +172,7 @@ class ControlTransportFence {
   }
   Decision admit(const ControlCommand& command, const Json* stamp_json, ControlPath received_path,
       std::string_view current_media_attempt, std::int64_t now_utc_ms, std::int64_t lease_expires_at_ms,
-      int max_command_gap_ms, bool cloud_authority_live, bool verified_stop_only = false,
-      bool allow_wss_mirror_of_dc = false, bool allow_dc_mirror_of_wss = false) {
+      int max_command_gap_ms, bool cloud_authority_live, bool verified_stop_only = false) {
     if (session_.empty() || command.vehicle_id != vehicle_ || command.driver_id != driver_ ||
         command.session_id != session_ || command.control_token != token_)
       return {false, false, "transport_authority_mismatch"};
@@ -214,18 +195,7 @@ class ControlTransportFence {
       last_seq_ = command.seq; return {true, false, "legacy_wss"};
     }
     const auto stamp = ControlTransportStamp::from_json(*stamp_json);
-    // An explicitly negotiated duplicate may carry the exact DC-stamped,
-    // authenticated command over WSS. The logical owner and epoch remain DC;
-    // the global sequence below admits at most one copy. This flag is false
-    // for existing sessions and never bypasses lease, expiry or attempt checks.
-    const bool mirrored = allow_wss_mirror_of_dc && received_path == ControlPath::Wss &&
-        stamp.path == ControlPath::DataChannel;
-    // A WSS-owned command may use DC as an additional carrier only after the
-    // WSS epoch has been selected. The caller verifies the signed attempt and
-    // negotiated mock capability; a mirror cannot select a new epoch.
-    const bool dc_mirror = allow_dc_mirror_of_wss && received_path == ControlPath::DataChannel &&
-        stamp.path == ControlPath::Wss && !stamp.select;
-    if ((!mirrored && !dc_mirror && stamp.path != received_path) ||
+    if (stamp.path != received_path ||
         (stamp.path == ControlPath::DataChannel && stamp.media_attempt != current_media_attempt))
       return {false, false, "transport_path_or_attempt_mismatch"};
     bool changed = false;

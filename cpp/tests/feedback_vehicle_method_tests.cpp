@@ -1,6 +1,5 @@
 #include "mine_teleop/detail/feedback_transport.hpp"
 #include "mine_teleop/detail/emergency_stop.hpp"
-#include "mine_teleop/detail/mock_dc_backpressure.hpp"
 #include "mine_teleop/media.hpp"
 #include <mutex>
 
@@ -13,12 +12,7 @@
 namespace {
 using namespace mine_teleop;
 using namespace mine_teleop::detail;
-using guint64 = std::uint64_t;
-struct FakeChannel { std::vector<Json> sent; guint64 buffered_bytes{}; };
-void g_object_get(FakeChannel* channel, const char* property, guint64* result, std::nullptr_t) {
-  if (std::string_view(property) != "buffered-amount") throw std::runtime_error("unexpected fake channel property");
-  *result = channel->buffered_bytes;
-}
+struct FakeChannel { std::vector<Json> sent; };
 void gst_webrtc_data_channel_send_string(FakeChannel* channel, const char* bytes) { channel->sent.push_back(Json::parse(bytes)); }
 struct Publisher {
   struct { struct { int experimental_direct_authority_max_ms{600}; } runtime; std::string vehicle_id{"v"}; } config;
@@ -36,10 +30,7 @@ struct Publisher {
   ControlTransportFence control_transport_fence;
   FeedbackTransportFence feedback_transport_fence;
   std::map<std::string, Json> latest_feedback_status, pending_control_status;
-  std::uint64_t mock_skipped_dc_telemetry{}, mock_skipped_dc_vcu_snapshot{};
   unsigned wakeups{};
-  bool mock_dual{false};
-  bool mock_dual_control_enabled() const { return mock_dual; }
   void wake_native_control_feedback() { ++wakeups; }
 #include "feedback_vehicle_method.inc"
 };
@@ -73,7 +64,6 @@ struct Startup {
   Startup() { config.runtime.control_enabled = true; config.vehicle_adapter.type = "mock"; static_cast<void>(control_recovery_latch->enter_session("s")); }
   ~Startup() { if (control_service) control_service->close(); }
   bool critical_cameras_ready() const { return cameras_ready; }
-  bool mock_dual_control_enabled() const { return false; }
   std::string_view recovery_inhibition_issue() const { return "fixture_inhibited"; }
   void invalidate_native_control_trusted_gear_locked() {}
   template<class... Args> void emit_diagnostic(Args&&...) {}
@@ -104,41 +94,13 @@ struct EarlyResult : Startup {
     receive_apply_invoked = invoked;
   }
   void deliver(ControlCommand command, ControlMessageTransport transport, FakeChannel* channel, Json* native_feedback,
-      const Json& message = Json::object(), bool mock_dual = false) {
+      const Json& message = Json::object()) {
     const std::uint64_t intent_seq = 9;
     const std::string current_attempt = "fixture-attempt";
-    const bool mock_dual_dc = mock_dual;
-    const bool mock_wss_dc = false;
 #include "control_early_result.inc"
     throw std::runtime_error("early rejection fixture unexpectedly passed its guard");
   }
 };
-
-void mirrored_duplicate_is_not_published_or_applied() {
-  for (const bool first_dc : {false, true}) {
-    EarlyResult value;
-    expect(value.start_control_service(), "dual fixture failed to start mock service");
-    value.config.runtime.control_log_commands = true;
-    FakeChannel channel;
-    value.control_channel = &channel;
-    value.control_link_open = true;
-    value.control_transport_fence.reset(value.config.vehicle_id, "d", "s", "t");
-    ControlCommand command;
-    command.vehicle_id = value.config.vehicle_id; command.driver_id = "d"; command.session_id = "s";
-    command.control_token = "t"; command.seq = 42; command.sent_at_utc_ms = 1000;
-    const auto stamp = ControlTransportStamp{1, 0, 42, ControlPath::DataChannel, "fixture-attempt", true}.to_json();
-    expect(value.control_transport_fence.admit(command, &stamp,
-        first_dc ? ControlPath::DataChannel : ControlPath::Wss, "fixture-attempt", 1000, 2000, 200, true, false, true).admitted,
-        "first mirrored copy was not admitted");
-    Json feedback;
-    value.deliver(command, first_dc ? EarlyResult::ControlMessageTransport::NativeSignaling :
-        EarlyResult::ControlMessageTransport::DataChannel, &channel, &feedback, {{"control_transport", stamp}}, true);
-    expect(value.trace_reason == "mock_dual_duplicate" && value.rejected_control_commands == 0 &&
-        value.control_result_seq == 0 && value.wakeups == 0 && channel.sent.empty() && feedback.is_null() &&
-        !value.receive_apply_invoked && value.control_service->adapter_status().applied_command_count == 0,
-        "duplicate mirror produced a result, applied a command, or changed a rejection counter");
-  }
-}
 
 void transport_expiry_has_signed_reason_and_trace_without_apply() {
   for (const bool trace : {false, true}) for (const bool dc : {false, true}) for (const int offset : {-201, 201}) {
@@ -309,77 +271,6 @@ void cloud_bootstrap_feedback_requires_live_authenticated_lease() {
     expect(publisher.wakeups == 1, "invalid cloud status woke the network owner");
   }
 }
-void mock_dual_telemetry_preserves_identity_and_requires_cloud_authority() {
-  for (int gate = 0; gate != 6; ++gate) {
-    Publisher publisher; FakeChannel channel; publisher.control_channel = &channel;
-    publisher.config.runtime.experimental_direct_authority_max_ms = 0;
-    publisher.mock_dual = gate != 1;
-    channel.buffered_bytes = gate >= 4 ? kMockDcBackpressureBytes : 0;
-    publisher.native_control_websocket_connected = gate != 2;
-    publisher.native_control_transport_cloud_capable = true;
-    if (gate == 3) publisher.signaling.expiry = publisher.signaling.clock;
-    Json telemetry = {{"event", "vehicle_telemetry"}, {"control_status_seq", 7}, {"seq", 5},
-        {"sent_at_utc_ms", 900}, {"session_id", gate == 4 ? "old" : "s"},
-        {"vehicle_id", "v"}, {"driver_id", "d"}};
-    publisher.send_control_status_locked(telemetry);
-    expect(gate == 5 ? channel.sent.empty() : channel.sent.size() == 1 && channel.sent.front() == telemetry,
-        "mock telemetry backpressure or DC identity changed");
-    expect(publisher.pending_control_status.size() == ((gate == 0 || gate == 5) ? 1U : 0U) &&
-        publisher.wakeups == ((gate == 0 || gate == 5) ? 1U : 0U),
-        "mock telemetry mirror bypassed its cloud, identity or opt-in gate");
-    if (gate == 0 || gate == 5) {
-      expect(publisher.pending_control_status.at("vehicle_telemetry") == telemetry,
-          "mock telemetry mirror changed the original sequence or source timestamp");
-      telemetry["control_status_seq"] = 8; telemetry["seq"] = 6; telemetry["sent_at_utc_ms"] = 910;
-      publisher.send_control_status_locked(telemetry);
-      expect(publisher.pending_control_status.size() == 1 && publisher.pending_control_status.at("vehicle_telemetry") == telemetry,
-          "mock mirror did not coalesce the latest telemetry snapshot");
-    }
-  }
-}
-void mock_backpressure_keeps_expiry_rejection() {
-  EarlyResult value;
-  expect(value.start_control_service(), "backpressure fixture failed to start mock service");
-  value.config.control.max_command_gap_ms = 200;
-  FakeChannel channel; channel.buffered_bytes = kMockDcBackpressureBytes;
-  value.control_channel = &channel; value.control_link_open = true;
-  value.control_transport_fence.reset(value.config.vehicle_id, "d", "s", "t");
-  ControlCommand command;
-  command.vehicle_id = value.config.vehicle_id; command.driver_id = "d"; command.session_id = "s";
-  command.control_token = "t"; command.seq = 42; command.sent_at_utc_ms = 799;
-  const ControlTransportStamp stamp{1, 0, 42, ControlPath::DataChannel, "fixture-attempt", true};
-  Json feedback;
-  value.deliver(command, EarlyResult::ControlMessageTransport::DataChannel, &channel, &feedback,
-      {{"control_transport", stamp.to_json()}}, true);
-  expect(channel.sent.size() == 1 && channel.sent.front().at("reason") == "transport_command_expired" &&
-      feedback.at("reason") == "transport_command_expired" && !value.receive_apply_invoked,
-      "backpressure suppressed an expired command rejection or applied the command");
-}
-void mock_vcu_backpressure_preserves_faults_and_wss() {
-  Publisher publisher; FakeChannel channel; publisher.control_channel = &channel;
-  publisher.config.runtime.experimental_direct_authority_max_ms = 0;
-  publisher.mock_dual = true;
-  publisher.native_control_websocket_connected = true;
-  publisher.native_control_transport_cloud_capable = true;
-  channel.buffered_bytes = kMockDcBackpressureBytes;
-  Json vcu{{"event", "vcu_handshake_status"}, {"result", "status_update"}, {"adapter_ready", true},
-      {"session_id", "s"}, {"vehicle_id", "v"}, {"driver_id", "d"}, {"control_status_seq", 1},
-      {"status", {{"state", "unsupported"}, {"supported", false}, {"ready", false}, {"requested", false},
-          {"handshake_revoked", false}, {"disarming", false}, {"vmc_fault_code_valid", false}, {"speed_valid", false}}}};
-  publisher.send_control_status_locked(vcu);
-  expect(channel.sent.empty() && publisher.pending_control_status.at("vcu_handshake_status") == vcu,
-      "stable VCU snapshot was not mirrored while DC was congested");
-  expect(publisher.mock_skipped_dc_vcu_snapshot == 1, "skipped VCU snapshot was not counted");
-  auto fault = vcu; fault["control_status_seq"] = 2; fault["status"]["state"] = "fault";
-  publisher.send_control_status_locked(fault);
-  expect(channel.sent.size() == 1 && channel.sent.front() == fault &&
-      publisher.pending_control_status.at("vcu_handshake_status") == fault,
-      "fault VCU status was suppressed or not mirrored");
-  publisher.native_control_websocket_connected = false;
-  publisher.send_control_status_locked(vcu);
-  expect(channel.sent.size() == 2 && channel.sent.back() == vcu,
-      "VCU snapshot was suppressed without a live WSS mirror");
-}
 void raw_vcu_details_are_not_a_transport_wrapper() {
   Publisher publisher;
   publisher.config.runtime.experimental_direct_authority_max_ms = 0;
@@ -412,6 +303,6 @@ void raw_vcu_details_are_not_a_transport_wrapper() {
 }
 }
 int main() {
-  try { mock_dual_telemetry_preserves_identity_and_requires_cloud_authority(); mock_vcu_backpressure_preserves_faults_and_wss(); mock_backpressure_keeps_expiry_rejection(); mirrored_duplicate_is_not_published_or_applied(); transport_expiry_has_signed_reason_and_trace_without_apply(); raw_vcu_details_are_not_a_transport_wrapper(); early_rejection_publishes_precise_signed_result(); cloud_only_startup_retains_all_safety_gates(); cloud_bootstrap_feedback_requires_live_authenticated_lease(); publish_all_four_independent_axes(); std::cout << "Actual vehicle feedback publisher: duplicate suppression, expiry rejection trace, raw/wrapped status ordering, early rejection reasons, four axes, real MAC and bounded snapshots passed; fake Gst send, no ABI/network proof\n"; }
+  try { transport_expiry_has_signed_reason_and_trace_without_apply(); raw_vcu_details_are_not_a_transport_wrapper(); early_rejection_publishes_precise_signed_result(); cloud_only_startup_retains_all_safety_gates(); cloud_bootstrap_feedback_requires_live_authenticated_lease(); publish_all_four_independent_axes(); std::cout << "Actual vehicle feedback publisher: duplicate suppression, expiry rejection trace, raw/wrapped status ordering, early rejection reasons, four axes, real MAC and bounded snapshots passed; fake Gst send, no ABI/network proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
