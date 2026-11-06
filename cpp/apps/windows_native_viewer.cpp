@@ -8,6 +8,7 @@
 #include "mine_teleop/bench/native_mock_profile_state.hpp"
 #include "mine_teleop/bench/native_mock_gear_transition.hpp"
 #include "mine_teleop/bench/native_mock_keyboard.hpp"
+#include "mine_teleop/bench/mock_control_trace.hpp"
 #include "mine_teleop/bench/native_can_feedback.hpp"
 #include "mine_teleop/bench/native_control_courier.hpp"
 #include "mine_teleop/bench/native_viewer_observation.hpp"
@@ -327,15 +328,12 @@ struct Window {
     std::uint64_t telemetry_status_observed = 0;
     std::uint64_t telemetry_wire_observed = 0, telemetry_wire_last_seq = 0;
     bool was_active = false, stop_episode = false;
-    Json dc_send_trace = Json::array();
-    std::uint64_t dc_send_trace_dropped = 0;
-    const auto flush_dc_trace = [&] {
-      if (!config.control_trace_commands || (dc_send_trace.empty() && !dc_send_trace_dropped)) return;
-      const Json trace{{"event", "native_mock_dc_batch"}, {"session_id", session_id},
-          {"records", std::move(dc_send_trace)}, {"dropped", dc_send_trace_dropped}};
-      std::fprintf(stderr, "%s\n", trace.dump().c_str());
-      dc_send_trace = Json::array(); dc_send_trace_dropped = 0;
+    // Bounded bench tracing (guard transitions, accepted input, DataChannel sends); see mock_control_trace.hpp.
+    detail::MockControlTrace trace(config.control_trace_commands, session_id);
+    const auto print_trace = [](const std::vector<std::string>& lines) {
+      for (const auto& line : lines) std::fprintf(stderr, "%s\n", line.c_str());
     };
+    const auto flush_dc_trace = [&] { print_trace(trace.flush_dc()); };
     std::unique_ptr<detail::NativeControlCourier> courier;
     auto* channel = receiver.control_channel();
     if (!channel || !render->health) throw std::runtime_error("mock control requires scoped channel and critical video");
@@ -363,65 +361,12 @@ struct Window {
       }
       clock_observed_ms.store(0);
     });
-    // Keep diagnostics off the lease worker's I/O path and bound memory if
-    // the observation thread stalls. -1 means a short-circuited check.
-    struct GuardState {
-      bool focused, ui_alive, clock_ok, video_ready, video_sample_healthy, authorized, ready;
-      int remote_ready, direct_ready;
-      std::uint64_t bad_revision, brake_revision;
-      detail::NativeVideoHealth::FaultCounts video_faults;
-      bool operator==(const GuardState&) const = default;
-    };
-    struct GuardEvent { std::int64_t at, authorization_at, authorization_now; GuardState state; };
-    std::mutex guard_mutex;
-    std::vector<GuardEvent> guard_events;
-    std::uint64_t guard_dropped = 0;
-    struct InputEvent { std::int64_t at, wall_ms; std::uint64_t intent_seq; unsigned keys; char gear; };
-    std::mutex input_trace_mutex;
-    std::vector<InputEvent> input_events;
-    std::uint64_t input_trace_dropped = 0;
-    const auto flush_guard_trace = [&] {
-      if (!config.control_trace_commands) return;
-      std::vector<GuardEvent> events;
-      std::uint64_t dropped = 0;
-      { std::lock_guard lock(guard_mutex); events.swap(guard_events); std::swap(dropped, guard_dropped); }
-      if (!events.empty() || dropped) {
-        Json records = Json::array();
-        for (const auto& event : events) {
-          const auto& s = event.state;
-          records.push_back({{"monotonic_ms", event.at}, {"focused", s.focused}, {"ui_alive", s.ui_alive},
-              {"clock_ok", s.clock_ok}, {"video_ready", s.video_ready}, {"video_sample_healthy", s.video_sample_healthy},
-              {"authorized", s.authorized}, {"ready", s.ready},
-              {"remote_ready", s.remote_ready < 0 ? Json(nullptr) : Json(s.remote_ready != 0)},
-              {"direct_ready", s.direct_ready < 0 ? Json(nullptr) : Json(s.direct_ready != 0)},
-              {"authorization_age_ms", event.authorization_at > 0 ?
-                  Json(event.authorization_now - event.authorization_at) : Json(nullptr)},
-              {"bad_revision", s.bad_revision}, {"brake_revision", s.brake_revision},
-              {"video_faults", {{"unusable", s.video_faults.unusable}, {"stale", s.video_faults.stale},
-                  {"invalid_frame", s.video_faults.invalid_frame}, {"replaced", s.video_faults.replaced},
-                  {"explicit_fault", s.video_faults.explicit_fault}, {"clock", s.video_faults.clock}}}});
-        }
-        std::fprintf(stderr, "%s\n", Json{{"event", "native_mock_guard_batch"}, {"records", std::move(records)},
-            {"dropped", dropped}}.dump().c_str());
-      }
-      std::vector<InputEvent> inputs;
-      dropped = 0;
-      { std::lock_guard lock(input_trace_mutex); inputs.swap(input_events); std::swap(dropped, input_trace_dropped); }
-      if (!inputs.empty() || dropped) {
-        Json input_records = Json::array();
-        for (const auto& event : inputs) input_records.push_back({{"monotonic_ms", event.at}, {"wall_utc_ms", event.wall_ms},
-            {"intent_seq", event.intent_seq}, {"keys", event.keys}, {"gear", std::string(1, event.gear)}});
-        std::fprintf(stderr, "%s\n", Json{{"event", "native_mock_input_batch"}, {"session_id", session_id}, {"records", std::move(input_records)},
-            {"dropped", dropped}}.dump().c_str());
-      }
-    };
+    using GuardState = detail::MockControlTrace::GuardState;
+    const auto flush_guard_trace = [&] { print_trace(trace.flush_guard_and_input()); };
     std::jthread input_worker([&](std::stop_token input_stop) {
       try {
         detail::NativeMockInputSequence input_sequence;
         bool withdrawn = false;
-        std::optional<GuardState> previous_guard;
-        std::int64_t last_input_trace_at = 0;
-        unsigned last_input_keys = 256;
         while (!input_stop.stop_requested() && !stop.stop_requested() && !parent.stop_requested()) {
           const auto clock_at = clock_observed_ms.load();
           const auto now_ms = static_cast<std::int64_t>(bench_now_ms());
@@ -438,16 +383,11 @@ struct Window {
           const auto authorization_now_ms = static_cast<std::int64_t>(bench_now_ms());
           const bool authorized = detail::native_mock_input_fresh(authorized_at, authorization_now_ms) &&
               !mock_gear_reconnect_required.load();
-          if (config.control_trace_commands) {
-            const GuardState state{focused, ui_alive, clock_ok, video_health.ready, video_health.sample_healthy,
-                authorized, ready, remote_ready, direct_ready, video_health.bad_revision, video_health.brake_revision,
-                video_health.faults};
-            if (!previous_guard || *previous_guard != state) {
-              std::lock_guard lock(guard_mutex);
-              if (guard_events.size() < 128) guard_events.push_back({now_ms, authorized_at, authorization_now_ms, state});
-              else ++guard_dropped;
-              previous_guard = state;
-            }
+          if (trace.enabled()) {
+            trace.record_guard(now_ms, authorized_at, authorization_now_ms,
+                GuardState{focused, ui_alive, clock_ok, video_health.ready, video_health.sample_healthy,
+                    authorized, ready, remote_ready, direct_ready, video_health.bad_revision, video_health.brake_revision,
+                    video_health.faults});
           }
           const auto confirmed_gear = mock_confirmed_gear.load();
           auto keyboard_input = keyboard.sample_now(ready && authorized && !mock_estop_requested.load(), confirmed_gear);
@@ -515,15 +455,11 @@ struct Window {
               std::lock_guard lock(gear_mutex);
               gear_transition.forwarded(*gear_generation, result.at("intent_seq").get<std::uint64_t>(), keyboard_input.gear);
             }
-            if (config.control_trace_commands && keyboard_input.armed &&
-                (keyboard_input.key_mask != last_input_keys || now_ms - last_input_trace_at >= 1000)) {
-              std::lock_guard lock(input_trace_mutex);
+            if (trace.enabled() && keyboard_input.armed) {
               const auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::system_clock::now().time_since_epoch()).count();
-              if (input_events.size() < 128) input_events.push_back({now_ms, wall_ms,
-                  input.at("intent_seq").get<std::uint64_t>(), keyboard_input.key_mask, keyboard_input.gear});
-              else ++input_trace_dropped;
-              last_input_keys = keyboard_input.key_mask; last_input_trace_at = now_ms;
+              trace.note_input(now_ms, wall_ms, input.at("intent_seq").get<std::uint64_t>(),
+                  keyboard_input.key_mask, keyboard_input.gear);
             }
             {
               std::lock_guard lock(intent_display_mutex);
@@ -720,14 +656,10 @@ struct Window {
               const auto started = static_cast<std::int64_t>(bench_now_ms());
               const auto frame = Json::parse(bytes, nullptr, false);
               const bool queued = channel->send(bytes);
-              if (config.control_trace_commands) {
-                if (frame.is_object() && frame.contains("seq") && frame.at("seq").is_number_unsigned()) {
-                  if (dc_send_trace.size() < 128)
-                    dc_send_trace.push_back({{"seq", frame.at("seq")}, {"started_monotonic_ms", started},
-                        {"completed_monotonic_ms", static_cast<std::int64_t>(bench_now_ms())}, {"queued", queued},
-                        {"wire_format", "json"}, {"wire_bytes", bytes.size()}});
-                  else ++dc_send_trace_dropped;
-                }
+              if (trace.enabled() && frame.is_object() && frame.contains("seq") && frame.at("seq").is_number_unsigned()) {
+                trace.record_dc_send({{"seq", frame.at("seq")}, {"started_monotonic_ms", started},
+                    {"completed_monotonic_ms", static_cast<std::int64_t>(bench_now_ms())}, {"queued", queued},
+                    {"wire_format", "json"}, {"wire_bytes", bytes.size()}});
               }
               return queued;
             }, on_status};
