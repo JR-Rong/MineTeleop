@@ -3183,7 +3183,12 @@ git commit -m "Index PR #26 evidence files" -m "Co-Authored-By: Claude <noreply@
 - viewer 接线：net -68 行。没有遗留引用、定界符平衡、逐行审阅 diff、线程与生命周期关系与原来一致（所有 `throw` 都被主循环的 `catch(...)` 接住，之后统一 join worker 再销毁 `trace`）。**viewer 没有被编译**。
 - **未验证：** 本提交没有跑 Linux 完整 CTest（Colima 不可用），新测试只在主机上构建并运行。
 
-**阶段 4 的未验证项汇总（环境恢复后必须补做）**
-1. 在恢复的 Linux 环境里对最终树跑默认 ON 的完整 CTest，并跑 OFF 配置的完整 CTest。
-2. Windows 工作流编译 `windows_native_viewer.cpp`（阶段 2、3、4 都改过它，需要推送，Task 29）。
-3. `docker buildx` 发布路径端到端（`build_cpp_ubuntu_bundle.sh`、`build_macos_vehicle_from_scratch.sh`）。
+**阶段 4 的验证补记（2026-11-05，Colima 恢复之后）**
+
+- 本地 Colima 虚拟机在 Task 24 的 OFF 配置测试中途崩溃（Lima 日志 `21:47:41 VirtualMachineStateError`，没有 `ENOSPC`；崩溃根因未能确定）。经用户同意恢复：先对修复后的两块盘做 APFS 写时复制快照，再 `colima stop` / `colima start`，镜像和卷全部保留。
+- **崩溃留下的残留会让构建假失败：** OFF 构建卷里有 42 个零字节产物（含 14 个 `.o`），make 因它们的时间戳比源码新而不重编，链接时报 `undefined reference to 'main'`。只删除零字节产物后重建即正常；主构建卷没有任何零字节产物。以后环境崩溃后先扫一遍零字节产物。
+- 补跑结果（代码状态为提交 40d7108；其后的提交只改文档）：**默认 ON 完整 CTest 94/94 通过**（含新的 `mock-control-trace-tests`）；**OFF 配置（发布形态）完整 CTest 94/94 通过**，编译定义确认为 `MINE_TELEOP_BENCH_EXPERIMENTS=0`。前两个"未验证"项由此关闭。
+
+**阶段 4 仍未验证的项**
+1. Windows 工作流编译 `windows_native_viewer.cpp`（阶段 2、3、4 都改过它，需要推送，Task 29）。
+2. `docker buildx` 发布路径端到端（`build_cpp_ubuntu_bundle.sh`、`build_macos_vehicle_from_scratch.sh`）。
