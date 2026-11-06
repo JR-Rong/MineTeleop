@@ -630,6 +630,10 @@ if(MINE_TELEOP_BUILD_TESTS OR MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
     COMMAND mine-teleop-control-transport-integration-tests --transient-hold-only)
   set_tests_properties(mine-teleop-transient-hold-integration-tests PROPERTIES
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 90)
+  add_test(NAME mine-teleop-transient-hold-netem-tests
+    COMMAND mine-teleop-control-transport-integration-tests --transient-hold-netem)
+  set_tests_properties(mine-teleop-transient-hold-netem-tests PROPERTIES
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 90 SKIP_RETURN_CODE 77)
   add_test(NAME mine-teleop-product-direct-integration-tests COMMAND mine-teleop-control-transport-integration-tests --product-only)
   set_tests_properties(mine-teleop-product-direct-integration-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 30)
   add_test(NAME mine-teleop-stale-stop-integration-tests COMMAND mine-teleop-control-transport-integration-tests --review-r4-only)

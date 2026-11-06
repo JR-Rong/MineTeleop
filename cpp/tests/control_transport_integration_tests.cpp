@@ -9,7 +9,11 @@
 #include <deque>
 #include <filesystem>
 #include <future>
+#include <cstdlib>
 #include <iostream>
+#if defined(__linux__)
+#include <unistd.h>
+#endif
 #include <map>
 #include <set>
 #include <thread>
@@ -1393,7 +1397,60 @@ void transient_hold_scenarios() {
   std::cout << "Transient hold over the real loopback path: short spike held and resumed without a re-press, long outage and repeated spikes escalated, legacy vehicle braked\n";
 }
 
+// ---- Real packet loss on the loopback interface (Linux, root, sch_netem). Everything else returns 77 (skip).
+#if defined(__linux__)
+int netem(const std::string& arguments) {
+  return std::system(("tc qdisc " + arguments + " >/dev/null 2>&1").c_str());
+}
+struct NetemRestore { ~NetemRestore() { static_cast<void>(netem("del dev lo root")); } };
+int transient_hold_survives_real_loopback_loss() {
+  if (geteuid() != 0 || netem("replace dev lo root netem loss 0%") != 0) return 77;
+  NetemRestore restore;
+  Fixture fixture(false, false, false, "cloud_only", false, true);
+  drive_until_motion(fixture, true);
+  Cut cut;
+  const auto lossy = [&](std::int64_t duration_ms) {
+    expect(netem("replace dev lo root netem loss 100%") == 0, "netem loss could not be applied");
+    const auto started = steady();
+    while (steady() - started < duration_ms) {
+      const auto before = steady();
+      fixture.pump(false);
+      cut.longest_pump_ms = std::max(cut.longest_pump_ms, steady() - before);
+      static_cast<void>(observe(fixture, cut));
+    }
+    static_cast<void>(netem("del dev lo root"));
+  };
+  // 350 ms of real loss. TCP retransmission adds head-of-line delay on recovery, so the vehicle's delivery
+  // gap is longer than the loss itself; the hold must still absorb it and the driver must not withdraw first.
+  lossy(350);
+  Json timing;
+  const auto settle = steady() + 2500;
+  while (steady() < settle) { fixture.pump(false); timing = observe(fixture, cut); }
+  // The loss must really have interrupted the vehicle's delivery (otherwise "nothing escalated" proves nothing).
+  expect(cut.saw_hold, "350 ms of real loopback loss never interrupted the vehicle's delivery: " + summary(cut, timing));
+  expect(!cut.saw_wait, "350 ms of real loopback loss escalated: " + summary(cut, timing));
+  expect(cut.max_throttle_in_hold == 0.0 && cut.min_brake_in_hold >= 0.15,
+      "the hold did not withdraw traction with the light brake under real loss: " + summary(cut, timing));
+  expect(cut.longest_pump_ms <= 100, "fixture was blocked during the loss, so the result is not valid: " + summary(cut, timing));
+  expect(!fixture.driver->status().at("native_control").at("requires_fresh_input").get<bool>(),
+      "350 ms of loss invalidated the driver's held input: " + summary(cut, timing));
+  // 1500 ms of loss is not transient.
+  Cut outage;
+  expect(netem("replace dev lo root netem loss 100%") == 0, "netem loss could not be re-applied");
+  const auto outage_started = steady();
+  while (steady() - outage_started < 1500) {
+    fixture.pump(false);
+    static_cast<void>(observe(fixture, outage));
+  }
+  static_cast<void>(netem("del dev lo root"));
+  expect(outage.saw_wait, "1500 ms of real loopback loss did not escalate: " + summary(outage, vehicle_timing(fixture)));
+  return 0;
+}
+#else
+int transient_hold_survives_real_loopback_loss() { return 77; }
+#endif
+
 int main(int argc, char** argv) {
-  try { courier_status_does_not_wait_for_signaling_poll(); if (argc > 1 && std::string_view(argv[1]) == "--transient-hold-only") { transient_hold_scenarios(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--mock-estop-only") { native_mock_estop_reaches_vehicle_after_input_loss(); native_mock_estop_reaches_vehicle_after_input_loss(true); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--feedback-only") { actual_feedback_selection_is_independent_and_rejects_retired_statuses(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-courier-only") { native_courier_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-dual-video-only") { native_dual_video_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-safety-only") { native_publication_safety_interlocks(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-publication-only") { native_publication_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--outage-only") { actual_native_short_cloud_outage_and_independent_vehicle_expiry(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--product-only") { product_recovery_withdraws_unfetched_motion(); product_wss_reconnect_retires_dc_and_recovers_ack(); product_startup_and_p2p_cloud_recovery(); product_cloud_only_never_trials_dc(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } native_publication_bridge_integration(); native_courier_bridge_integration(); native_publication_safety_interlocks(); native_dual_video_bridge_integration(); integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
+  try { courier_status_does_not_wait_for_signaling_poll(); if (argc > 1 && std::string_view(argv[1]) == "--transient-hold-only") { transient_hold_scenarios(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--transient-hold-netem") return transient_hold_survives_real_loopback_loss(); if (argc > 1 && std::string_view(argv[1]) == "--mock-estop-only") { native_mock_estop_reaches_vehicle_after_input_loss(); native_mock_estop_reaches_vehicle_after_input_loss(true); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--feedback-only") { actual_feedback_selection_is_independent_and_rejects_retired_statuses(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-courier-only") { native_courier_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-dual-video-only") { native_dual_video_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-safety-only") { native_publication_safety_interlocks(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-publication-only") { native_publication_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--outage-only") { actual_native_short_cloud_outage_and_independent_vehicle_expiry(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--product-only") { product_recovery_withdraws_unfetched_motion(); product_wss_reconnect_retires_dc_and_recovers_ack(); product_startup_and_p2p_cloud_recovery(); product_cloud_only_never_trials_dc(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } native_publication_bridge_integration(); native_courier_bridge_integration(); native_publication_safety_interlocks(); native_dual_video_bridge_integration(); integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
