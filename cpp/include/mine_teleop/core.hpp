@@ -908,6 +908,19 @@ class VehicleControlService {
   [[nodiscard]] std::uint64_t recovery_bad_sample_revision() const { return recovery_bad_sample_revision_; }
   [[nodiscard]] std::uint64_t recovery_brake_revision() const { return recovery_brake_revision_; }
   [[nodiscard]] bool driver_control_link_ready() const { return driver_control_link_ready_; }
+  // Transient link hold (docs/64-transient-link-hold-design.md): enabled only for
+  // a session whose driver declared the capability against a vehicle that allows it.
+  [[nodiscard]] bool transient_hold_enabled() const;
+  [[nodiscard]] bool transient_hold_active() const { return transient_hold_.active(); }
+  // A driver video report that is neither ready nor merely stale/recovering.
+  [[nodiscard]] bool driver_critical_video_fault() const {
+    return !driver_critical_video_ready_ && !driver_critical_video_transient_;
+  }
+  // The media runtime reports whether a critical encoded lane is only stale.
+  void observe_vehicle_video_transient(bool stale, std::int64_t timestamp_ms);
+  // A transport epoch change during a hold escalates with its own reason.
+  void note_transport_epoch_changed(std::int64_t timestamp_ms);
+  [[nodiscard]] std::vector<Json> drain_transient_hold_events();
   [[nodiscard]] std::pair<int, int> recovery_timing() const;
   [[nodiscard]] const std::deque<Json>& telemetry_history() const { return telemetry_history_; }
   [[nodiscard]] Json summary() const;
@@ -916,6 +929,17 @@ class VehicleControlService {
   [[nodiscard]] bool refresh_adapter_safe_stop_state() noexcept;
   void evaluate_control_watchdog();
   void apply_recovery_brake(std::string_view gear_override = {});
+  // Returns true when the action escalated to the existing braking wait.
+  bool handle_transient_action(detail::TransientHoldAction action, ControlRecoveryCause cause,
+      std::int64_t timestamp_ms);
+  [[nodiscard]] ControlRecoveryCause transient_recovery_cause() const;
+  void apply_hold_output();
+  // Ends an active hold because a stronger stop took over (fault, hard timeout, ESTOP).
+  void end_transient_hold(std::string_view reason);
+  void record_transient_event(std::string_view event);
+  // Lowest brake request the staged hard timeout may apply: it never drops
+  // below the brake the vehicle was already holding.
+  [[nodiscard]] double current_brake_floor() const;
   void clear_session_profile() noexcept;
   [[nodiscard]] SessionControlProfileResult profile_result(
       const SessionControlProfileRequest& request,
@@ -953,6 +977,7 @@ class VehicleControlService {
   double hard_overspeed_margin_kph_{3.6};
   Json control_limits_;
   int telemetry_interval_ms_;
+  detail::TransientHoldPolicy transient_hold_;
   std::optional<std::int64_t> last_telemetry_ms_;
   std::uint64_t telemetry_sequence_{0};
   std::deque<Json> telemetry_history_;
@@ -972,6 +997,11 @@ class VehicleControlService {
   bool recovery_samples_healthy_{true};
   std::uint64_t recovery_bad_sample_revision_{0};
   std::uint64_t recovery_brake_revision_{0};
+  bool transient_hold_negotiated_{false};
+  bool driver_critical_video_transient_{false};
+  bool vehicle_video_transient_{false};
+  std::optional<ControlOutput> hold_output_;
+  std::deque<Json> transient_hold_events_;
   bool started_{false};
 };
 
