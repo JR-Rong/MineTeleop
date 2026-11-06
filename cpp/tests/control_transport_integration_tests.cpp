@@ -98,6 +98,55 @@ void note_fixture_retry(std::string_view scenario, int attempt, std::string_view
 }
 void print_retry_summary() { std::cout << "[RETRY-SUMMARY] total=" << g_fixture_retries.load() << std::endl; }
 
+// The hold scenarios measure real time against a 700 ms limit, so a stall of the test process itself (a descheduled
+// CI runner) can turn a correct hold into a correct escalation, which these assertions then report as a failure.
+// Fixture::pump() is the loop that also drives the vehicle, so the longest gap between two of its calls is direct
+// evidence of such a stall. If an assertion fails while that gap reached kSchedulerStallMs, the scenario is repeated
+// from a fresh fixture, visibly ([RETRY]) and at most twice more. Without that evidence, or when the failure
+// repeats, it stands: a hold that resumes slowly with no stall is a regression and must not be retried away.
+constexpr std::int64_t kSchedulerStallMs = 100;
+template <typename Scenario>
+void run_realtime_scenario(std::string_view name, Scenario&& scenario, bool announce_retries = true) {
+  for (int attempt = 1;; ++attempt) {
+    std::int64_t stall_ms = 0;
+    try { scenario(stall_ms); return; }
+    catch (const std::runtime_error& error) {
+      if (attempt >= 3 || stall_ms < kSchedulerStallMs)
+        throw std::runtime_error(std::string(error.what()) + " [attempt " + std::to_string(attempt) +
+            ", longest gap between pump() calls " + std::to_string(stall_ms) + " ms]");
+      if (announce_retries) note_fixture_retry(name, attempt + 1, "scheduler_stall_ms=" + std::to_string(stall_ms));
+    }
+  }
+}
+// The wrapper decides what gets repeated, so its own contract is checked without any real-time fixture.
+void realtime_scenario_wrapper_retries_only_on_stall_evidence() {
+  int calls = 0;
+  run_realtime_scenario("wrapper_self_test", [&](std::int64_t& stall) {
+    stall = kSchedulerStallMs;
+    if (++calls < 3) throw std::runtime_error("stalled twice");
+  }, false);
+  expect(calls == 3, "a failure with stall evidence was not repeated until it passed");
+
+  calls = 0;
+  std::string message;
+  try {
+    run_realtime_scenario("wrapper_self_test", [&](std::int64_t& stall) {
+      ++calls; stall = kSchedulerStallMs - 1; throw std::runtime_error("slow resume");
+    }, false);
+  } catch (const std::runtime_error& error) { message = error.what(); }
+  expect(calls == 1 && message.find("slow resume") != std::string::npos && message.find("attempt 1") != std::string::npos,
+      "a failure without stall evidence was retried or lost its message: " + message);
+
+  calls = 0; message.clear();
+  try {
+    run_realtime_scenario("wrapper_self_test", [&](std::int64_t& stall) {
+      ++calls; stall = 500; throw std::runtime_error("always");
+    }, false);
+  } catch (const std::runtime_error& error) { message = error.what(); }
+  expect(calls == 3 && message.find("always") != std::string::npos && message.find("attempt 3") != std::string::npos,
+      "a failure that repeats with stall evidence was not capped at three attempts: " + message);
+}
+
 void courier_status_does_not_wait_for_signaling_poll() {
   DriverConfig config;
   config.driver_id = "status-probe";
@@ -426,7 +475,12 @@ struct Fixture {
     for (const auto& status : response.at("statuses")) received_statuses.push_back(status);
     return response;
   }
+  // Interval between two consecutive pump() calls; see run_realtime_scenario().
+  std::int64_t last_pump_at{0}, longest_pump_gap_ms{0};
   void pump(bool dc_ready) {
+    const auto pumped_at = steady();
+    if (last_pump_at != 0) longest_pump_gap_ms = std::max(longest_pump_gap_ms, pumped_at - last_pump_at);
+    last_pump_at = pumped_at;
     renew_authority();
     if (refresh_input && steady() - last_input >= 60) input();
     const auto received = cloud_online ? vehicle_socket.receive_json(std::chrono::milliseconds(1)) : WebSocketReceiveResult{};
@@ -1339,8 +1393,14 @@ void cut_vehicle_delivery(Fixture& fixture, std::int64_t duration_ms, Cut& cut) 
   }
   fixture.cloud_online = true;
 }
-void transient_hold_absorbs_short_spikes_and_escalates_long_outage() {
+// Stores the fixture's longest pump() gap into the scenario's out-parameter on every exit, including a throw.
+struct StallReport {
+  const Fixture& fixture; std::int64_t& out;
+  ~StallReport() { out = fixture.longest_pump_gap_ms; }
+};
+void transient_hold_absorbs_short_spikes_and_escalates_long_outage(std::int64_t& stall_ms) {
   Fixture fixture(false, false, false, "cloud_only", false, true);
+  StallReport report{fixture, stall_ms};
   drive_until_motion(fixture, true);
   {
     std::lock_guard lock(fixture.car_mutex);
@@ -1376,27 +1436,36 @@ void transient_hold_absorbs_short_spikes_and_escalates_long_outage() {
       "long outage escalated for the wrong reason: " + summary(outage, timing));
   expect(vehicle_view(fixture).output.brake_feedback >= 1.0, "escalation did not apply the full braking-wait brake");
 }
-void transient_hold_budget_escalates_repeated_spikes() {
+void transient_hold_budget_escalates_repeated_spikes(std::int64_t& stall_ms) {
   Fixture fixture(false, false, false, "cloud_only", false, true);
+  StallReport report{fixture, stall_ms};
   drive_until_motion(fixture, true);
   Cut total;
   bool escalated = false;
+  int spikes = 0;
   for (int spike = 0; spike < 8 && !escalated; ++spike) {
+    ++spikes;
     Cut cut;
     cut_vehicle_delivery(fixture, 420, cut);
     const auto settle = steady() + 600;
     while (steady() < settle) { fixture.pump(false); static_cast<void>(observe(fixture, cut)); }
     total.longest_pump_ms = std::max(total.longest_pump_ms, cut.longest_pump_ms);
+    // The failure summary must describe the whole sequence, not only the pump times.
+    total.saw_hold = total.saw_hold || cut.saw_hold;
+    total.saw_wait = total.saw_wait || cut.saw_wait;
+    total.max_throttle_in_hold = std::max(total.max_throttle_in_hold, cut.max_throttle_in_hold);
+    total.min_brake_in_hold = std::min(total.min_brake_in_hold, cut.min_brake_in_hold);
     escalated = cut.saw_wait;
   }
   const auto timing = vehicle_timing(fixture);
   const auto reason = last_hold_field(timing, "escalation_reason");
   expect(escalated && (reason == "budget_count_exceeded" || reason == "budget_time_exceeded"),
-      "repeated spikes did not exhaust the hold budget: " + summary(total, timing));
+      "repeated spikes did not exhaust the hold budget after " + std::to_string(spikes) + " spikes: " + summary(total, timing));
 }
 // Same network event, vehicle without the hold: the spike still becomes a braking wait.
-void vehicle_without_hold_brakes_on_the_same_spike() {
+void vehicle_without_hold_brakes_on_the_same_spike(std::int64_t& stall_ms) {
   Fixture fixture(false, false, false, "cloud_only", false, false, true);
+  StallReport report{fixture, stall_ms};
   drive_until_motion(fixture, false);
   Cut cut;
   cut_vehicle_delivery(fixture, 450, cut);
@@ -1412,9 +1481,11 @@ void vehicle_without_hold_brakes_on_the_same_spike() {
   expect(cut.saw_wait, "the same 450 ms gap did not brake a vehicle without the hold: " + summary(cut, timing));
 }
 void transient_hold_scenarios() {
-  transient_hold_absorbs_short_spikes_and_escalates_long_outage();
-  transient_hold_budget_escalates_repeated_spikes();
-  vehicle_without_hold_brakes_on_the_same_spike();
+  realtime_scenario_wrapper_retries_only_on_stall_evidence();
+  run_realtime_scenario("transient_hold_absorbs_short_spikes_and_escalates_long_outage",
+      transient_hold_absorbs_short_spikes_and_escalates_long_outage);
+  run_realtime_scenario("transient_hold_budget_escalates_repeated_spikes", transient_hold_budget_escalates_repeated_spikes);
+  run_realtime_scenario("vehicle_without_hold_brakes_on_the_same_spike", vehicle_without_hold_brakes_on_the_same_spike);
   std::cout << "Transient hold over the real loopback path: short spike held and resumed without a re-press, long outage and repeated spikes escalated, legacy vehicle braked\n";
 }
 
@@ -1472,6 +1543,6 @@ int transient_hold_survives_real_loopback_loss() { return 77; }
 #endif
 
 int main(int argc, char** argv) {
-  try { courier_status_does_not_wait_for_signaling_poll(); if (argc > 1 && std::string_view(argv[1]) == "--transient-hold-only") { transient_hold_scenarios(); print_retry_summary(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--transient-hold-netem") return transient_hold_survives_real_loopback_loss(); if (argc > 1 && std::string_view(argv[1]) == "--mock-estop-only") { native_mock_estop_reaches_vehicle_after_input_loss(); native_mock_estop_reaches_vehicle_after_input_loss(true); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--feedback-only") { actual_feedback_selection_is_independent_and_rejects_retired_statuses(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-courier-only") { native_courier_bridge_integration(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-dual-video-only") { native_dual_video_bridge_integration(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-safety-only") { native_publication_safety_interlocks(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-publication-only") { native_publication_bridge_integration(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--outage-only") { actual_native_short_cloud_outage_and_independent_vehicle_expiry(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--product-only") { product_recovery_withdraws_unfetched_motion(); product_wss_reconnect_retires_dc_and_recovers_ack(); product_startup_and_p2p_cloud_recovery(); product_cloud_only_never_trials_dc(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); print_retry_summary(); return 0; } native_publication_bridge_integration(); native_courier_bridge_integration(); native_publication_safety_interlocks(); native_dual_video_bridge_integration(); integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; print_retry_summary(); }
+  try { courier_status_does_not_wait_for_signaling_poll(); if (argc > 1 && std::string_view(argv[1]) == "--transient-hold-only") { transient_hold_scenarios(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--transient-hold-netem") return transient_hold_survives_real_loopback_loss(); if (argc > 1 && std::string_view(argv[1]) == "--mock-estop-only") { native_mock_estop_reaches_vehicle_after_input_loss(); native_mock_estop_reaches_vehicle_after_input_loss(true); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--feedback-only") { actual_feedback_selection_is_independent_and_rejects_retired_statuses(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-courier-only") { native_courier_bridge_integration(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-dual-video-only") { native_dual_video_bridge_integration(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-safety-only") { native_publication_safety_interlocks(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-publication-only") { native_publication_bridge_integration(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--outage-only") { actual_native_short_cloud_outage_and_independent_vehicle_expiry(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--product-only") { product_recovery_withdraws_unfetched_motion(); product_wss_reconnect_retires_dc_and_recovers_ack(); product_startup_and_p2p_cloud_recovery(); product_cloud_only_never_trials_dc(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); print_retry_summary(); return 0; } native_publication_bridge_integration(); native_courier_bridge_integration(); native_publication_safety_interlocks(); native_dual_video_bridge_integration(); integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; print_retry_summary(); }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
