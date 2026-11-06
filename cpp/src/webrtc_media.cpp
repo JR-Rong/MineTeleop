@@ -7,6 +7,7 @@
 #include "mine_teleop/detail/ice_diagnostics.hpp"
 #include "mine_teleop/detail/ice_route_policy.hpp"
 #include "mine_teleop/detail/isolated_mock_bench.hpp"
+#include "mine_teleop/detail/transient_hold.hpp"
 #include "mine_teleop/detail/gstreamer_rtp_marker.hpp"
 #include "mine_teleop/detail/gstreamer_ice_servers.hpp"
 #include <agent.h>
@@ -1247,6 +1248,12 @@ struct VehicleMediaRuntime::Impl {
          {"type", "offer"},
          {"control_transport_capability", self->signaling.transport_mac_key().size() >= 32 ? detail::kControlTransportCapability : std::string_view{}},
          {"isolated_mock_bench_capability", self->isolated_mock_bench_attested() ? detail::kIsolatedMockBenchCapability : std::string_view{}},
+         {"transient_hold_capability", self->config.control.transient_hold.enabled ? detail::kTransientHoldCapability : std::string_view{}},
+         {"transient_hold", self->config.control.transient_hold.enabled
+             ? Json{{"control_tolerance_ms", self->config.control.degraded_timeout_ms + self->config.control.transient_hold.max_hold_ms},
+                    {"video_tolerance_ms", self->config.runtime.critical_camera_stale_brake_ms + self->config.control.transient_hold.max_hold_ms},
+                    {"max_hold_ms", self->config.control.transient_hold.max_hold_ms}}
+             : Json(nullptr)},
          {"emergency_stop_capability", self->config.runtime.experimental_direct_authority_max_ms > 0 && self->signaling.transport_mac_key().size() >= 32 ? detail::kEmergencyStopCapability : std::string_view{}},
          {"feedback_transport_capability", self->config.runtime.experimental_direct_authority_max_ms > 0 && self->signaling.transport_mac_key().size() >= 32 ? detail::kFeedbackTransportCapability : std::string_view{}},
          {"sdp", text == nullptr ? "" : text},
@@ -1951,6 +1958,7 @@ struct VehicleMediaRuntime::Impl {
         }
         if (decision.changed) {
           invalidate_native_control_trusted_gear_locked();
+          control_service->note_transport_epoch_changed(signaling.now_ms());
           control_service->set_control_braking_wait(true, signaling.now_ms(), ControlRecoveryCause::ControlLink);
         }
       } else {
@@ -3472,27 +3480,51 @@ struct VehicleMediaRuntime::Impl {
     bool ready = true;
     auto cause = ControlRecoveryCause::CriticalVideo;
     const Lane* failed_lane = nullptr;
+    // A negotiated transient hold absorbs stale and IDR-wait video stalls on the
+    // vehicle: only fault-class lane events (invalid samples, disabled or faulted
+    // cameras) reach the recovery latch. Without it every rule below is unchanged.
+    bool hold_mode = false;
+    {
+      std::lock_guard lock(control_mutex);
+      hold_mode = control_service_started && control_service && control_service->transient_hold_enabled();
+    }
     std::vector<ReadinessSampleRevision> revisions;
     for (const auto& lane : lanes) {
-      if (lane->camera.critical_for_control && lane->send_freshness)
+      if (!lane->camera.critical_for_control || !lane->send_freshness) continue;
+      if (hold_mode) {
+        const auto fault = lane->send_freshness->invalid_brake_revision.load();
+        revisions.push_back({"video:" + lane->camera.id, fault, fault});
+      } else {
         revisions.push_back({"video:" + lane->camera.id,
             lane->send_freshness->bad_sample_revision.load(), lane->send_freshness->brake_sample_revision.load()});
+      }
     }
+    bool vehicle_video_stale = false;
     for (const auto& lane : lanes) {
       if (!lane->camera.critical_for_control) continue;
       if (lane->send_freshness) lane->send_freshness->max_age_ms = stale_brake_ms;
-      if (lane->disabled.load() || lane->camera_faulted.load() || !lane->send_freshness ||
-          lane->send_freshness->invalid_sample_blocked.load() ||
-          lane->send_freshness->consecutive_anomalies.load() >= 3 ||
-          !camera_encoded_frame_fresh(lane->send_freshness->last_fresh_frame_ms.load(), now_ms, stale_brake_ms) ||
-          (was_waiting && (lane->send_freshness->consecutive_anomalies.load() != 0 ||
-           lane->send_freshness->fresh_frames.load() < lane->video_wait_encoded_baseline.load() + 3))) {
+      const bool has_freshness = lane->send_freshness != nullptr;
+      const unsigned anomalies = has_freshness ? lane->send_freshness->consecutive_anomalies.load() : 0U;
+      const bool awaiting_recovery = (was_waiting || vehicle_video_hold_active) && has_freshness &&
+          lane->send_freshness->fresh_frames.load() < lane->video_wait_encoded_baseline.load() + 3;
+      const auto lane_state = detail::classify_vehicle_video_lane(lane->disabled.load(), lane->camera_faulted.load(),
+          has_freshness, has_freshness && lane->send_freshness->invalid_sample_blocked.load(),
+          has_freshness && camera_encoded_frame_fresh(lane->send_freshness->last_fresh_frame_ms.load(), now_ms, stale_brake_ms),
+          detail::effective_lane_anomalies(anomalies, hold_mode, was_waiting), awaiting_recovery);
+      if (detail::vehicle_video_lane_blocks_control(lane_state, hold_mode)) {
         ready = false;
         failed_lane = lane.get();
         break;
       }
+      if (lane_state == detail::VehicleVideoLaneState::Stale) vehicle_video_stale = true;
     }
+    // A new stall restarts the "three fresh encoded frames" recovery window.
+    if (hold_mode && vehicle_video_stale && !vehicle_video_hold_active)
+      for (const auto& lane : lanes)
+        lane->video_wait_encoded_baseline = lane->send_freshness ? lane->send_freshness->fresh_frames.load() : 0;
+    vehicle_video_hold_active = hold_mode && vehicle_video_stale;
     bool receive_path_waiting = false;
+    std::vector<Json> transient_events;
     {
       std::lock_guard lock(control_mutex);
       if (control_service_started && control_service) {
@@ -3503,8 +3535,13 @@ struct VehicleMediaRuntime::Impl {
         if (receive_path_waiting && !failed_lane) cause = control_service->control_recovery_cause();
         revisions.push_back({"driver", control_service->recovery_bad_sample_revision(),
             control_service->recovery_brake_revision()});
-        ready = ready && control_service->driver_critical_video_ready();
-        if (!control_service->driver_critical_video_ready()) cause = ControlRecoveryCause::CriticalVideo;
+        // A stale or recovering driver view is transient only under a negotiated hold.
+        const bool driver_video_fault = hold_mode ? control_service->driver_critical_video_fault()
+                                                  : !control_service->driver_critical_video_ready();
+        ready = ready && !driver_video_fault;
+        if (driver_video_fault) cause = ControlRecoveryCause::CriticalVideo;
+        control_service->observe_vehicle_video_transient(vehicle_video_hold_active, signaling.now_ms());
+        transient_events = control_service->drain_transient_hold_events();
         if (was_waiting || receive_path_waiting)
           ready = ready && control_service->recovery_samples_healthy() &&
               control_service->control_timing(signaling.now_ms()).value("consecutive_late_frames", 0) == 0;
@@ -3512,6 +3549,17 @@ struct VehicleMediaRuntime::Impl {
         if (!control_service->driver_control_link_ready()) { ready = false; cause = ControlRecoveryCause::ControlLink; }
         if (!control_service->driver_time_sync_ready()) { ready = false; cause = ControlRecoveryCause::TimeSynchronization; }
       }
+    }
+    // Report hold transitions now: the startup-grace return below must not drop events
+    // that were already drained from the service.
+    for (auto& event : transient_events) {
+      const auto name = event.value("event", std::string("vehicle_transient_hold"));
+      const bool escalated = name == "vehicle_transient_hold_escalated";
+      event["severity"] = escalated ? "warning" : "info";
+      emit_diagnostic(name, name, "transient_hold", "",
+          escalated ? "The link or video did not recover within the hold limit; follow the braking-wait guidance."
+                    : "No action is required.",
+          true, std::move(event));
     }
     const auto time_readiness = vehicle_time_readiness();
     if (config.field_safety.require_time_sync)
@@ -5597,6 +5645,7 @@ struct VehicleMediaRuntime::Impl {
   std::mutex control_mutex;
   // Acquired before control_mutex; no control handler takes this mutex.
   std::mutex control_recovery_phase_mutex;
+  bool vehicle_video_hold_active{false};  // Only accessed under control_recovery_phase_mutex.
   std::unique_ptr<VehicleControlService> control_service;
   // Guarded by control_mutex. Stale-safe heartbeats may only preserve this
   // accepted fresh gear; ESTOP freezes its gear for the pipeline lifetime.

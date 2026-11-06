@@ -38,7 +38,8 @@ PRELUDE = r'''
 #include <nlohmann/json.hpp>
 #include "mine_teleop/detail/ice_diagnostics.hpp"
 #include "mine_teleop/detail/isolated_mock_bench.hpp"
-namespace detail { using mine_teleop::detail::ice_candidate_summary; using mine_teleop::detail::ice_direct_sdp; using mine_teleop::detail::isolated_mock_bench_offer; using mine_teleop::detail::kIsolatedMockBenchCapability; }
+#include "mine_teleop/detail/transient_hold.hpp"
+namespace detail { using mine_teleop::detail::kTransientHoldCapability; using mine_teleop::detail::parse_transient_hold_offer; using mine_teleop::detail::ice_candidate_summary; using mine_teleop::detail::ice_direct_sdp; using mine_teleop::detail::isolated_mock_bench_offer; using mine_teleop::detail::kIsolatedMockBenchCapability; }
 using Json=nlohmann::json;
 namespace detail { constexpr std::string_view kControlTransportCapability = "native-control-transport-v1"; constexpr std::string_view kEmergencyStopCapability = "native-stop-only-v1"; constexpr std::string_view kFeedbackTransportCapability = "native-feedback-transport-v1"; }
 using guint=unsigned;using guint8=unsigned char;using gchar=char;using gpointer=void*;
@@ -101,7 +102,8 @@ struct Impl {
 MEMBERS = r'''
   bool attested=false;
   bool isolated_mock_bench_attested() const {return attested;}
-  struct { struct { int experimental_direct_authority_max_ms=0; bool mock_control_diagnostic=false; } runtime; } config;
+  struct { struct { int experimental_direct_authority_max_ms=0; bool mock_control_diagnostic=false; int critical_camera_stale_brake_ms=500; } runtime;
+           struct { int degraded_timeout_ms=300; struct { bool enabled=false; int max_hold_ms=700; } transient_hold; } control; } config;
   void flush_control_status() {} // Control status has separate protocol/service coverage.
   void process_control_management(const Json&,const Json&) {}
   struct Lane {struct {std::string id="front";} camera;struct {int width=1,height=1,fps=1,bitrate_kbps=1;} profile;};
@@ -162,6 +164,19 @@ void case_isolated_mock_attestation() {
     expect(impl.signaling.sent[0].second.value("isolated_mock_bench_capability","")==
         (attested?std::string(detail::kIsolatedMockBenchCapability):std::string{}),"isolated mock bench attestation mismatch");
     expect(detail::isolated_mock_bench_offer(impl.signaling.sent[0].second)==attested,"attestation did not satisfy the viewer predicate");
+  }
+}
+void case_transient_hold_offer() {
+  for (bool enabled : {false,true}) {
+    Impl impl;impl.config.control.transient_hold.enabled=enabled;GstElement peer;activate(impl,peer);negotiate(impl,peer);
+    complete(peer);impl.flush_outgoing_signals();
+    expect(impl.signaling.sent.size()==1&&impl.signaling.sent[0].first=="webrtc_offer","transient hold offer missing");
+    const auto& offer=impl.signaling.sent[0].second;
+    const auto parsed=detail::parse_transient_hold_offer(offer);
+    expect(offer.value("transient_hold_capability","")==(enabled?std::string(detail::kTransientHoldCapability):std::string{}),"transient hold capability mismatch");
+    expect(parsed.has_value()==enabled,"driver predicate disagrees with the vehicle's transient hold declaration");
+    if (enabled) expect(parsed->control_tolerance_ms==1000&&parsed->video_tolerance_ms==1200&&parsed->max_hold_ms==700,"declared tolerances are not degraded+hold and stale+hold");
+    else expect(offer.at("transient_hold").is_null(),"disabled vehicle declared tolerances");
   }
 }
 void case_late_callbacks() {
@@ -275,7 +290,7 @@ void case_direct_filter_and_fresh_fallback() {
   expect(replacement.added.size()==1,"fresh fallback did not admit TURN");
 }
 int main(){int failed=0;const std::vector<std::pair<const char*,void(*)()>> cases={
-  {"ICE-VEHICLE-MOCK-001",case_order},{"ICE-VEHICLE-MOCK-ATTEST",case_isolated_mock_attestation},{"ICE-VEHICLE-MOCK-002",case_late_callbacks},
+  {"ICE-VEHICLE-MOCK-001",case_order},{"ICE-VEHICLE-MOCK-ATTEST",case_isolated_mock_attestation},{"ICE-VEHICLE-MOCK-TRANSIENT",case_transient_hold_offer},{"ICE-VEHICLE-MOCK-002",case_late_callbacks},
   {"ICE-VEHICLE-MOCK-003",case_remote_order},{"ICE-VEHICLE-MOCK-004",case_legacy_retry},
   {"ICE-VEHICLE-MOCK-005",case_stale_invalid_answer},{"ICE-VEHICLE-MOCK-006",case_bounded_pending}};
   auto selected=cases;
@@ -325,6 +340,9 @@ def main():
             raise AssertionError(f"isolated mock bench attestation no longer uses {needle}")
     if 'starts_with("test_bench_")' in source:
         raise AssertionError("scattered bench identity check; use isolated_mock_bench_attested()")
+    epoch = section(source, "        if (decision.changed) {", "        }\n")
+    if "note_transport_epoch_changed" not in epoch:
+        raise AssertionError("transport epoch changes must escalate an active hold with their own reason")
     call_site = section(source, "      configure_ice_servers();", "    } catch (const std::exception& error) {")
     if "observe_ice_agent();" not in call_site:
         raise AssertionError("ICE agent observation call site moved unexpectedly")

@@ -107,11 +107,33 @@ void validation_offer_and_lanes() {
   require(classify_vehicle_video_lane(false, true, true, false, true, 0, false) == VehicleVideoLaneState::Fault, "faulted lane not a fault");
   require(classify_vehicle_video_lane(false, false, false, false, true, 0, false) == VehicleVideoLaneState::Fault, "missing freshness not a fault");
 }
+void legacy_lane_decision_is_unchanged() {
+  // Without a negotiated hold the per-lane decision must equal the media runtime's
+  // original expression for every combination of its inputs.
+  for (int bits = 0; bits < (1 << 7); ++bits) {
+    const bool disabled = bits & 1, faulted = bits & 2, has = bits & 4, invalid = bits & 8, fresh = bits & 16,
+        waiting = bits & 32, enough_frames = bits & 64;
+    for (unsigned anomalies = 0; anomalies <= 4; ++anomalies) {
+      const bool legacy = disabled || faulted || !has || invalid || anomalies >= 3 || !fresh ||
+          (waiting && (anomalies != 0 || !enough_frames));
+      const bool awaiting = waiting && !enough_frames;
+      const auto legacy_state = classify_vehicle_video_lane(disabled, faulted, has, invalid, fresh,
+          effective_lane_anomalies(anomalies, false, waiting), awaiting);
+      require(vehicle_video_lane_blocks_control(legacy_state, false) == legacy, "legacy lane decision changed");
+      // With a negotiated hold only faults block control; staleness becomes a hold.
+      const auto hold_state = classify_vehicle_video_lane(disabled, faulted, has, invalid, fresh,
+          effective_lane_anomalies(anomalies, true, waiting), awaiting);
+      require(vehicle_video_lane_blocks_control(hold_state, true) == (disabled || faulted || !has || invalid),
+          "hold-mode lane decision treated staleness as a fault");
+    }
+  }
+}
 }  // namespace
 int main() {
   try {
     resume_within_window(); cause_reappearing_resets_fresh_count(); escalate_at_max_hold();
     budget_count_time_and_window(); fault_clock_and_disabled(); validation_offer_and_lanes();
+    legacy_lane_decision_is_unchanged();
     std::cout << "PASS transient hold policy: resume, escalation, budget, clock, offer and lane classification\n";
     return 0;
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

@@ -188,6 +188,7 @@ void test_fault_history_between_control_reads(AccessUnitCodec codec) {
   expect(state.consecutive_anomalies == 0 && !state.blocked &&
       state.bad_sample_revision == before_bad + 1 && state.brake_sample_revision == before_brake,
       "latest healthy IDR erased a tolerable stale event between control reads");
+  expect(state.invalid_brake_revision == 0, "a stale drop bumped the fault-class revision");
   const auto after_short_bad = state.bad_sample_revision.load();
   push(source.get(), delta, 10 * GST_MSECOND); // old, not another sample
   push(source.get(), idr, 1000 * GST_MSECOND);
@@ -199,6 +200,7 @@ void test_fault_history_between_control_reads(AccessUnitCodec codec) {
   expect(pull_pts(sink.get()) == 1990 * GST_MSECOND && state.consecutive_anomalies == 0 && !state.blocked &&
       state.bad_sample_revision == after_short_bad + 4 && state.brake_sample_revision == before_brake + 1,
       "third crossing followed by normal IDR was lost or fourth anomaly repeatedly braked");
+  expect(state.invalid_brake_revision == 0, "three consecutive stale drops bumped the fault-class revision");
   const auto before_invalid_bad = state.bad_sample_revision.load(), before_invalid_brake = state.brake_sample_revision.load();
   now = 3100;
   for (int repeat = 0; repeat < 3; ++repeat) push(source.get(), delta, GST_CLOCK_TIME_NONE);
@@ -206,6 +208,7 @@ void test_fault_history_between_control_reads(AccessUnitCodec codec) {
   expect(pull_pts(sink.get()) == 2090 * GST_MSECOND && !state.invalid_sample_blocked &&
       state.bad_sample_revision == before_invalid_bad + 1 && state.brake_sample_revision == before_invalid_brake + 1,
       "invalid-time barrier followed by normal IDR was lost or repeated unidentifiable buffers repeatedly braked");
+  expect(state.invalid_brake_revision == 1, "one invalid episode did not bump the fault-class revision exactly once");
   // Reading an already healthy status has no side effect on either category.
   const auto healthy_bad = state.bad_sample_revision.load(), healthy_brake = state.brake_sample_revision.load();
   for (int repeat = 0; repeat < 100; ++repeat) {
@@ -218,6 +221,7 @@ void test_fault_history_between_control_reads(AccessUnitCodec codec) {
   expect(pull_pts(sink.get()) == 2100 * GST_MSECOND && state.bad_sample_revision == healthy_bad + 1 &&
       state.brake_sample_revision == healthy_brake + 1,
       "new invalid-time episode after valid recovery failed to preserve another brake event");
+  expect(state.invalid_brake_revision == 2, "a new invalid episode after recovery was not counted");
   const auto before_old_invalid_bad = state.bad_sample_revision.load();
   const auto before_old_invalid_brake = state.brake_sample_revision.load();
   now = 3200;
@@ -227,6 +231,7 @@ void test_fault_history_between_control_reads(AccessUnitCodec codec) {
   expect(pull_pts(sink.get()) == 2190 * GST_MSECOND && !state.invalid_sample_blocked &&
       state.bad_sample_revision == before_old_invalid_bad + 1 && state.brake_sample_revision == before_old_invalid_brake + 1,
       "old malformed AU counted again or masked the subsequent first real invalid-time event");
+  expect(state.invalid_brake_revision == 3, "an old malformed AU counted as an invalid episode, or the real one was missed");
 }
 
 void test_raw_delivery_ceiling_for_misreported_rate() {

@@ -61,6 +61,9 @@ struct EncodedSendFreshness {
   std::atomic<std::uint64_t> dropped_waiting_idr{0};
   std::atomic<std::uint64_t> key_unit_requests{0};
   std::atomic<std::uint64_t> key_unit_request_failures{0};
+  // One increment per invalid-sample episode. Stale and IDR-wait drops never touch it,
+  // so a negotiated transient hold can tell faults from tolerable video stalls.
+  std::atomic<std::uint64_t> invalid_brake_revision{0};
   // Streaming-thread state. One retry per reference-gap episode, never an
   // unbounded IDR storm. No buffer means the existing video watchdog applies.
   std::optional<std::int64_t> recovery_started_ms;
@@ -140,6 +143,7 @@ inline GstPadProbeReturn encoded_send_freshness_probe(
             sample_id <= *previous_sample_id;
         if (!known_old_sample && !state.invalid_fault_event_latched) {
           state.invalid_fault_event_latched = true;
+          ++state.invalid_brake_revision;
           if (!new_sample) ++state.bad_sample_revision;
           if (state.samples.brake_sample_revision() == previous_brake_revision) ++state.brake_sample_revision;
         }

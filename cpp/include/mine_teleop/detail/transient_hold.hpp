@@ -262,4 +262,16 @@ inline VehicleVideoLaneState classify_vehicle_video_lane(bool disabled, bool fau
   return VehicleVideoLaneState::Fresh;
 }
 
+// Without a negotiated hold the legacy per-lane rules apply unchanged: one or two
+// dropped pictures are tolerated unless a braking wait already demands a clean
+// recovery window, and only the third consecutive drop counts.
+inline unsigned effective_lane_anomalies(unsigned anomalies, bool hold_mode, bool waiting) {
+  return (hold_mode || waiting) ? anomalies : (anomalies >= 3U ? anomalies : 0U);
+}
+
+// A fault always blocks control. Staleness blocks it only when no hold can absorb it.
+inline bool vehicle_video_lane_blocks_control(VehicleVideoLaneState state, bool hold_mode) {
+  return state == VehicleVideoLaneState::Fault || (state == VehicleVideoLaneState::Stale && !hold_mode);
+}
+
 }  // namespace mine_teleop::detail
