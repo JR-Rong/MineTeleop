@@ -6,7 +6,7 @@
 #include <mutex>
 #include <limits>
 #include <stdexcept>
-#include "mine_teleop/detail/native_web_control.hpp"
+#include "mine_teleop/bench/native_web_control.hpp"
 
 namespace mine_teleop::detail {
 

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "mine_teleop/detail/control_transport.hpp"
-#include "mine_teleop/detail/native_control_mailbox.hpp"
+#include "mine_teleop/bench/native_control_mailbox.hpp"
 #include <cstdint>
 #include <optional>
 #include <string>

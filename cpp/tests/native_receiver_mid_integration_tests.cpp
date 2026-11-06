@@ -1,5 +1,5 @@
 // Synthetic two-camera WebRTC loopback: no device, signaling or vehicle control.
-#include "native_receiver_core.hpp"
+#include "mine_teleop/bench/native_receiver_core.hpp"
 #include "mine_teleop/detail/gstreamer_rtp_marker.hpp"
 #include <gio/gnetworking.h>
 #include <gst/video/video.h>

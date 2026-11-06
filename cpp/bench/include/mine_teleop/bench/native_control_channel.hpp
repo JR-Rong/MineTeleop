@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mine_teleop/detail/native_control_mailbox.hpp"
+#include "mine_teleop/bench/native_control_mailbox.hpp"
 #define GST_USE_UNSTABLE_API
 #include <gst/webrtc/webrtc.h>
 #include <gio/gio.h>

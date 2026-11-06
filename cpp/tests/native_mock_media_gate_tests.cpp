@@ -1,10 +1,10 @@
-#include "mine_teleop/detail/native_mock_media_gate.hpp"
-#include "mine_teleop/detail/native_mock_input_sequence.hpp"
-#include "mine_teleop/detail/native_mock_profile_retry.hpp"
-#include "mine_teleop/detail/native_mock_profile_state.hpp"
-#include "mine_teleop/detail/native_mock_gear_transition.hpp"
-#include "mine_teleop/detail/native_mock_keyboard.hpp"
-#include "mine_teleop/detail/dtls_record_trace.hpp"
+#include "mine_teleop/bench/native_mock_media_gate.hpp"
+#include "mine_teleop/bench/native_mock_input_sequence.hpp"
+#include "mine_teleop/bench/native_mock_profile_retry.hpp"
+#include "mine_teleop/bench/native_mock_profile_state.hpp"
+#include "mine_teleop/bench/native_mock_gear_transition.hpp"
+#include "mine_teleop/bench/native_mock_keyboard.hpp"
+#include "mine_teleop/bench/dtls_record_trace.hpp"
 #include <iostream>
 #include <limits>
 #include <stdexcept>

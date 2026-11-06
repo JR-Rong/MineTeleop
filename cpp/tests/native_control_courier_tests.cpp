@@ -1,4 +1,4 @@
-#include "mine_teleop/detail/native_control_courier.hpp"
+#include "mine_teleop/bench/native_control_courier.hpp"
 #include <iostream>
 #include <stdexcept>
 

@@ -1,7 +1,7 @@
-#include "mine_teleop/detail/native_viewer_observation.hpp"
-#include "mine_teleop/detail/native_operator_readouts.hpp"
-#include "mine_teleop/detail/native_identity_input.hpp"
-#include "mine_teleop/detail/native_video_layout.hpp"
+#include "mine_teleop/bench/native_viewer_observation.hpp"
+#include "mine_teleop/bench/native_operator_readouts.hpp"
+#include "mine_teleop/bench/native_identity_input.hpp"
+#include "mine_teleop/bench/native_video_layout.hpp"
 #include <cstdlib>
 #include <limits>
 

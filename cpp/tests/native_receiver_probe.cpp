@@ -1,4 +1,4 @@
-#include "native_receiver_core.hpp"
+#include "mine_teleop/bench/native_receiver_core.hpp"
 
 namespace {
 using namespace mine_teleop::bench;

@@ -1,6 +1,6 @@
 // In-process ICE fixture only: no signaling service, vehicle or control inputs.
-#include "mine_teleop/detail/native_control_channel.hpp"
-#include "mine_teleop/detail/native_control_courier.hpp"
+#include "mine_teleop/bench/native_control_channel.hpp"
+#include "mine_teleop/bench/native_control_courier.hpp"
 #include <agent.h>
 #include <gio/gnetworking.h>
 #include <atomic>

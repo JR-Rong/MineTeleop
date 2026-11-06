@@ -1,4 +1,4 @@
-#include "mine_teleop/detail/native_video_health.hpp"
+#include "mine_teleop/bench/native_video_health.hpp"
 #include <iostream>
 #include <limits>
 #include <stdexcept>

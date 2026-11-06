@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mine_teleop/detail/native_control_publication.hpp"
+#include "mine_teleop/bench/native_control_publication.hpp"
 #include <chrono>
 #include <deque>
 #include <functional>

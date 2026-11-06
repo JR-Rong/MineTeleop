@@ -153,7 +153,7 @@ python3 scripts/test/receiver_ab_analyze.py browser.json native.json > summary.j
 
 `desktop/bench/main.cjs` 是独立、显式启动的实验入口：同一 Electron 44.3.0、同一控制台页面、窗口尺寸和压力脚本，`browser` 使用原有 WebRTC `<video>`，`native` 通过 Node-API 将 VideoToolbox/GL 视图嵌入相机区域。接收器与命令队列运行在独立线程，页面继续复用产品登录、会话围栏和信令。原生帧不会被伪造成产品的健康视频准入，台架关闭控制。此入口和 `.node` 不进入现有桌面发布包，也不改变默认客户端。
 
-原生解码与探针共用 `cpp/tests/native_receiver_core.hpp`。macOS 嵌入模式为每路创建独立 GL display context，避免 VideoToolbox GL 分配器经公共管线发现并共用另一视频轨道的 drawable；仅有两路 draw 回调不能证明两个区域都显示。必须同时检查窗口截图和两路 NSView 的子视图挂载。绘制仍使用有界队列和 `sync=false`，未实现 Moonlight 的显示刷新调度。
+原生解码与探针共用 `cpp/bench/include/mine_teleop/bench/native_receiver_core.hpp`。macOS 嵌入模式为每路创建独立 GL display context，避免 VideoToolbox GL 分配器经公共管线发现并共用另一视频轨道的 drawable；仅有两路 draw 回调不能证明两个区域都显示。必须同时检查窗口截图和两路 NSView 的子视图挂载。绘制仍使用有界队列和 `sync=false`，未实现 Moonlight 的显示刷新调度。
 
 构建需要 GStreamer GL 和 Node-API 头文件：
 

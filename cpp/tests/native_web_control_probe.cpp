@@ -1,5 +1,5 @@
-#include "mine_teleop/detail/native_web_control.hpp"
-#include "mine_teleop/detail/native_mock_gear_transition.hpp"
+#include "mine_teleop/bench/native_web_control.hpp"
+#include "mine_teleop/bench/native_mock_gear_transition.hpp"
 #include <iomanip>
 #include <iostream>
 #include <string_view>

@@ -3,7 +3,7 @@
 #include "mine_teleop/video.hpp"
 #include "mine_teleop/gstreamer_media.hpp"
 #include "mine_teleop/detail/media_freshness.hpp"
-#include "mine_teleop/detail/gstreamer_decoder.hpp"
+#include "mine_teleop/bench/gstreamer_decoder.hpp"
 #include "mine_teleop/detail/latency_histogram.hpp"
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>

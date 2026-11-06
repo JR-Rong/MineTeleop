@@ -3,7 +3,7 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
 #include <node_api.h>
-#include "native_receiver_core.hpp"
+#include "mine_teleop/bench/native_receiver_core.hpp"
 #include <cstring>
 
 using namespace mine_teleop::bench;

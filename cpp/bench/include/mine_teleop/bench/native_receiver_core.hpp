@@ -4,11 +4,11 @@
 #include "mine_teleop/server.hpp"
 #include "mine_teleop/detail/gstreamer_ice_servers.hpp"
 #include "mine_teleop/detail/ice_diagnostics.hpp"
-#include "mine_teleop/detail/gstreamer_decoder.hpp"
-#include "mine_teleop/detail/native_control_channel.hpp"
-#include "mine_teleop/detail/dtls_record_trace.hpp"
+#include "mine_teleop/bench/gstreamer_decoder.hpp"
+#include "mine_teleop/bench/native_control_channel.hpp"
+#include "mine_teleop/bench/dtls_record_trace.hpp"
 #include "mine_teleop/detail/rtp_marker.hpp"
-#include "owned_callback_guard.hpp"
+#include "mine_teleop/bench/owned_callback_guard.hpp"
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/sdp/sdp.h>

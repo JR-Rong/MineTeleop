@@ -1,8 +1,8 @@
 #include "mine_teleop/server.hpp"
 #include "mine_teleop/websocket.hpp"
-#include "mine_teleop/detail/native_control_publication.hpp"
-#include "mine_teleop/detail/native_control_courier.hpp"
-#include "mine_teleop/detail/native_video_health.hpp"
+#include "mine_teleop/bench/native_control_publication.hpp"
+#include "mine_teleop/bench/native_control_courier.hpp"
+#include "mine_teleop/bench/native_video_health.hpp"
 #include "control_time_fixture.hpp"
 
 #include <chrono>
