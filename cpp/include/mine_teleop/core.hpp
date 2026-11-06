@@ -17,6 +17,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "mine_teleop/detail/transient_hold.hpp"
+
 namespace mine_teleop {
 
 using Json = nlohmann::json;
@@ -451,6 +453,11 @@ struct ControlConfig {
   int max_command_gap_ms{200};
   int degraded_timeout_ms{300};
   int control_timeout_ms{800};
+  // Chassis bridge apply watchdog (process liveness). Loaded as control_timeout_ms
+  // unless the YAML sets it, so it can stay shorter than a hold-extended hard watchdog.
+  int bridge_apply_timeout_ms{800};
+  // Disabled unless the YAML block enables it.
+  detail::TransientHoldConfig transient_hold;
   std::vector<DecelerationStage> deceleration_profile;
 };
 

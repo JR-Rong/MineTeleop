@@ -1964,6 +1964,12 @@ Json VehicleConfig::redacted_summary() const {
       {"ice_direct_timeout_ms", cloud.ice_direct_timeout_ms},
       {"device_token_file_configured", !cloud.device_token_file.empty()},
       {"control_enabled", runtime.control_enabled},
+      {"control_timeout_ms", control.control_timeout_ms},
+      {"bridge_apply_timeout_ms", control.bridge_apply_timeout_ms},
+      {"transient_hold",
+       {{"enabled", control.transient_hold.enabled},
+        {"max_hold_ms", control.transient_hold.max_hold_ms},
+        {"hold_brake", control.transient_hold.hold_brake}}},
       {"media_enabled", runtime.media_enabled},
       {"teleop_poll_interval_ms", runtime.teleop_poll_interval_ms},
       {"camera_count", enabled.size()},
@@ -2087,6 +2093,44 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
       config.control.control_timeout_ms > 60000) {
     throw std::runtime_error(
         "control timing requires positive values no greater than 60000 ms and degraded_timeout_ms < control_timeout_ms");
+  }
+  config.control.bridge_apply_timeout_ms =
+      optional<int>(control, "bridge_apply_timeout_ms", config.control.control_timeout_ms);
+  if (config.control.bridge_apply_timeout_ms < 20 || config.control.bridge_apply_timeout_ms > 60000 ||
+      config.control.bridge_apply_timeout_ms > config.control.control_timeout_ms) {
+    throw std::runtime_error(
+        "control.bridge_apply_timeout_ms must be 20..60000 and no greater than control_timeout_ms");
+  }
+  if (const auto hold = control["transient_hold"]; hold && !hold.IsNull()) {
+    if (!hold.IsMap()) throw std::runtime_error("control.transient_hold must be a mapping");
+    // A misspelled key must not silently leave a safety parameter at its default.
+    static constexpr std::array<std::string_view, 7> known_keys{
+        "enabled", "max_hold_ms", "hold_brake", "resume_fresh_commands",
+        "budget_window_ms", "max_holds_per_window", "max_hold_time_per_window_ms"};
+    for (const auto& entry : hold) {
+      const auto key = entry.first.as<std::string>();
+      if (std::find(known_keys.begin(), known_keys.end(), key) == known_keys.end())
+        throw std::runtime_error("control.transient_hold." + key + " is not a known setting");
+    }
+    auto& value = config.control.transient_hold;
+    value.enabled = optional<bool>(hold, "enabled", false);
+    value.max_hold_ms = optional<int>(hold, "max_hold_ms", 700);
+    value.hold_brake = optional<double>(hold, "hold_brake", 0.15);
+    value.resume_fresh_commands = optional<int>(hold, "resume_fresh_commands", 2);
+    value.budget_window_ms = optional<int>(hold, "budget_window_ms", 60000);
+    value.max_holds_per_window = optional<int>(hold, "max_holds_per_window", 6);
+    value.max_hold_time_per_window_ms = optional<int>(hold, "max_hold_time_per_window_ms", 3000);
+    if (value.enabled) {
+      try {
+        value.validate();
+      } catch (const std::invalid_argument& error) {
+        throw std::runtime_error(error.what());
+      }
+      if (config.control.degraded_timeout_ms + value.max_hold_ms + 100 > config.control.control_timeout_ms) {
+        throw std::runtime_error(
+            "control.transient_hold requires degraded_timeout_ms + max_hold_ms + 100 <= control_timeout_ms");
+      }
+    }
   }
   const auto profile = control["timeout_action"]["deceleration_profile"];
   if (!profile || !profile.IsSequence()) throw std::runtime_error("control.timeout_action.deceleration_profile is required");
@@ -2323,7 +2367,7 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   }
   if (config.field_safety.speed_feedback_timeout_ms < kMinSpeedFeedbackTimeoutMs ||
       config.field_safety.speed_feedback_timeout_ms > kMaxSpeedFeedbackTimeoutMs ||
-      config.field_safety.speed_feedback_timeout_ms > config.control.control_timeout_ms ||
+      config.field_safety.speed_feedback_timeout_ms > config.control.bridge_apply_timeout_ms ||
       !std::isfinite(config.field_safety.speed_pid_kp) ||
       config.field_safety.speed_pid_kp <= 0.0 ||
       config.field_safety.speed_pid_kp > kMaxSpeedPidGain ||
@@ -2344,7 +2388,7 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
       config.field_safety.hard_overspeed_margin_kph >
           kMaxHardOverspeedMarginKph) {
     throw std::runtime_error(
-        "field_safety local speed PID, feedback timeout, max dt, or hard overspeed margin is invalid");
+        "field_safety local speed PID, feedback timeout (no greater than control.bridge_apply_timeout_ms), max dt, or hard overspeed margin is invalid");
   }
 
   const auto recording = root["recording"];
@@ -3057,7 +3101,7 @@ std::unique_ptr<VehicleAdapter> create_vehicle_adapter(const VehicleConfig& conf
         config.field_safety.full_scale_motor_torque_nm,
         config.field_safety.motor_torque_rise_rate_nm_per_s,
         config.field_safety.max_brake_pressure_bar,
-        config.control.control_timeout_ms,
+        config.control.bridge_apply_timeout_ms,
         config.field_safety.speed_feedback_timeout_ms,
         config.field_safety.speed_pid_kp,
         config.field_safety.speed_pid_ki,
