@@ -40,6 +40,11 @@ scripts/test/check.sh
 - `mine-teleop-recovery-enforcer-tests`、`mine-teleop-media-freshness-gstreamer-tests`、`mine-teleop-ice-vehicle-callback-mock-tests`：车端视频分类、故障类修订号、offer 声明；
 - `mine-teleop-native-control-ack-tests`：驾驶端 ACK 容忍模式；
 - `mine-teleop-transient-hold-integration-tests`：真实回环 WSS 上的断流尖峰，以及同一断流下无保持能力的车端仍制动的对照；
+  这组测试用真实定时器对 700 ms 的保持上限计时，对调度敏感：整个进程停顿约 350 ms 以上，正确的保持就会变成正确的升级。
+  夹具记录 `pump()` 两次调用之间的最大间隔；断言失败时若该间隔不小于 100 ms，就在新夹具上重跑，最多再跑两次，每次打印
+  `[RETRY] ... reason=scheduler_stall_ms=N`；没有停顿证据，或三次都失败，失败就成立（保持恢复变慢而没有停顿，是回归，不会被重试掉）。
+  本地在 8 核加 8 个忙循环、2 核加 2 个忙循环下各 15/15 通过；2 核加 6 个忙循环（三倍超订）下全部失败，且测到的最大间隔只有 77–86 ms，
+  检测不会触发，那是持续饥饿而不是单次停顿，不要在那种条件下运行它。
 - `mine-teleop-transient-hold-netem-tests`：用 `tc netem` 在回环口注入真实丢包。需要 root 和 `sch_netem`，不满足时退出码 77，CTest 记为**跳过**——跳过不计为通过，汇报时必须单独列出。
 
 页面逻辑由 `cpp/tests/camera_view.test.cjs`、`cpp/tests/control_logic.test.cjs` 覆盖，随 `scripts/test/run_offline_regressions.py` 运行。
