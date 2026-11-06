@@ -655,6 +655,7 @@ class DriverConsoleRuntime {
   detail::NativeControlAckRecovery control_dc_ack_recovery_;
   std::uint64_t control_dc_last_ack_seq_{0};
   detail::NativeControlAckRecovery control_signaling_ack_recovery_;
+  bool ack_rtt_anomaly_traced_{false};  // control_signaling_websocket_mutex_
   std::string control_signaling_recovery_gear_{"N"};
   std::int64_t control_signaling_next_connect_monotonic_ms_{0};
   int control_signaling_reconnect_delay_ms_{100};

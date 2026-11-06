@@ -5521,6 +5521,7 @@ void DriverConsoleRuntime::close_control_signaling_websocket() {
   control_signaling_last_ack_seq_ = 0;
   control_signaling_ack_window_.reset();
   control_signaling_ack_recovery_.reset();
+  ack_rtt_anomaly_traced_ = false;
   control_vehicle_result_latency_.reset();
   control_transport_sender_.reset(); control_transport_cloud_capable_ = false;
   feedback_transport_sender_.reset(); feedback_transport_enabled_ = feedback_transport_dc_is_p2p_ = false;
@@ -6428,6 +6429,11 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
         ~RecordUnlock() { value = monotonic_now_ms(); }
       } record_unlock{socket_lock_released_ms};
       if (native_control_trace_) trace_record["socket_lock_acquired_monotonic_ms"] = socket_lock_acquired_ms;
+      // The vehicle's declared control tolerance applies to both carriers: RTT-only anomalies
+      // and ACK stalls escalate only after it, and 0 keeps the existing rules. Set it before
+      // any ACK of this cycle is consumed, including the drain below and the DC observation.
+      control_signaling_ack_recovery_.set_tolerance_ms(transient_tolerance_ms);
+      control_dc_ack_recovery_.set_tolerance_ms(transient_tolerance_ms);
       {
         std::lock_guard lock(mutex_);
         if (session_id_ != session || control_token_ != control_token ||
@@ -6536,6 +6542,14 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
       const auto recovery_transition = direct_continuation ? detail::NativeControlAckRecovery::Transition{} : control_signaling_ack_recovery_.observe(
           monotonic_ms, control_signaling_ack_window_.pending_count(), ack_stall_age_ms,
           control_signaling_last_ack_seq_, control_signaling_ack_window_.last_ack_packet_age_ms(), recovery_timeout_ms);
+      const bool rtt_anomaly = control_signaling_ack_recovery_.rtt_anomaly_since().has_value();
+      if (rtt_anomaly != ack_rtt_anomaly_traced_) {
+        ack_rtt_anomaly_traced_ = rtt_anomaly;
+        if (native_control_trace_) native_control_trace_->enqueue({
+            {"stage", rtt_anomaly ? "ack_rtt_anomaly_started" : "ack_rtt_anomaly_ended"},
+            {"trace_session_id", session}, {"seq", sequence}, {"event_monotonic_ms", monotonic_ms},
+            {"tolerance_ms", transient_tolerance_ms}});
+      }
       if (recovery_transition.entered) {
         control_signaling_recovery_gear_ = command.gear;
         if (control_transport_sender_.path() == detail::ControlPath::DataChannel)
@@ -8535,6 +8549,7 @@ Json DriverConsoleRuntime::status(bool omit_signaling_socket) {
   std::int64_t native_control_next_connect_monotonic_ms = 0;
   std::int64_t native_control_unacknowledged_age_ms = 0;
   std::int64_t native_control_ack_stall_age_ms = 0;
+  std::optional<std::int64_t> native_control_ack_rtt_anomaly_since;
   std::size_t native_control_unacknowledged_count = 0;
   int native_control_reconnect_delay_ms = 0;
   bool native_control_ack_braking_wait = false;
@@ -8564,6 +8579,7 @@ Json DriverConsoleRuntime::status(bool omit_signaling_socket) {
     native_control_unacknowledged_count = control_signaling_ack_window_.pending_count();
     native_control_reconnect_delay_ms = control_signaling_reconnect_delay_ms_;
     native_control_ack_braking_wait = control_signaling_ack_recovery_.waiting();
+    native_control_ack_rtt_anomaly_since = control_signaling_ack_recovery_.rtt_anomaly_since();
     native_control_capabilities_verified = control_signaling_capabilities_verified_;
     native_control_ack_recovery_deadline_ms = control_signaling_ack_recovery_.deadline();
     native_control_last_ack_packet_age_ms = control_signaling_ack_window_.last_ack_packet_age_ms();
@@ -8679,7 +8695,11 @@ Json DriverConsoleRuntime::status(bool omit_signaling_socket) {
         {"transient_hold",
          {{"negotiated", transient_hold_vehicle_capable_},
           {"control_tolerance_ms", transient_control_tolerance_ms_},
-          {"video_tolerance_ms", transient_video_tolerance_ms_}}},
+          {"video_tolerance_ms", transient_video_tolerance_ms_},
+          {"ack_rtt_anomaly_active", native_control_ack_rtt_anomaly_since.has_value()},
+          {"ack_rtt_anomaly_ms", native_control_ack_rtt_anomaly_since
+              ? Json(std::max<std::int64_t>(0, monotonic_now_ms() - *native_control_ack_rtt_anomaly_since)) : Json(nullptr)},
+          {"ack_stall_ms", native_control_ack_stall_age_ms}}},
         {"websocket_connected", native_control_websocket_connected},
         {"next_connect_in_ms",
          std::max<std::int64_t>(

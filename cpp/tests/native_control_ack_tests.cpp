@@ -752,6 +752,78 @@ void test_runtime_coalesced_ack_history_restarts_one_common_healthy_window() {
     expect(stable_elapsed >= mine_teleop::kControlRecoveryStableMs && stable_elapsed < 600,
         "bad revision did not restart exactly one shared 300ms window: " + packets.dump());
 }
+void test_tolerant_mode_absorbs_short_rtt_spikes() {
+  NativeControlAckRecovery recovery; recovery.set_tolerance_ms(1000);
+  std::uint64_t seq = 0;
+  for (std::int64_t now = 0; now < 900; now += 50)
+    expect(!recovery.note_ack_progress(now, ++seq, 300, 5000).entered, "short RTT spike entered the ACK wait");
+  expect(!recovery.waiting() && recovery.bad_sample_revision() > 0, "spike was not recorded as link degradation");
+  expect(recovery.brake_sample_revision() == 0, "a tolerated spike was reported as a brake event");
+  expect(recovery.rtt_anomaly_since().has_value(), "anomaly start was not tracked");
+  expect(!recovery.note_ack_progress(950, ++seq, 50, 5000).entered && !recovery.rtt_anomaly_since(),
+      "healthy ACK did not clear the anomaly");
+  // A new anomaly after a healthy ACK starts a fresh clock rather than inheriting the old one.
+  for (std::int64_t now = 1000; now < 1900; now += 50)
+    expect(!recovery.note_ack_progress(now, ++seq, 300, 5000).entered, "anomaly clock was not restarted after a healthy ACK");
+}
+
+void test_tolerant_mode_escalates_sustained_rtt() {
+  NativeControlAckRecovery recovery; recovery.set_tolerance_ms(1000);
+  std::uint64_t seq = 0; bool entered = false; std::int64_t entered_at = -1;
+  for (std::int64_t now = 0; now <= 1100 && !entered; now += 50) {
+    entered = recovery.note_ack_progress(now, ++seq, 300, 5000).entered;
+    if (entered) entered_at = now;
+  }
+  expect(entered && entered_at == 1000, "sustained RTT anomaly did not enter the wait exactly at the tolerance");
+  expect(recovery.waiting() && recovery.brake_sample_revision() == 1, "the escalation was not reported as one brake event");
+}
+
+void test_tolerant_mode_stall_uses_tolerance() {
+  NativeControlAckRecovery recovery; recovery.set_tolerance_ms(1000);
+  static_cast<void>(recovery.note_ack_progress(0, 1, 50, 5000));
+  expect(!recovery.observe(600, 2, 600, 1, 50, 5000).entered, "600 ms stall entered in tolerant mode");
+  expect(!recovery.observe(999, 2, 999, 1, 50, 5000).entered, "999 ms stall entered in tolerant mode");
+  expect(recovery.observe(1000, 2, 1000, 1, 50, 5000).entered, "1000 ms stall did not enter");
+}
+
+void test_tolerant_mode_recovers_with_fresh_ack() {
+  NativeControlAckRecovery recovery; recovery.set_tolerance_ms(1000);
+  std::uint64_t seq = 0;
+  for (std::int64_t now = 0; now <= 1000; now += 50) static_cast<void>(recovery.note_ack_progress(now, ++seq, 300, 5000));
+  expect(recovery.waiting(), "precondition: wait entered");
+  expect(recovery.note_ack_progress(1050, ++seq, 50, 5000).recovered && !recovery.waiting(), "fresh ACK did not recover the wait");
+}
+
+void test_zero_tolerance_keeps_the_existing_rules() {
+  NativeControlAckRecovery recovery;
+  std::uint64_t seq = 0;
+  static_cast<void>(recovery.note_ack_progress(0, ++seq, 300, 5000));
+  static_cast<void>(recovery.note_ack_progress(50, ++seq, 300, 5000));
+  expect(recovery.note_ack_progress(100, ++seq, 300, 5000).entered, "legacy third anomaly did not enter");
+  NativeControlAckRecovery stall;
+  static_cast<void>(stall.note_ack_progress(0, 1, 50, 5000));
+  expect(stall.observe(500, 2, 500, 1, 50, 5000).entered, "legacy 500 ms stall did not enter");
+  NativeControlAckRecovery reset_to_legacy; reset_to_legacy.set_tolerance_ms(1000);
+  static_cast<void>(reset_to_legacy.note_ack_progress(0, 1, 300, 5000));
+  expect(reset_to_legacy.rtt_anomaly_since().has_value(), "precondition: anomaly clock not tracked");
+  reset_to_legacy.set_tolerance_ms(0);
+  expect(reset_to_legacy.tolerance_ms() == 0 && !reset_to_legacy.rtt_anomaly_since(), "tolerance 0 did not restore legacy mode");
+  NativeControlAckRecovery negative; negative.set_tolerance_ms(-5);
+  expect(negative.tolerance_ms() == 0, "a negative tolerance was kept instead of meaning the existing rules");
+  static_cast<void>(negative.note_ack_progress(0, 1, 300, 5000));
+  expect(!negative.rtt_anomaly_since(), "a negative tolerance started an anomaly clock");
+}
+
+void test_reopened_socket_restarts_the_anomaly_clock() {
+  NativeControlAckRecovery recovery; recovery.set_tolerance_ms(1000);
+  std::uint64_t seq = 0;
+  for (std::int64_t now = 0; now <= 1000; now += 50) static_cast<void>(recovery.note_ack_progress(now, ++seq, 300, 5000));
+  expect(recovery.waiting() && recovery.rtt_anomaly_since().has_value(), "precondition: waiting with an anomaly clock");
+  recovery.connection_reopened(1100);
+  expect(!recovery.rtt_anomaly_since() && recovery.consecutive_anomalies() == 0,
+      "a reopened socket kept the old anomaly clock");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -762,7 +834,13 @@ int main(int argc, char** argv) {
       {"ack_event_revisions_survive_bad_normal_drain_and_socket_reopen", test_ack_event_revisions_survive_bad_normal_drain_and_socket_reopen},
       {"runtime_full_window_estop_send_succeeds_without_socket_failure", test_runtime_full_window_estop_send_succeeds_without_socket_failure},
       {"runtime_counts_each_drained_ack_and_duplicate_does_not_recover", test_runtime_counts_each_drained_ack_and_duplicate_does_not_recover},
-      {"runtime_coalesced_ack_history_restarts_one_common_healthy_window", test_runtime_coalesced_ack_history_restarts_one_common_healthy_window}};
+      {"runtime_coalesced_ack_history_restarts_one_common_healthy_window", test_runtime_coalesced_ack_history_restarts_one_common_healthy_window},
+      {"tolerant_ack_mode_absorbs_short_rtt_spikes", test_tolerant_mode_absorbs_short_rtt_spikes},
+      {"tolerant_ack_mode_escalates_sustained_rtt", test_tolerant_mode_escalates_sustained_rtt},
+      {"tolerant_ack_mode_stall_uses_tolerance", test_tolerant_mode_stall_uses_tolerance},
+      {"tolerant_ack_mode_recovers_with_fresh_ack", test_tolerant_mode_recovers_with_fresh_ack},
+      {"zero_ack_tolerance_keeps_the_existing_rules", test_zero_tolerance_keeps_the_existing_rules},
+      {"reopened_socket_restarts_the_ack_anomaly_clock", test_reopened_socket_restarts_the_anomaly_clock}};
   int failed = 0;
   int executed = 0;
   for (const auto& [name, test] : tests) {
