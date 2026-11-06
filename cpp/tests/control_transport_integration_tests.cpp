@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <future>
 #include <cstdlib>
+#include <atomic>
 #include <iostream>
 #if defined(__linux__)
 #include <unistd.h>
@@ -82,6 +83,20 @@ using namespace mine_teleop::detail;
 std::int64_t utc() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(); }
 std::int64_t steady() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 void expect(bool value, std::string_view message) { if (!value) throw std::runtime_error(std::string(message)); }
+
+// A fixture retry means a scenario hit a condition that the loopback harness itself can produce, and the scenario
+// was started again from a fresh fixture. Retries must never be silent: they are counted, printed, and reported at
+// the end of the run. `wall_minus_steady_ms` is utc() - steady() at that instant. The fixture feeds the wall clock to
+// the vehicle service, and the Colima VM steps its wall clock about every 30 s, so a jump of this value between two
+// retries is the signature of that cause (see docs/evidence/pr26-retry-root-cause-20261104.md).
+std::atomic<int> g_fixture_retries{0};
+void note_fixture_retry(std::string_view scenario, int attempt, std::string_view reason) {
+  ++g_fixture_retries;
+  static const std::int64_t base = utc() - steady();
+  std::cout << "[RETRY] scenario=" << scenario << " attempt=" << attempt << " reason=" << reason
+            << " wall_minus_steady_ms_since_start=" << (utc() - steady() - base) << std::endl;
+}
+void print_retry_summary() { std::cout << "[RETRY-SUMMARY] total=" << g_fixture_retries.load() << std::endl; }
 
 void courier_status_does_not_wait_for_signaling_poll() {
   DriverConfig config;
@@ -665,6 +680,8 @@ void product_recovery_withdraws_unfetched_motion() {
       // ACK watchdog expires and try a fresh release/press; never retimestamp a
       // previously published command or fetch the frame being tested.
       for (int attempt = 0; attempt < 3 && pending.is_null(); ++attempt) {
+        if (attempt > 0) note_fixture_retry("product_recovery_withdraws_unfetched_motion", attempt + 1,
+            "motion_sample_raced_the_route_boundary_rearm cause=" + std::to_string(cause));
         f.requested_throttle = 0.0; f.input();
         deadline = steady() + 150;
         while (steady() < deadline) f.pump(true);
@@ -693,8 +710,11 @@ void product_recovery_withdraws_unfetched_motion() {
           "; native=" + f.driver->status().at("native_control").dump());
       // No WSS select has been delivered to the vehicle. Neither expiry nor
       // replay rejection may hide a stale publication at this boundary.
-      if (steady() - pending.at("published_at").get<std::int64_t>() >= kNativeBridgePublicationMaxAgeMs)
+      if (steady() - pending.at("published_at").get<std::int64_t>() >= kNativeBridgePublicationMaxAgeMs) {
+        note_fixture_retry("product_recovery_withdraws_unfetched_motion", run + 1,
+            "publication_expired_before_withdrawal_check cause=" + std::to_string(cause));
         continue;
+      }
       expect(f.fence.path() == ControlPath::DataChannel, "vehicle already received fallback select");
       expect(f.bridge(f.scope(true)).at("frame_json").is_null(), "bridge returned retired nonzero DC publication");
       expect(DriverConsoleTransportTestAccess::retired(*f.driver), "fallback retained DC publication or ACK state");
@@ -825,6 +845,7 @@ void product_startup_and_p2p_cloud_recovery() {
     try { product_startup_and_p2p_cloud_recovery_once(); return; }
     catch (const NominalRouteFixtureWatchdogTimeout&) {
       if (attempt == 2) throw;
+      note_fixture_retry("product_startup_and_p2p_cloud_recovery", attempt + 1, "fixture_hard_watchdog");
       std::cout << "[PRODUCT_DIRECT] fixture watchdog stopped the session; retrying a fresh fixture\n";
     }
   }
@@ -1451,6 +1472,6 @@ int transient_hold_survives_real_loopback_loss() { return 77; }
 #endif
 
 int main(int argc, char** argv) {
-  try { courier_status_does_not_wait_for_signaling_poll(); if (argc > 1 && std::string_view(argv[1]) == "--transient-hold-only") { transient_hold_scenarios(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--transient-hold-netem") return transient_hold_survives_real_loopback_loss(); if (argc > 1 && std::string_view(argv[1]) == "--mock-estop-only") { native_mock_estop_reaches_vehicle_after_input_loss(); native_mock_estop_reaches_vehicle_after_input_loss(true); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--feedback-only") { actual_feedback_selection_is_independent_and_rejects_retired_statuses(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-courier-only") { native_courier_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-dual-video-only") { native_dual_video_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-safety-only") { native_publication_safety_interlocks(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-publication-only") { native_publication_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--outage-only") { actual_native_short_cloud_outage_and_independent_vehicle_expiry(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--product-only") { product_recovery_withdraws_unfetched_motion(); product_wss_reconnect_retires_dc_and_recovers_ack(); product_startup_and_p2p_cloud_recovery(); product_cloud_only_never_trials_dc(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } native_publication_bridge_integration(); native_courier_bridge_integration(); native_publication_safety_interlocks(); native_dual_video_bridge_integration(); integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
+  try { courier_status_does_not_wait_for_signaling_poll(); if (argc > 1 && std::string_view(argv[1]) == "--transient-hold-only") { transient_hold_scenarios(); print_retry_summary(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--transient-hold-netem") return transient_hold_survives_real_loopback_loss(); if (argc > 1 && std::string_view(argv[1]) == "--mock-estop-only") { native_mock_estop_reaches_vehicle_after_input_loss(); native_mock_estop_reaches_vehicle_after_input_loss(true); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--feedback-only") { actual_feedback_selection_is_independent_and_rejects_retired_statuses(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-courier-only") { native_courier_bridge_integration(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-dual-video-only") { native_dual_video_bridge_integration(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-safety-only") { native_publication_safety_interlocks(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-publication-only") { native_publication_bridge_integration(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--outage-only") { actual_native_short_cloud_outage_and_independent_vehicle_expiry(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--product-only") { product_recovery_withdraws_unfetched_motion(); product_wss_reconnect_retires_dc_and_recovers_ack(); product_startup_and_p2p_cloud_recovery(); product_cloud_only_never_trials_dc(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); print_retry_summary(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); print_retry_summary(); return 0; } native_publication_bridge_integration(); native_courier_bridge_integration(); native_publication_safety_interlocks(); native_dual_video_bridge_integration(); integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; print_retry_summary(); }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
