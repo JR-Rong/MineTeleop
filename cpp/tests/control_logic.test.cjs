@@ -1514,6 +1514,8 @@ function useProductionCameraView(fixture) {
   view.configure(['front']);view.attach('front',track);
   const video=grid.children[0].children[1];
   fixture.context.driverCriticalVideoHealth=()=>view.criticalHealth(['front'],500);
+  // The page's renderMonitoring() also reports the hold negotiation to the same production view.
+  fixture.context.cameraView=view;
   return {view,track,video};
 }
 
@@ -2431,6 +2433,107 @@ test('receiver interval delays expose recent stalls without mixing stream lifeti
   }
   assert.equal(logic.receiverIntervalStats({...current,totalDecodeTime:old.totalDecodeTime},old).decodeMs,0);
   assert.equal(logic.receiverIntervalStats(current,old).counters.totalDecodeTime,1.5);
+});
+
+
+test('transient hold guidance keeps input and does not ask for a re-press', () => {
+  const timing = {control_braking_wait: false, recovery_brake_hold: false, rearm_required: false,
+    transient_hold: {active: true, causes: ['control_gap'], elapsed_ms: 180, max_hold_ms: 700}};
+  const guidance = logic.controlRecoveryGuidance(timing, true);
+  assert.equal(guidance.visible, true);
+  assert.equal(guidance.phase, 'transient_hold');
+  assert.match(guidance.text, /已暂停牵引（轻制动）/);
+  assert.match(guidance.text, /180\/700 ms/);
+  assert.doesNotMatch(guidance.text, /重新按下/);
+  assert.equal(logic.degradedInputRearmRequired(timing, 0), false);
+  // Stale feedback must not claim a live hold.
+  assert.notEqual(logic.controlRecoveryGuidance(timing, false).phase, 'transient_hold');
+});
+test('escalated braking wait keeps the existing re-press guidance', () => {
+  const guidance = logic.controlRecoveryGuidance({control_braking_wait: true, rearm_required: true,
+    driver_control_link_ready: false, transient_hold: {active: false}}, true);
+  assert.notEqual(guidance.phase, 'transient_hold');
+  assert.match(guidance.text, /下一步/);
+  // A stale hold flag must never hide the braking wait's re-press guidance.
+  const stale = logic.controlRecoveryGuidance({control_braking_wait: true, rearm_required: true,
+    driver_control_link_ready: false, transient_hold: {active: true, causes: ['control_gap'], elapsed_ms: 10, max_hold_ms: 700}}, true);
+  assert.notEqual(stale.phase, 'transient_hold');
+  assert.doesNotMatch(stale.text, /无需操作/);
+});
+test('the shipped safety-state handler logs hold changes once and keeps held input during a hold', () => {
+  const handler = controlPageSource.match(/^function applyVehicleSafetyState\(value,timing\)\{.*$/m);
+  assert(handler, 'applyVehicleSafetyState is missing from the page');
+  const logs = [], cleared = [];
+  const context = vm.createContext({controlLogic: logic, lastVehicleSafetyState: '', lastNativeAcceptedControlSeq: 0,
+    lastTransientHoldActive: false, lastKeyboardEvent: {textContent: ''}, statusPanel: {textContent: ''},
+    clientLog: (event, details) => logs.push({event, details}), clearControlInput: (...args) => cleared.push(args)});
+  vm.runInContext(handler[0], context);
+  const hold = {active: true, causes: ['control_gap'], last: null};
+  context.applyVehicleSafetyState('DEGRADED', {rearm_required: false, transient_hold: hold});
+  assert.deepEqual(cleared, [], 'a transient hold cleared the held driver input');
+  assert.equal(logs.filter(entry => entry.event === 'driver_transient_hold_observed').length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(logs[0].details)), {active: true, causes: ['control_gap'], last: null});
+  context.applyVehicleSafetyState('DEGRADED', {rearm_required: false, transient_hold: hold});
+  assert.equal(logs.filter(entry => entry.event === 'driver_transient_hold_observed').length, 1, 'an unchanged hold was logged again');
+  const last = {outcome: 'resumed', duration_ms: 120};
+  context.applyVehicleSafetyState('CONTROL_ACTIVE', {rearm_required: false, transient_hold: {active: false, causes: [], last}});
+  const observed = logs.filter(entry => entry.event === 'driver_transient_hold_observed');
+  assert.equal(observed.length, 2);
+  assert.equal(observed[1].details.active, false);
+  assert.equal(observed[1].details.last.outcome, 'resumed');
+  // The escalated case keeps the existing behavior: DEGRADED with a required re-press clears the input.
+  context.applyVehicleSafetyState('DEGRADED', {rearm_required: true, transient_hold: {active: false}});
+  assert.equal(cleared.length, 1, 'an escalated degrade no longer clears the held input');
+});
+test('a video-only hold shows an info banner while the vehicle stays CONTROL_ACTIVE', () => {
+  const telemetry = {safety_state: 'CONTROL_ACTIVE', estop: false, control_timing: {control_braking_wait: false,
+    recovery_brake_hold: false, rearm_required: false,
+    transient_hold: {active: true, causes: ['vehicle_video_stale'], elapsed_ms: 90, max_hold_ms: 700}}};
+  const view = logic.deriveControlRecoveryPresentation(true, telemetry, true, false);
+  assert.equal(view.visible, true);
+  assert.equal(view.severity, 'info');
+  assert.equal(view.cause, 'transient_hold');
+  assert.doesNotMatch(view.banner, /重新按下/);
+  const degraded = logic.deriveControlRecoveryPresentation(true, {...telemetry, safety_state: 'DEGRADED'}, true, false);
+  assert.equal(degraded.severity, 'info', 'a hold during DEGRADED must not show the legacy warning');
+  const idle = logic.deriveControlRecoveryPresentation(true, {safety_state: 'CONTROL_ACTIVE', control_timing: {
+    control_braking_wait: false, recovery_brake_hold: false, transient_hold: {active: false}}}, true, false);
+  assert.equal(idle.visible, false);
+});
+test('budget escalation explains the unstable link', () => {
+  const guidance = logic.controlRecoveryGuidance({control_braking_wait: true, rearm_required: true,
+    driver_control_link_ready: true, recovery_samples_healthy: false,
+    transient_hold: {active: false, holds_in_window: 7,
+      last: {outcome: 'escalated', escalation_reason: 'budget_count_exceeded'}}}, true);
+  assert.match(guidance.text, /链路不稳定（1 分钟内保持 7 次）/);
+  const plain = logic.controlRecoveryGuidance({control_braking_wait: true, rearm_required: true,
+    driver_control_link_ready: true, recovery_samples_healthy: false,
+    transient_hold: {active: false, holds_in_window: 1,
+      last: {outcome: 'escalated', escalation_reason: 'hold_duration_exceeded'}}}, true);
+  assert.doesNotMatch(plain.text, /链路不稳定/);
+});
+test('monitoring row states the negotiation, the live hold and the last outcome', () => {
+  const runtime = {native_control: {transient_hold: {negotiated: true}}};
+  assert.equal(logic.transientHoldPresentation({native_control: {transient_hold: {negotiated: false}}}, null).text, '未启用');
+  assert.equal(logic.transientHoldPresentation({}, null).text, '未启用');
+  assert.match(logic.transientHoldPresentation(runtime, null).text, /等待车端状态/);
+  const live = logic.transientHoldPresentation(runtime, {control_timing: {transient_hold: {active: true}}});
+  assert.deepEqual([live.text, live.level], ['保持中', 'warn']);
+  const resumed = logic.transientHoldPresentation(runtime, {control_timing: {transient_hold: {active: false,
+    holds_in_window: 2, last: {outcome: 'resumed', duration_ms: 412.4}}}});
+  assert.equal(resumed.text, '1 分钟内 2 次 · 最近 412 ms 已自动恢复');
+  assert.equal(resumed.level, 'ok');
+  const escalated = logic.transientHoldPresentation(runtime, {control_timing: {transient_hold: {active: false,
+    holds_in_window: 7, last: {outcome: 'escalated', duration_ms: 700}}}});
+  assert.match(escalated.text, /已升级为制动等待/);
+  assert.equal(escalated.level, 'critical');
+});
+test('control page reports transient video and negotiation to the camera view', () => {
+  assert.match(controlPageSource, /critical_video_transient:viewHealth\.ready!==true&&viewHealth\.transient===true/);
+  assert.match(controlPageSource, /cameraView\.setTransientHoldNegotiated\(/);
+  assert.match(controlPageSource, /driver_transient_hold_observed/);
+  assert.match(controlPageSource, /id="metric-transient-hold"/);
+  assert.match(controlPageSource, /controlLogic\.transientHoldPresentation\(/);
 });
 
 // An unresolved Promise alone does not keep Node alive. A stuck asynchronous

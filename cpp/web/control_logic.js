@@ -1127,12 +1127,15 @@
     const waiting = timing.control_braking_wait === true;
     const holding = timing.recovery_brake_hold === true;
     const delayed = telemetry.safety_state === 'DEGRADED';
-    if (!waiting && !holding && !delayed) return hidden;
+    const transientHold = Boolean(timing.transient_hold && timing.transient_hold.active === true);
+    if (!waiting && !holding && !delayed && !transientHold) return hidden;
     const cause = waiting || holding ? String(timing.control_recovery_cause || '') : 'control_delay';
     const reasons = {critical_video: '关键视频中断或无新帧', time_sync: '时间同步不可信',
       input_lease: '驾驶输入刷新过期', control_link: '控制命令延迟或短暂中断', control_delay: '控制指令延迟或短暂中断'};
     const reason = reasons[cause] || '控制链路暂时异常';
     const guidance = controlRecoveryGuidance(timing, feedbackFresh);
+    if (feedbackFresh && guidance.visible && guidance.phase === 'transient_hold')
+      return {visible: true, severity: 'info', banner: guidance.text, alert: guidance.text, cause: 'transient_hold'};
     // Report the last authoritative vehicle state without claiming that old
     // feedback confirms current physical braking or a completed stop.
     const banner = !feedbackFresh
@@ -1149,6 +1152,19 @@
     const holding = timing.recovery_brake_hold === true;
     const rearm = timing.rearm_required === true;
     const hidden = {visible: false, phase: 'none', causes: [], reason: '', nextStep: '', text: ''};
+    const hold = timing.transient_hold && typeof timing.transient_hold === 'object' ? timing.transient_hold : null;
+    // A transient hold needs no operator action: input is kept and motion resumes by itself.
+    if (feedbackFresh && hold && hold.active === true && !waiting) {
+      const labels = {control_gap: '控制链路中断', late_commands: '控制命令迟到',
+        driver_video_stale: '驾驶端画面停顿', vehicle_video_stale: '车端画面停顿'};
+      const causes = Array.isArray(hold.causes) ? hold.causes.filter(cause => labels[cause]) : [];
+      const elapsed = Number.isFinite(hold.elapsed_ms) ? Math.max(0, Math.round(hold.elapsed_ms)) : null;
+      const limit = Number.isFinite(hold.max_hold_ms) ? hold.max_hold_ms : null;
+      const reason = causes.length ? causes.map(cause => labels[cause]).join('、') : '链路或画面短暂波动';
+      const progress = elapsed !== null && limit ? `（${elapsed}/${limit} ms）` : '';
+      return {visible: true, phase: 'transient_hold', causes, reason, nextStep: '无需操作，恢复后自动继续',
+        text: `链路/画面短暂波动，已暂停牵引（轻制动）${progress} · 原因：${reason} · 无需操作，恢复后自动继续`};
+    }
     if (!waiting && !holding && !rearm) return hidden;
     const labels = {critical_video: '关键视频未就绪', input_lease: '驾驶输入刷新未就绪',
       control_link: '控制命令时效或链路未就绪', time_sync: '时间同步不可信'};
@@ -1173,7 +1189,29 @@
       phase = 'await_fresh_input'; reason = '等待新的驾驶操作，制动保持';
       nextStep = '释放旧方向输入、归零后重新按下；持续制动可保持';
     }
-    return {visible: true, phase, causes, reason, nextStep, text: `当前阻挡：${reason} · 下一步：${nextStep}`};
+    // A budget escalation means the link keeps dropping: say so instead of showing a bare wait.
+    const holdLast = hold && hold.last && typeof hold.last === 'object' ? hold.last : null;
+    const unstable = waiting && holdLast && holdLast.outcome === 'escalated' &&
+      ['budget_count_exceeded', 'budget_time_exceeded'].includes(holdLast.escalation_reason);
+    const holds = Number.isInteger(hold && hold.holds_in_window) ? hold.holds_in_window : '多';
+    const prefix = unstable ? `链路不稳定（1 分钟内保持 ${holds} 次）· ` : '';
+    return {visible: true, phase, causes, reason, nextStep, text: `${prefix}当前阻挡：${reason} · 下一步：${nextStep}`};
+  }
+
+  // Monitoring row for the vehicle-led transient hold. Display only.
+  function transientHoldPresentation(runtime, telemetry) {
+    const negotiated = Boolean(runtime && runtime.native_control && runtime.native_control.transient_hold &&
+      runtime.native_control.transient_hold.negotiated === true);
+    if (!negotiated) return {text: '未启用', level: ''};
+    const hold = telemetry && telemetry.control_timing && telemetry.control_timing.transient_hold;
+    if (!hold || typeof hold !== 'object') return {text: '已启用，等待车端状态', level: ''};
+    if (hold.active === true) return {text: '保持中', level: 'warn'};
+    const count = Number.isInteger(hold.holds_in_window) ? hold.holds_in_window : 0;
+    const last = hold.last && typeof hold.last === 'object' ? hold.last : null;
+    const duration = last && Number.isFinite(last.duration_ms) ? Math.round(last.duration_ms) : null;
+    const outcome = last ? (last.outcome === 'resumed' ? '已自动恢复' : last.outcome === 'escalated' ? '已升级为制动等待' : '') : '';
+    const tail = last && duration !== null && outcome ? ` · 最近 ${duration} ms ${outcome}` : '';
+    return {text: `1 分钟内 ${count} 次${tail}`, level: last && last.outcome === 'escalated' ? 'critical' : 'ok'};
   }
 
   function deriveControlCommandRejection(issueCodeValue) {
@@ -1801,6 +1839,7 @@
     deriveEstopPresentation,
     deriveControlRecoveryPresentation,
     controlRecoveryGuidance,
+    transientHoldPresentation,
     deriveControlCommandRejection,
     isCurrentPeer,
     isCurrentControlChannel,
