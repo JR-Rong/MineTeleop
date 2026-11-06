@@ -1333,6 +1333,10 @@ struct Cut {
   bool saw_hold{false}, saw_wait{false};
   double max_throttle_in_hold{0.0}, min_brake_in_hold{1.0};
   std::int64_t longest_pump_ms{0};
+  // State changes since the cut was created, so that a failure shows what the vehicle did with every command it
+  // received: "<ms>:<hold|nohold>,<wait|run>,<result reason>,commands=<WSS commands read>,age=<last valid command ms>".
+  std::int64_t started_at{steady()};
+  std::string timeline, last_key;
 };
 Json observe(Fixture& fixture, Cut& cut) {
   const auto view = vehicle_view(fixture);
@@ -1340,6 +1344,14 @@ Json observe(Fixture& fixture, Cut& cut) {
   const bool wait = view.timing.value("control_braking_wait", false);
   cut.saw_hold = cut.saw_hold || hold;
   cut.saw_wait = cut.saw_wait || wait;
+  const auto key = std::string(hold ? "hold" : "nohold") + (wait ? ",wait," : ",run,") + fixture.last_result_reason +
+      ",commands=" + std::to_string(fixture.wss_commands);
+  if (key != cut.last_key) {
+    cut.last_key = key;
+    cut.timeline += std::to_string(steady() - cut.started_at) + "ms:" + key + ",age=" +
+        std::to_string(view.timing.value("last_valid_control_age_ms", std::int64_t{-1})) + " | ";
+    if (cut.timeline.size() > 6000) cut.timeline.erase(0, cut.timeline.size() - 6000);
+  }
   if (hold && !wait) {  // Judge the hold's own output, not an escalated braking wait.
     cut.max_throttle_in_hold = std::max(cut.max_throttle_in_hold, view.output.throttle_feedback);
     cut.min_brake_in_hold = std::min(cut.min_brake_in_hold, view.output.brake_feedback);
@@ -1348,7 +1360,8 @@ Json observe(Fixture& fixture, Cut& cut) {
 }
 std::string summary(const Cut& cut, const Json& timing) {
   return Json{{"saw_hold", cut.saw_hold}, {"saw_wait", cut.saw_wait}, {"max_throttle_in_hold", cut.max_throttle_in_hold},
-      {"min_brake_in_hold", cut.min_brake_in_hold}, {"longest_pump_ms", cut.longest_pump_ms}, {"timing", timing}}.dump();
+      {"min_brake_in_hold", cut.min_brake_in_hold}, {"longest_pump_ms", cut.longest_pump_ms}, {"timeline", cut.timeline},
+      {"timing", timing}}.dump();
 }
 // This fixture has no VehicleMediaRuntime recovery coordinator, so the vehicle's initial transport-selection
 // braking wait is released explicitly once every readiness input is healthy (the same model as the existing safety
@@ -1455,6 +1468,7 @@ void transient_hold_budget_escalates_repeated_spikes(std::int64_t& stall_ms) {
     total.saw_wait = total.saw_wait || cut.saw_wait;
     total.max_throttle_in_hold = std::max(total.max_throttle_in_hold, cut.max_throttle_in_hold);
     total.min_brake_in_hold = std::min(total.min_brake_in_hold, cut.min_brake_in_hold);
+    total.timeline = cut.timeline;  // The spike that ended the sequence is the one worth reading.
     escalated = cut.saw_wait;
   }
   const auto timing = vehicle_timing(fixture);
