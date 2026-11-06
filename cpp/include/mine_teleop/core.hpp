@@ -980,6 +980,7 @@ class VehicleControlService {
   double hard_overspeed_margin_kph_{3.6};
   Json control_limits_;
   int telemetry_interval_ms_;
+  int degraded_timeout_ms_;
   detail::TransientHoldPolicy transient_hold_;
   std::optional<std::int64_t> last_telemetry_ms_;
   std::uint64_t telemetry_sequence_{0};

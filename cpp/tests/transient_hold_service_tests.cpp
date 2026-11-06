@@ -206,6 +206,23 @@ void budget_escalation() {
   require(h.timing().at("control_braking_wait").get<bool>() &&
       h.hold().at("last").at("escalation_reason") == "budget_count_exceeded", "seventh hold in a minute did not escalate");
 }
+// set_control_braking_wait(false) forces DEGRADED so the next neutral command re-arms the input. That is not a
+// command gap, and must not look like one to the hold.
+void braking_wait_release_does_not_fake_a_gap() {
+  Harness h; require(h.send(0.5).accepted, "initial command rejected");
+  h.service->set_control_braking_wait(true, h.utc, ControlRecoveryCause::ControlLink);
+  for (int i = 0; i < 3; ++i) { h.wait(50); static_cast<void>(h.send(0.0)); }  // The driver keeps sending neutral commands.
+  h.service->set_control_braking_wait(false, h.utc, ControlRecoveryCause::ControlLink);
+  h.wait(50);
+  require(!h.hold().at("active").get<bool>() && h.hold().at("holds_in_window") == 0,
+      "releasing a braking wait started a control-gap hold: " + h.hold().dump());
+  require(h.send(0.0).accepted && !h.timing().at("rearm_required").get<bool>(), "a neutral command did not re-arm after the release");
+  require(h.send(0.5).accepted && h.output().throttle_feedback > 0.0, "motion was not restored after the re-arm");
+  require(h.hold().at("holds_in_window") == 0 && h.hold().at("last").is_null(), "the release left a hold record behind");
+  // A genuine gap after the release still holds.
+  h.wait(400);
+  require(h.hold().at("active").get<bool>() && h.hold().at("causes").at(0) == "control_gap", "a real gap after the release did not hold");
+}
 void epoch_change_escalates_with_its_own_reason() {
   Harness h; require(h.send(0.5).accepted, "initial command rejected");
   h.wait(400);
@@ -233,7 +250,7 @@ int main() {
     link_not_ready_is_a_fault(); estop_during_hold(); brake_floor_survives_hard_timeout(true); brake_floor_survives_hard_timeout(false);
     hard_timeout_boundary(); hard_timeout_while_ticks_were_stalled_ends_the_hold(); legacy_without_capability();
     disabled_vehicle_ignores_the_capability(); capability_withdrawn_mid_hold_clears_the_hold(); budget_escalation();
-    epoch_change_escalates_with_its_own_reason(); events_are_drained_once();
+    epoch_change_escalates_with_its_own_reason(); events_are_drained_once(); braking_wait_release_does_not_fake_a_gap();
     std::cout << "PASS vehicle transient hold: gap/late/video holds, light brake, resume, escalation, faults, floor, legacy\n";
     return 0;
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

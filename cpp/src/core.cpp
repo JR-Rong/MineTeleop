@@ -3186,6 +3186,7 @@ VehicleControlService::VehicleControlService(
       speed_feedback_timeout_ms_(config.field_safety.speed_feedback_timeout_ms),
       hard_overspeed_margin_kph_(config.field_safety.hard_overspeed_margin_kph),
       telemetry_interval_ms_(telemetry_interval_ms),
+      degraded_timeout_ms_(config.control.degraded_timeout_ms),
       transient_hold_(config.control.transient_hold) {
   validate_mock_control_diagnostic(config);
   if (mock_control_diagnostic_ && dynamic_cast<MockVehicleAdapter*>(adapter_.get()) == nullptr)
@@ -3972,9 +3973,12 @@ void VehicleControlService::apply_recovery_brake(std::string_view gear_override)
 void VehicleControlService::evaluate_control_watchdog() {
   const auto now = monotonic_clock_();
   safety_.tick(now);
-  // DEGRADED is where a control gap becomes a hold instead of an immediate braking wait.
+  // A control gap becomes a hold instead of an immediate braking wait. DEGRADED alone is not a gap:
+  // require_input_rearm() also forces it (for example when a braking wait is released) while commands keep
+  // arriving, so the gap itself, measured from the last valid command, must have reached the threshold.
+  const auto last_valid = safety_.last_valid_receive_ms();
   if (transient_hold_enabled() && !control_braking_wait_ && !transient_hold_.escalated() &&
-      safety_.state() == SafetyState::Degraded &&
+      safety_.state() == SafetyState::Degraded && last_valid && now - *last_valid >= degraded_timeout_ms_ &&
       handle_transient_action(transient_hold_.set_cause(detail::TransientCause::ControlGap, true, now),
           ControlRecoveryCause::ControlLink, 0))
     return;  // Escalation already re-entered this function through set_control_braking_wait.
