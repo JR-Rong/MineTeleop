@@ -3192,3 +3192,55 @@ git commit -m "Index PR #26 evidence files" -m "Co-Authored-By: Claude <noreply@
 **阶段 4 仍未验证的项**
 1. Windows 工作流编译 `windows_native_viewer.cpp`（阶段 2、3、4 都改过它，需要推送，Task 29）。
 2. `docker buildx` 发布路径端到端（`build_cpp_ubuntu_bundle.sh`、`build_macos_vehicle_from_scratch.sh`）。
+
+## 执行偏差记录（阶段 5，Task 26–30）
+
+**Task 26（提交 `f1ae44d`）**
+- 证据文件名是 `docs/evidence/pr26-retry-root-cause-20261105.md`（计划写的是 20261104，实际写作日是 11 月 5 日）。
+  提交标题改为 "Mark integration fixture retries and record the root-cause search"，因为没有找到根因。
+- 计划把结论预设为"生产缺陷"或"夹具调度问题"两种。两种都没有证据：本地 70 次运行没有一次触发重试，
+  确定性的挂钟回拨探针（服务层，回拨 0–250 ms）证伪了"挂钟步进让车端走到 800 ms 硬看门狗"，所以结论是"未查明"，重试和标记保留。
+  没有使用计划里的 `--repeat until-fail:30`，改为空闲、8 个忙循环、容器限 2 核加 6 个忙循环各 20–30 次的连续运行。
+- 阶段 3 偏差记录里的推测"挂钟回拨很可能就是 Task 26 要查的根因之一"只对了一部分：挂钟回拨确实造成了别的偶发
+  （`clock_reversed`，已通过让夹具的车端服务使用真实 `steady_clock` 消除，并做了干预验证；`media-time-sync` 的偶发与之吻合，但没有做干预验证），
+  但不是这三处重试的原因。
+
+**Task 27（提交 `a727a5d`）**：重写稿在 `docs/superpowers/plans/pr26-description-draft.md`。Step 3（用户审阅，之后才允许 `gh pr edit`）没有执行，PR 说明没有改。
+稿里有两处 `【…】` 留给用户：CI 链接，以及 Orin 记录是否提交。
+
+**Task 28（提交 `d17a887`）**：索引在 `docs/evidence/README.md`。没有迁出或删除任何文件。
+全部 25 个文件合计约 450 KB，按体积没有迁出的必要；按地址格式扫描没有公网地址（3 处 IPv4 命中是版本号和基准测试地址 `198.18.0.1`，IPv6 全球地址为 0，不覆盖主机名与账号）。
+Step 3（迁出目的地）等用户决定。Orin 记录没有提交，所以没有列入索引。
+
+**Task 29**：没有执行，需要用户同意推送。
+
+**Task 30**：Step 1 已执行（见下）；Step 3（squash 还是保留历史）等用户决定。
+
+**计划之外：Orin 台架原生测试**（用户授权；步骤清单经用户确认后才执行）
+- 方式：把容器里构建的 aarch64 测试二进制（HEAD `f1ae44d`，563 个文件逐个校验）放进 Orin 上唯一的新目录，
+  在无特权的私有用户、网络、挂载、PID 命名空间里运行（只有回环，看不到真实的 `can0`，私有 `/tmp`）；结束后清扫并删除该目录，前后快照对比只有 `~/mine-teleop-tests` 目录自身的修改时间变化。
+- 结果：85 项一遍 76 通过、5 跳过、4 失败，9 项未通过都有环境原因（缺 `avdec_h264`、缺 turnserver、内核没有 netem、`/var/log` 无写权限；
+  最后一项在给了私有 `/var/log` 后补跑通过）；84 次重复零失败，`[RETRY]` 0 次；`media-time-sync` 20/20 通过（Colima 约 1/3 失败）。
+- 详细记录在 `docs/evidence/pr26-orin-native-tests-20261105.md`（**未提交**，等用户决定）；脚本在仓库之外的 `/tmp/mt-scratch/orin/`（未入库）。
+
+**最终验证（Task 30 Step 1；代码状态 `f1ae44d`，其后只有文档提交）**
+- Task 0 Step 2 第一条：容器内 `native-check.sh`，**94/94 通过**，0 失败 0 跳过，298.16 s，`native-check.sh` 退出码 0。
+- Task 0 Step 2 第二条：`python3 scripts/test/run_offline_regressions.py`，12 个套件全部退出码 0；6 个需要真实桌面二进制的生命周期用例按设计跳过，不算通过。
+- 已删除符号的 `grep`：无输出。
+- `git status`：只有未提交的 Orin 记录；本地领先 `origin/rjr/cx/native-realtime-pr26` 36 个提交，没有推送。
+
+**仍未验证（不得算作通过）**
+1. Windows 工作流编译 `windows_native_viewer.cpp`（阶段 2、3、4 都改过它，需要推送，Task 29）。
+2. `docker buildx` 发布路径端到端（只做了 `bash -n`）。
+3. 真实 WebRTC 双端会话、5G / TURN、真相机与编码硬件、真实 CAN 与车辆、现场验收。
+4. 真实网络尖峰下的保持行为：Orin 内核没有 netem，该用例只在容器里执行过。
+5. Orin 上没有跑通的 8 项：缺 `avdec_h264` 的 6 项、缺 turnserver 的 1 项、内核没有 netem 的 1 项。
+6. 6 个桌面生命周期用例（跳过）。
+7. Windows 与 Orin 的 30 分钟 mock 控制验收：仍未通过。
+
+**新发现，未处理**
+- `vehicle-agent --run-loop` 从不提交会话控制 profile，任何配置下都停在 STANDBY，所以它不能验证控制循环（`320a662` 起如此，早于本 PR）。`Dockerfile.build` 里用它做构建冒烟，只看退出码。
+- `chassis-bridge-diagnostics-smoke` 的"parking runtime open"场景没有设置 `MINE_TELEOP_VCU_LOG_PATH`，默认写 `/var/log/mine-teleop/vcu-can.jsonl`：
+  非 root 运行失败（Orin 上见到的现象），root 运行会在真实 `/var/log` 下建目录。路径默认值在 PR25 基线之前就存在。修复只需在该场景里设置环境变量，尚未做。
+- Orin 缺少 gst-libav（`avdec_h264`）和 `turnserver`，内核没有 netem；车端运行库不引用 `avdec_h264`。
+- 恢复 Colima 时做的两个 APFS 写时复制快照（`root.raw.crash-snapshot-…`、`data.raw.crash-snapshot-…`）仍在，虚拟机恢复后已稳定运行数小时；是否删除等用户决定，不删除用户的 `*.before-ff-repair-20261105` 备份。
