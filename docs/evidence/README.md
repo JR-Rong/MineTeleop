@@ -31,12 +31,13 @@
 | `windows-orin-5g-native-compact-full-20261101.md` | 原生紧凑控制与全量遥测实验 | 2026-11-01 | 4,559 | **已失效**（实验已删除） |
 | `windows-native-ui-preflight-20261101.md` | Windows 原生 UI mock 预检，也是旧 PR 说明引用的详细版本、输入与失败证据 | 2026-11-01 | 78,702 | **部分失效**（含紧凑格式与 DC/WSS 副本的章节） |
 | `pr26-retry-root-cause-20261105.md` | 集成夹具三处重试的根因排查：**没有找到根因**，重试已带原因计数 | 2026-11-05 | 5,150 | 有效 |
+| `pr26-orin-native-tests-20261105.md` | Orin 台架原生测试：85 项一遍 76 通过、9 项因环境未通过（缺 `avdec_h264`、turnserver、内核无 netem、`/var/log` 无写权限），84 次重复零失败，`[RETRY]` 0 次；只有回环的私有命名空间 | 2026-11-05 | 9,603 | 有效 |
 
 ## 关于迁出
 
 计划里的"迁出原始 JSON"还没有执行，也不会在你同意之前执行任何迁移或删除。
 
-- 全部 25 个文件合计约 450 KB（JSON 约 250 KB，Markdown 约 200 KB），最大的是 `hybrid-ui-long-ab-20261027.json`（127 KB）和 `windows-native-ui-preflight-20261101.md`（77 KB）。按体积没有迁出的必要。
+- 全部 26 个文件合计约 405 KB（JSON 约 250 KB，Markdown 约 154 KB），最大的是 `hybrid-ui-long-ab-20261027.json`（127 KB）和 `windows-native-ui-preflight-20261101.md`（77 KB）。按体积没有迁出的必要。
 - 按地址格式扫描，文件里没有公网 IPv4 或 IPv6 地址：IPv4 的 3 处命中是软件版本号和基准测试地址 `198.18.0.1`，IPv6 全球地址为 0。这个扫描只看地址格式，不覆盖主机名或账号。
 - 如果一定要迁出，按体积优先的候选是上面最大的两份，以及 `hybrid-ui-long-ab-20261027.json` 之外的 `mac-receiver-ab-20261027.json`（23 KB）和 `native-receiver-20261027.json`（23 KB）。
   迁出后在这里留一行指向新位置，并保留文件的 SHA-256。

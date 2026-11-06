@@ -95,7 +95,7 @@ Windows 与 Orin 的 30 分钟 mock 控制验收此前多轮未通过，本 PR �
 | 同上 | `media-time-sync-retry-loopback` 单独重复 | 约三分之一失败；在阶段 2 结束的基线二进制上同样失败（4/12），与负载无关。完整 CTest 因此约三分之一会出现这一项失败；上一行的 94/94 是它通过的那几次运行 |
 | Orin 台架（Jetson Orin 系列，6 核，L4T R36.5；无特权私有命名空间，只有回环；2026-11-05 晚） | 全量 85 项（排除需 node 的 7 项和需编译器的 2 项），另重复 84 次 | 76 通过、5 跳过、4 失败；9 项未通过均因环境（缺 `avdec_h264`、缺 turnserver、内核没有 netem、`/var/log` 无写权限），其中 1 项补跑通过；84 次重复零失败，`[RETRY]` 0 次；`media-time-sync` 20/20 通过（Colima 约 1/3 失败，只是旁证，不是干预验证） |
 
-Orin 记录：`docs/evidence/pr26-orin-native-tests-20261105.md`。`【用户决定：是否提交该记录】`
+Orin 记录：`docs/evidence/pr26-orin-native-tests-20261105.md`。
 
 **偶发与未查明的现象**
 - `media-time-sync-retry-loopback`（`cli-over-budget`）：比较同一次交换的挂钟与单调钟耗时。运行容器的虚拟机会周期性校正客户机挂钟（日志里相邻两次约 30 秒），实测会出现约 100 ms 的回拨，与现象吻合，但没有对这一点做干预验证。

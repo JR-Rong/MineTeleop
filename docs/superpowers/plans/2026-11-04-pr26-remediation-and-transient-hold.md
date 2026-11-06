@@ -3244,3 +3244,9 @@ Step 3（迁出目的地）等用户决定。Orin 记录没有提交，所以没
   非 root 运行失败（Orin 上见到的现象），root 运行会在真实 `/var/log` 下建目录。路径默认值在 PR25 基线之前就存在。修复只需在该场景里设置环境变量，尚未做。
 - Orin 缺少 gst-libav（`avdec_h264`）和 `turnserver`，内核没有 netem；车端运行库不引用 `avdec_h264`。
 - 恢复 Colima 时做的两个 APFS 写时复制快照（`root.raw.crash-snapshot-…`、`data.raw.crash-snapshot-…`）仍在，虚拟机恢复后已稳定运行数小时；是否删除等用户决定，不删除用户的 `*.before-ff-repair-20261105` 备份。
+
+**阶段 5 后续（用户决定，2026-11-06）**
+- 用户同意推送（Task 29 Step 1）并同意提交 Orin 记录，证据继续保留在仓库，其余按建议处理。
+  Orin 记录 `docs/evidence/pr26-orin-native-tests-20261105.md` 现已提交，并列入证据索引；PR 说明草稿里"是否提交该记录"的占位已去掉，只剩 CI 链接一处。
+- 更正：上面写的"全部 25 个文件合计约 450 KB"是 `du` 的磁盘占用；实际文件大小之和约 395 KB（JSON 250 KB，Markdown 145 KB），加上 Orin 记录共 26 个文件、约 405 KB。结论不变，没有迁出的必要。
+- 用户没有明确指示、因此保持原状等待确认的项：Orin 脚本是否入库、`chassis-bridge-diagnostics-smoke` 的 `/var/log` 默认写入是否修复、Colima 崩溃快照是否删除、合并方式；PR 说明草稿也还没有获批，PR 正文没有改。
