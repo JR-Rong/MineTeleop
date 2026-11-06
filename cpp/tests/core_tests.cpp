@@ -1993,6 +1993,59 @@ void test_control_command_json_round_trip_and_validation() {
   expect_throws([&] { invalid.validate(); }, "invalid throttle was accepted");
 }
 
+void test_transient_hold_command_fields() {
+  auto value = command(1, 1000);
+  value.transient_hold_capable = true;
+  value.critical_video_ready = false;
+  value.critical_video_transient = true;
+  const auto json = value.to_json();
+  expect(json.at("transient_hold") == "transient-hold-v1" && json.at("critical_video_transient") == true,
+         "transient hold fields not serialized");
+  const auto parsed = ControlCommand::from_json(json);
+  expect(parsed.transient_hold_capable && parsed.critical_video_transient, "transient hold fields not parsed");
+
+  auto legacy = command(2, 1000).to_json();
+  expect(!legacy.contains("transient_hold") && !legacy.contains("critical_video_transient"),
+         "legacy command gained new keys");
+  expect(!ControlCommand::from_json(legacy).transient_hold_capable, "legacy command negotiated hold");
+  // Capable but with healthy video: the marker is present, the transient flag is explicit false.
+  auto capable = command(3, 1000);
+  capable.transient_hold_capable = true;
+  const auto capable_json = capable.to_json();
+  expect(capable_json.at("transient_hold") == "transient-hold-v1" && capable_json.at("critical_video_transient") == false,
+         "capable command with healthy video serialized the wrong transient flag");
+
+  const auto rejects = [&](const std::function<void(mine_teleop::Json&)>& change, std::string_view message) {
+    auto broken = json;
+    change(broken);
+    expect_throws([&] { static_cast<void>(ControlCommand::from_json(broken)); }, message);
+  };
+  rejects([](mine_teleop::Json& body) { body["transient_hold"] = "transient-hold-v2"; }, "unknown capability accepted");
+  rejects([](mine_teleop::Json& body) { body["transient_hold"] = true; }, "non-string capability accepted");
+  rejects([](mine_teleop::Json& body) { body["critical_video_transient"] = "yes"; }, "non-boolean transient video flag accepted");
+  rejects([](mine_teleop::Json& body) { body["critical_video_ready"] = true; },
+          "transient video flag accepted while video was ready");
+  rejects([](mine_teleop::Json& body) { body.erase("transient_hold"); },
+          "transient video flag accepted without the hold capability");
+
+  auto direct = value;
+  direct.critical_video_ready = true;
+  expect_throws([&] { direct.validate(); }, "validate accepted a transient video flag with ready video");
+
+  // A verified ESTOP never depends on the optional hold schema: unknown or
+  // contradictory hold fields are ignored instead of rejecting the stop.
+  auto stop = json;
+  stop["estop"] = true;
+  stop["transient_hold"] = "transient-hold-v2";
+  stop["critical_video_ready"] = true;
+  const auto parsed_stop = ControlCommand::from_json(stop);
+  expect(parsed_stop.estop && !parsed_stop.transient_hold_capable && !parsed_stop.critical_video_transient,
+         "estop kept unverified hold fields");
+  auto direct_stop = direct;
+  direct_stop.estop = true;
+  direct_stop.validate();
+}
+
 void test_session_control_profile_json_round_trip_and_physical_units() {
   const auto request = session_profile_request(9, 1234, 12.0, 300.0, 100.0, 30.0, 80.0);
   const auto encoded = request.to_json();
@@ -5293,6 +5346,7 @@ int main() {
       {"bench_config_drives_unified_vehicle_runtime", test_bench_config_drives_unified_vehicle_runtime},
       {"field_config_pins_tls_route_without_system_dns", test_field_config_pins_tls_route_without_system_dns},
       {"control_command_json_round_trip_and_validation", test_control_command_json_round_trip_and_validation},
+      {"transient_hold_command_fields", test_transient_hold_command_fields},
       {"session_control_profile_json_round_trip_and_physical_units", test_session_control_profile_json_round_trip_and_physical_units},
       {"shared_protocol_v1_vectors_and_session_states", test_shared_protocol_v1_vectors_and_session_states},
       {"control_receiver_enforces_token_sequence_and_gap", test_control_receiver_enforces_token_sequence_and_gap},

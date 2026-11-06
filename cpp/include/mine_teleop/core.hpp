@@ -91,6 +91,10 @@ struct ControlCommand {
   bool recovery_sample_healthy{true};
   std::uint64_t recovery_bad_sample_revision{0};
   std::uint64_t recovery_brake_revision{0};
+  // Signed only after the vehicle advertised transient-hold-v1. The transient
+  // video flag is only meaningful with critical_video_ready=false.
+  bool transient_hold_capable{false};
+  bool critical_video_transient{false};
 
   void validate() const;
   [[nodiscard]] Json to_json() const;

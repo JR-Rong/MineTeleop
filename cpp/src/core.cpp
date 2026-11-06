@@ -1023,6 +1023,8 @@ void ControlCommand::validate() const {
   require_finite_range(brake, 0.0, 1.0, "brake");
   if (!estop && !control_link_ready && operator_input_ready)
     throw std::invalid_argument("control link wait must also withdraw operator input readiness");
+  if (!estop && critical_video_transient && (!transient_hold_capable || critical_video_ready))
+    throw std::invalid_argument("critical_video_transient requires transient_hold and critical_video_ready=false");
 }
 
 Json ControlCommand::to_json() const {
@@ -1043,6 +1045,10 @@ Json ControlCommand::to_json() const {
   value["recovery_bad_sample_revision"] = recovery_bad_sample_revision;
   value["recovery_brake_revision"] = recovery_brake_revision;
   value["control_token"] = control_token;
+  if (transient_hold_capable) {
+    value["transient_hold"] = std::string(detail::kTransientHoldCapability);
+    value["critical_video_transient"] = critical_video_transient;
+  }
   return value;
 }
 
@@ -1089,6 +1095,21 @@ ControlCommand ControlCommand::from_json(const Json& value) {
     // readiness bit. A V7 relay that strips it still causes independent braking.
     command.control_link_ready = command.estop || value.value("control_link_ready", true);
     command.control_token = value.at("control_token").get<std::string>();
+    // Optional transient-hold fields. A verified ESTOP never depends on them:
+    // unknown or contradictory values are ignored for a stop and rejected otherwise.
+    if (value.contains("transient_hold")) {
+      const auto& marker = value.at("transient_hold");
+      const bool known = marker.is_string() &&
+          marker.get_ref<const std::string&>() == detail::kTransientHoldCapability;
+      if (!known && !command.estop) throw std::invalid_argument("transient_hold capability is invalid");
+      command.transient_hold_capable = known;
+    }
+    if (value.contains("critical_video_transient")) {
+      const auto& flag = value.at("critical_video_transient");
+      if (!flag.is_boolean() && !command.estop)
+        throw std::invalid_argument("critical_video_transient must be a boolean");
+      command.critical_video_transient = !command.estop && flag.is_boolean() && flag.get<bool>();
+    }
   } catch (const Json::exception& error) {
     throw std::invalid_argument(std::string("invalid control command: ") + error.what());
   }
