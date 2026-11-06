@@ -3076,3 +3076,83 @@ git commit -m "Index PR #26 evidence files" -m "Co-Authored-By: Claude <noreply@
   双栈 IP 等无关含义，未改。
 - **未验证项：** `cpp/apps/windows_native_viewer.cpp` 在阶段 2 被修改（Task 6、7、9），本机没有 Windows 工具链，只做了定界符平衡检查；
   必须推送后由 Windows 工作流编译验证（Task 29，需用户同意推送）。
+
+## 执行偏差记录（阶段 3，Task 12–22）
+
+下列偏差都在执行中发现，原因和验证方式一并记录；没有一项降低了计划要求的覆盖。
+
+**Task 12**
+- 策略头文件与测试逐字取自计划（草稿目录里先做过变异检查）。随后在 Task 16 增加了两个纯函数和一个穷举等价性测试（见 Task 16）。
+
+**Task 13**
+- 在 `control.transient_hold` 块里额外拒绝未知键（拼错的键不会静默回退到默认值，`hold_brake` 是安全相关参数）、拒绝非映射写法；空块（`transient_hold:`）视为未配置。对应测试在计划用例之外补充了边界值（`degraded+max_hold+100` 恰好等于/少 1 ms）、逐字段越界、现场配置自身的断言、`redacted_summary`、其他配置保持关闭。
+- `speed_feedback_timeout_ms` 校验改为与 `bridge_apply_timeout_ms` 比较，报错文案补充了该字段名（原文案是合并的，没有点名 `control_timeout_ms`）。
+
+**Task 14**
+- 已认证的 ESTOP 不依赖可选的保持字段：`validate()` 对 ESTOP 跳过"瞬态视频标志"一致性规则；`from_json` 对 ESTOP 忽略未知或矛盾的保持字段（置为未协商），非 ESTOP 仍然拒绝。计划的写法会让一个带异常保持字段的 ESTOP 被拒收，与既有注释"ESTOP 不依赖更新的生产者 schema"矛盾。
+- 云端信令对 `control_command` 用 `ControlCommand::from_json` 校验并原样转发 payload，所以新字段在中转链路上保持不变；MAC 覆盖整个 payload（除 `native_mac` 本身），无需另行签名。
+
+**Task 15**
+- 制动下限不用存储字段 `brake_floor_`，改为 `current_brake_floor()` 由当前状态即时推导（制动等待或恢复制动保持 → 1.0；保持中 → `hold_brake`）。两者生命周期等价，但少一个会失步的可变成员。
+- 新增 `end_transient_hold(reason)`：硬超时、安全锁存、ESTOP、其他故障启动制动等待、驾驶端撤回能力时，保持记录明确结束并写入原因。否则硬停车之后页面仍会显示"保持中"的横幅。
+- 间隔/迟到的保持路径只在没有制动等待时启用；已在制动等待时沿用原有写法（副作用保持不变）。
+- 计划的夹具里 `control_link_ready=false` 没有同时撤回 `operator_input_ready`，会被 `ControlCommand::validate` 当作无效命令拒收，到不了制动等待；夹具已修正。
+- 服务测试 19 个用例（计划 13 个 + 刹车保留、硬超时看门狗停滞、能力撤回、禁用的车端、事件、ESTOP 后记录等），15 个变异体全部被杀死。
+
+**Task 15（补记，由 Task 20 的集成测试发现）**
+- 看门狗里"`DEGRADED` 就进入控制链路中断保持"是错的（计划 Step 6 也是这样写的）：`set_control_braking_wait(false)` 经 `require_input_rearm()` 会强制把状态置为 `DEGRADED`，此时命令一直在到达，并没有断流。结果是每次制动等待恢复后都会产生一次假的 `control_gap` 保持：占用保持预算、横幅和日志误报"链路中断"。改为必须同时满足"距最后一条有效命令 ≥ `degraded_timeout_ms`"（新增成员 `degraded_timeout_ms_`）。服务层补回归用例 `braking_wait_release_does_not_fake_a_gap`，红灯→绿灯，并新增 2 个变异体（共 17 个，全部被杀死）。
+
+**Task 16**
+- 计划里按"任何非零异常即过期"调用分类函数，在未协商时会让 1–2 帧丢帧也触发制动（旧规则是连续 3 帧才算）。改为两个纯函数 `effective_lane_anomalies`、`vehicle_video_lane_blocks_control`，并用穷举测试证明未协商时与旧布尔表达式逐位一致（7 位输入 × 异常数 0–4）。
+- 保持事件在持锁块之后、启动宽限期的提前 `return` 之前发出；计划放在函数末尾，宽限期内的事件会被取走却不发出。该缺陷由 `recovery_enforcer_tests` 的新用例抓到。
+- 硬停车诊断（`control_hard_stop_transition`）已整体嵌入 `control_timing`，Task 15 之后其中自带 `transient_hold`，不再另加重复键。
+- `recovery_enforcer_tests` 的伪造夹具补了新成员，并新增 7 个行为用例，直接执行从 `webrtc_media.cpp` 抽取的真实代码，配真实闩锁和真实服务；9 个变异体全部被杀死。
+- `ice_vehicle_callbacks.test.py` 用行为用例（真实抽取的 offer 构造代码 + 驾驶端的解析函数）替代计划里的字符串存在性检查，另保留代际变化的契约检查。
+
+**Task 17**
+- 计划把"协商 + 负载"都放在一个单元用例里验证；协商（含越界容忍值、缺失能力清除旧协商、Windows mock 客户端关闭）在单元层覆盖，命令负载里的 `transient_hold` / `critical_video_transient` 赋值由 Task 20 的真实回环集成测试端到端覆盖（车端真的收到带保持字段的命令并进入保持），并在那里对赋值做变异验证。
+- `/api/control-intent` 的意图回显和发送路径追踪里补了 `critical_video_transient` / `transient_hold_capable`，便于现场日志核对。
+- Windows viewer 只加一行 `config.disable_transient_hold = true;`，无法在本地编译，待获准推送后由 Windows 工作流验证。
+
+**Task 18**
+- 容忍值在持有 WSS 锁的块开头设置，早于本周期首个 ACK 的消费（排空、DC 的 `observe`、WSS 的 `observe`），而不是计划写的"`observe` 之前"：计划的位置会让容忍值滞后一个采样周期。
+- 草稿目录里的 ACK 头文件基于旧版本（含已删除的镜像类），只套用与容忍相关的改动，不整体拷贝。
+- 在计划的 4 个用例之外补了 2 个：重连套接字会重置异常计时，以及负容忍值等同 0。11 个变异体全部被杀死；其中"负容忍值"一开始存活（行为等价，只有访问器返回负数），补断言后被杀死。
+
+**Task 19**
+- 新增纯函数 `transientHoldPresentation(runtime, telemetry)` 生成监控面板"链路保持"一行，页面只调用它，因此可以单测（计划里是直接写在内嵌页面里）。
+- `setTransientHoldNegotiated` 在 `renderMonitoring()` 里调用，而不是只在 `/api/status` 轮询赋值处，因为后者在登录、连接、恢复等多处赋值，漏一处就会在协商生效后仍按旧规则推进制动修订号。位置是在 ESTOP 呈现和恢复呈现之后、`renderVcuHandshake()` 之前：首版放在函数开头，被 `control_tests` 的 `control_page_contract` 抓到——该契约要求 `function renderMonitoring(){const estopPresentation=…`，即急停横幅必须是监控刷新做的第一件事，这条约束应当保留，所以改动放到后面而不是放宽断言。这是完整套件才暴露的回归（任务 19 的目标测试都通过）。
+- 页面测试追加在各自文件的汇总语句之前（`camera_view.test.cjs` 的 `process.exitCode`、`control_logic.test.cjs` 的 `Promise.all(pendingTests)` 汇总块）。
+- 既有的 8 个"actual shipped monitor …"用例在沙箱里执行真实的 `renderMonitoring()`，新增的 `cameraView` 调用让它们抛 `ReferenceError`。修正放在测试夹具 `useProductionCameraView`：把它已创建的真实 camera view 同时挂到 `context.cameraView`，监控用例因此会执行真实的 `setTransientHoldNegotiated`，而不是放一个桩。
+- 页面变异检查共 27 个变异体：首轮 3 个存活（"已结束且静音的轨道也不是瞬态"、"保持中又进入制动等待时沿用重按提示"、"页面只在保持状态变化时记录日志且保持期间不清输入"），补测试后全部被杀死。后者通过从页面源码抽出真实的 `applyVehicleSafetyState` 在沙箱里执行来验证。
+- 未改动 `docs/45-control-stop-trigger-review.md` 里"画面中断/暂无新帧提示保留"的措辞（它记录的是当时的评审结论）；页面文案现在是"画面短暂中断"，Task 22 的文档里统一说明。
+
+**Task 20**
+- 计划里 `car_watchdog` 线程只在 `direct_enabled` 时启动，而场景用非直连夹具；不启动车端定时 tick，断流期间车端不会进入保持。夹具改为 `direct_enabled || transient_hold || tick_vehicle` 时启动。
+- 夹具原先的会话配置目标车速为 0，油门恒为 0，无法断言"牵引被撤回/恢复"；瞬态夹具改用非零配置并保留 `MockVehicleAdapter` 指针，在同一把锁内同时读取时序 JSON 和适配器输出，避免读到不一致的快照。
+- 夹具没有 `VehicleMediaRuntime` 的恢复协调器，所以和既有安全夹具一样，在传输选择引起的初始制动等待上由测试显式释放；释放后先等车端接受中性命令（`rearm_required == false`）再按下油门，与页面的流程一致。
+- 计划里的状态键 `intent_requires_fresh_input` 在驾驶端 `status()` 里实际叫 `native_control.requires_fresh_input`，用 `.value(..., false)` 会空过；改用 `.at()`。`transient_hold.last` 在从未保持过时是 `null`，对它调用 `.value()` 会抛 JSON 类型错误而不是给出断言信息；加了空安全的读取函数。
+- **挂钟会倒退。** 在这台 Colima VM 里实测 60 秒内 `CLOCK_REALTIME` 倒退 5 次，最大约 104 ms（约每 12 秒一次，像是时间同步服务在校正）。夹具把 `utc()`（挂钟）同时当作车端服务的单调时钟喂入，保持按设计在看到时间倒退时 fail-closed（`clock_reversed`），于是约 10% 的运行出现 0–47 ms 的假升级。生产里车端用 `steady_clock`，不受影响。修复：`LogicalTimeControlService` 增加可注入单调时钟的构造重载（不改变其他测试），只有新场景使用 `steady()`。修复后 42 次连续运行零失败。
+- 新增对照场景：同一次断流下没有保持能力的车端仍进入制动等待，并断言驾驶端不会向没有声明能力的车端发送 `transient_hold` 字段；另断言保持场景里驾驶端的签名命令确实带了该字段。
+- 集成层变异：8 个里 7 个被杀死，包括任务 17 欠的两个驾驶端变异（从不声明能力 / 从不解析 offer）和"无条件声明能力"。存活的"迟到命令不触发保持"在回环场景里等价（断流结束后积压旧命令涌入时保持已经由断流进入），已由服务层 `late_commands_hold_then_resume` 和 M06 变异覆盖。
+- 记入 Task 26：其他集成夹具仍把 `utc()` 当作车端单调时钟，挂钟每约 12 秒倒退约 100 ms，会让它们偶发出现 `receive_time_reversed`、硬看门狗等现象。这很可能就是 Task 26 要查的"正常场景触发硬看门狗"的根因之一。
+
+**Task 21**
+- 沿用 Task 20 的辅助函数；`#include <cstdlib>`/`<unistd.h>` 放在文件顶部。这台 Colima VM 支持 `sch_netem`，所以该测试真正执行并通过（4.85 秒，不是跳过）；不支持的环境返回 77，CTest 记为跳过。
+- 设计 9.3 写的是 netem 延迟尖峰，实现用 `loss 100%`（350 ms 与 1500 ms）：丢包才会触发 TCP 重传退避和队头阻塞，350 ms 的丢包使车端投递间隔延长到约 600 ms，正好检验保持能吸收它，同时驾驶端 ACK 容忍（Task 18）不让驾驶端先撤回。
+- 首版断言只有"没有升级"，变异体"丢包根本没生效"存活，说明测试可能空过；补了"丢包确实打断了车端投递（`saw_hold`）"和"保持期间牵引为 0 且有轻制动"。最终 4 个变异体（驾驶端容忍关闭、ACK 停滞规则退回旧值、车端从不保持、丢包未生效）全部被杀死，连续 12 次运行无失败也无跳过。
+
+**Task 22**
+- 分析脚本与计划原文逐字一致；测试在计划的 1 个用例外补了"多文件合并、百分位、未知升级原因、空日志统计为 null"3 个用例，8 个变异体全部被杀死。已用真实策略产出的事件载荷验证脚本能正确统计。
+- 文档除计划列出的 `64/07/08/11/DEPLOY.md` 外，还给 `docs/24-vehicle-runtime-diagnostics.md` 加了三个事件的条目（运维按它查事件），并在 `docs/64` 增加第 14 节"实施记录"和第 15 节"现场验收清单"（含 `escalation_reason` 的全部取值，其中 `hard_timeout`/`safety_latched`/`estop` 表示更强的停车接管了保持）。
+- `DEPLOY.md` 里 `rto_min` 路由属性已在容器的 iproute2 中确认存在，并明确写成"现场实测后再采用，代码默认不变"。
+- 没有改动 `docs/45-control-stop-trigger-review.md`（它记录当时的评审结论，其中"画面中断/暂无新帧提示保留"是历史描述）。
+
+**已知环境偶发（与阶段 3 无关）**
+- `mine-teleop-media-time-sync-retry-loopback`（`cli-over-budget`）：在阶段 2 结束的基线二进制上 4/12 失败，阶段 3 二进制 4/12 失败；空闲与 8 个满载进程下失败率相同（2/8）。完整 CTest 约三分之一的运行会因它失败，它是唯一失败项时视为通过并如实说明。留给 Task 26 查根因。
+- `mine-teleop-control-tests` 的 `driver_login_failure_rate_limit_and_recovery`：完整运行中失败过 1 次，5 次隔离复跑通过；同样留给 Task 26。
+
+**阶段 3 的验证概况与未验证项**
+- 提交：Task 12–22 共 12 个提交（Task 15 的缺陷修复单独一个）。每个提交都在 Ubuntu 22.04 容器里对最终树跑了完整 CTest，并跑了与改动对应的变异检查（策略 11 个以上、服务 17 个、媒体观察者 9 个、ACK 11 个、页面 27 个、集成 8 个、netem 4 个、分析脚本 8 个，最终全部被杀死，个别等价变异已说明）。
+- 完整 CTest 现为 93 项，全部通过；其中 `mine-teleop-transient-hold-netem-tests` 真正执行（不是跳过）。
+- **未验证：** `cpp/apps/windows_native_viewer.cpp`（阶段 2 的改动加上阶段 3 的一行 `config.disable_transient_hold = true;`）仍不能在本机编译，需推送后由 Windows 工作流验证；真实 WebRTC DataChannel、真实 5G/TURN 链路和实车都没有覆盖，只有回环 WSS 和回环丢包；现场验收清单见 `docs/64` 第 15 节。
