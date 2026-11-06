@@ -27,6 +27,14 @@ struct DriverConsoleTransportTestAccess {
     std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
     static_cast<void>(runtime.consume_vehicle_control_result_locked(result, "session-001", "vehicle-001", "driver-001", now, true));
   }
+  static void observe_offer_capabilities(DriverConsoleRuntime& runtime, const Json& payload) {
+    std::lock_guard lock(runtime.mutex_);
+    runtime.observe_transient_hold_offer_locked(payload);
+  }
+  static int transient_tolerance(DriverConsoleRuntime& runtime) {
+    std::lock_guard lock(runtime.mutex_);
+    return runtime.transient_hold_vehicle_capable_ ? runtime.transient_control_tolerance_ms_ : 0;
+  }
   static bool direct_retired(DriverConsoleRuntime& runtime) {
     std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
     return runtime.control_transport_sender_.path() == detail::ControlPath::Wss &&
@@ -53,6 +61,28 @@ Json stamp(std::uint64_t epoch, std::uint64_t from, ControlPath path, std::uint6
 }
 auto admit(ControlTransportFence& value, const ControlCommand& cmd, const Json* wire, ControlPath path, std::int64_t now) {
   return value.admit(cmd, wire, path, "media-a", now, 100000, 200, true);
+}
+void driver_negotiates_transient_hold_from_offer() {
+  DriverConfig config; config.driver_id = "driver-001"; config.signaling_url = "http://127.0.0.1:1";
+  config.browser_event_log_path.clear();
+  DriverConsoleRuntime runtime(config, "vehicle-001", "fixture");
+  NativeControlIntent intent; intent.ui_instance_id = "ui"; intent.intent_seq = 1;
+  intent.critical_video_ready = true; intent.critical_video_transient = true;
+  bool rejected = false; try { intent.validate(); } catch (const std::invalid_argument&) { rejected = true; }
+  expect(rejected, "intent accepted transient video while video was ready");
+  const Json offer = {{"transient_hold_capability", "transient-hold-v1"},
+      {"transient_hold", {{"control_tolerance_ms", 1000}, {"video_tolerance_ms", 1200}, {"max_hold_ms", 700}}}};
+  DriverConsoleTransportTestAccess::observe_offer_capabilities(runtime, offer);
+  expect(DriverConsoleTransportTestAccess::transient_tolerance(runtime) == 1000, "valid capability not negotiated");
+  DriverConsoleTransportTestAccess::observe_offer_capabilities(runtime, Json::object());
+  expect(DriverConsoleTransportTestAccess::transient_tolerance(runtime) == 0, "missing capability kept a stale negotiation");
+  Json out_of_range = offer; out_of_range["transient_hold"]["control_tolerance_ms"] = 399;
+  DriverConsoleTransportTestAccess::observe_offer_capabilities(runtime, out_of_range);
+  expect(DriverConsoleTransportTestAccess::transient_tolerance(runtime) == 0, "out-of-range tolerance negotiated");
+  DriverConfig mock_config = config; mock_config.disable_transient_hold = true;
+  DriverConsoleRuntime mock_runtime(mock_config, "vehicle-001", "fixture");
+  DriverConsoleTransportTestAccess::observe_offer_capabilities(mock_runtime, offer);
+  expect(DriverConsoleTransportTestAccess::transient_tolerance(mock_runtime) == 0, "mock client negotiated the hold");
 }
 void version_scope_and_expiry() {
   expect(!DriverConfig{}.enable_experimental_control_transport, "experimental transport default must remain closed pending authority review");
@@ -438,6 +468,7 @@ void real_service_switch_does_not_disable_watchdog() {
 int main() {
   try {
     publication_is_owned_only_by_its_current_dc_epoch();
+    driver_negotiates_transient_hold_from_offer();
     late_dc_results_withdraw_publication_in_result_handler();
     failed_direct_trials_back_off_and_exhaust_per_attempt();
     mock_idle_reprobe_is_fenced_fresh_and_once_per_attempt();
@@ -445,6 +476,6 @@ int main() {
     confirmed_profile_permits_only_one_new_bounded_dc_budget();
     version_scope_and_expiry(); single_receiver_epoch_replay_and_emergency(); exact_result_and_neutral_qualification();
     slower_dc_and_lost_selection(); cloud_ingress_without_vehicle_result_can_only_start_a_neutral_trial(); healthy_proven_p2p_is_preferred_to_a_faster_cloud_backup(); signatures_bind_native_bytes_and_vehicle_results(); private_signing_material_is_not_public_session_state(); bounded_status_rejects_unsupported_kinds_and_scope_mismatch(); real_service_switch_does_not_disable_watchdog();
-    std::cout << "16 control transport cases passed; real common safety service, no sockets\n";
+    std::cout << "17 control transport cases passed; real common safety service, no sockets\n";
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

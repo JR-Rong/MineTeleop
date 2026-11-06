@@ -1132,6 +1132,8 @@ void NativeControlIntent::validate() const {
   require_finite_range(steering, -1.0, 1.0, "intent steering");
   require_finite_range(throttle, 0.0, 1.0, "intent throttle");
   require_finite_range(brake, 0.0, 1.0, "intent brake");
+  if (critical_video_transient && critical_video_ready)
+    throw std::invalid_argument("critical_video_transient requires critical_video_ready=false");
 }
 
 bool NativeControlIntent::is_neutral() const {

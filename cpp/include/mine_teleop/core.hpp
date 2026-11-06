@@ -115,6 +115,9 @@ struct NativeControlIntent {
   bool critical_video_sample_healthy{false};
   std::uint64_t critical_video_bad_sample_revision{0};
   std::uint64_t critical_video_brake_revision{0};
+  // Every blocked critical view is only stale, recovering or muted. Meaningful only
+  // with critical_video_ready=false, and only forwarded when a hold is negotiated.
+  bool critical_video_transient{false};
 
   void validate() const;
   [[nodiscard]] bool is_neutral() const;

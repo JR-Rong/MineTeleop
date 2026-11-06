@@ -393,6 +393,9 @@ struct DriverConfig {
   // In-process opt-in for a video-only viewer. It is not a YAML option and
   // must never start the control sender, control WSS, or accept control APIs.
   bool receive_only{false};
+  // In-process switch, never read from YAML: the Windows mock client keeps the
+  // existing safety behavior and ignores a vehicle's transient hold offer.
+  bool disable_transient_hold{false};
   // In-process opt-in for a control client that must verify its peer and
   // video before creating the first input. Not loaded from YAML.
   bool defer_control_bootstrap{false};
@@ -627,6 +630,10 @@ class DriverConsoleRuntime {
   bool control_transport_vehicle_capable_{false}; // mutex_
   bool emergency_stop_vehicle_capable_{false}; // mutex_
   bool feedback_transport_vehicle_capable_{false}; // mutex_
+  bool transient_hold_vehicle_capable_{false};  // mutex_
+  int transient_control_tolerance_ms_{0};       // mutex_
+  int transient_video_tolerance_ms_{0};         // mutex_
+  void observe_transient_hold_offer_locked(const Json& payload);
   detail::FeedbackTransportSender feedback_transport_sender_; // existing transport mutex
   bool feedback_transport_enabled_{false};
   bool feedback_transport_dc_is_p2p_{false};

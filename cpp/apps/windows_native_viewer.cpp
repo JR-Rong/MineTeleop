@@ -997,6 +997,7 @@ struct Window {
       if (mock_control && !config.signaling_url.starts_with("ws://127.0.0.1:"))
         throw std::runtime_error("mock control requires an isolated loopback signaling tunnel");
       config.receive_only = !mock_control;
+      config.disable_transient_hold = true;  // The mock client keeps the existing safety behavior.
       config.defer_control_bootstrap = mock_control;
       config.mock_idle_direct_reprobe = mock_control;
       config.max_time_sync_uncertainty_ms = vehicle.field_safety.max_time_sync_uncertainty_ms;

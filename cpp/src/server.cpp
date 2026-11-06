@@ -5535,6 +5535,14 @@ void DriverConsoleRuntime::close_control_signaling_websocket() {
   control_signaling_reconnect_delay_ms_ = 100;
 }
 
+void DriverConsoleRuntime::observe_transient_hold_offer_locked(const Json& payload) {
+  // Anything unexpected keeps both endpoints on the existing behavior.
+  const auto offer = config_.disable_transient_hold ? std::nullopt : detail::parse_transient_hold_offer(payload);
+  transient_hold_vehicle_capable_ = offer.has_value();
+  transient_control_tolerance_ms_ = offer ? offer->control_tolerance_ms : 0;
+  transient_video_tolerance_ms_ = offer ? offer->video_tolerance_ms : 0;
+}
+
 void DriverConsoleRuntime::reset_native_control_state() {
   std::lock_guard update_lock(native_control_update_mutex_);
   close_control_signaling_websocket();
@@ -5551,6 +5559,7 @@ void DriverConsoleRuntime::reset_native_control_state() {
     control_sequence_ = 0;
     control_transport_vehicle_capable_ = false;
     emergency_stop_vehicle_capable_ = false; feedback_transport_vehicle_capable_ = false;
+    observe_transient_hold_offer_locked(Json::object());
     control_transport_mac_key_.clear();
     ++control_session_generation_;
   }
@@ -6236,6 +6245,7 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
   Json trace_record;
   std::int64_t socket_lock_acquired_ms = 0, socket_lock_released_ms = 0;
   bool vehicle_transport_capable = false, vehicle_stop_capable = false;
+  int transient_tolerance_ms = 0;
   std::string current_media_attempt, transport_signing_key;
   {
     std::lock_guard update_lock(native_control_update_mutex_);
@@ -6263,6 +6273,7 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
       vehicle_transport_capable = control_transport_vehicle_capable_ && control_transport_mac_key_.size() >= 32;
       transport_signing_key = control_transport_mac_key_;
       vehicle_stop_capable = emergency_stop_vehicle_capable_;
+      transient_tolerance_ms = transient_hold_vehicle_capable_ ? transient_control_tolerance_ms_ : 0;
       current_media_attempt = media_scope_id_;
     }
   }
@@ -6310,6 +6321,11 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
     command.estop = sample.intent.estop;
     command.mock_control_diagnostic = config_.mock_control_diagnostic;
     command.critical_video_ready = sample.intent.critical_video_ready;
+    // Declared only against a vehicle that offered the capability; a transient
+    // video report needs the capability and a view that is actually not ready.
+    command.transient_hold_capable = transient_tolerance_ms > 0;
+    command.critical_video_transient = command.transient_hold_capable && !command.critical_video_ready &&
+        sample.intent.critical_video_transient;
     const auto time_readiness = time_sync_readiness_gate_.observe(
         clock_.status(), config_.max_time_sync_uncertainty_ms, monotonic_now_ms(),
         TimeSyncReadinessGate::candidate_timeout_ms(config_.time_sync_interval_ms, config_.time_sync_samples));
@@ -6328,6 +6344,8 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
       trace_record["operator_input_ready"] = command.operator_input_ready;
       trace_record["mock_control_diagnostic"] = config_.mock_control_diagnostic;
       trace_record["critical_video_ready"] = command.critical_video_ready;
+      trace_record["transient_hold_capable"] = command.transient_hold_capable;
+      trace_record["critical_video_transient"] = command.critical_video_transient;
       trace_record["effective_throttle"] = command.throttle;
       trace_record["effective_steering"] = command.steering;
     }
@@ -7840,6 +7858,7 @@ Json DriverConsoleRuntime::poll_signaling() {
       control_transport_vehicle_capable_ = payload.value("control_transport_capability", "") == detail::kControlTransportCapability;
       emergency_stop_vehicle_capable_ = payload.value("emergency_stop_capability", "") == detail::kEmergencyStopCapability;
       feedback_transport_vehicle_capable_ = payload.value("feedback_transport_capability", "") == detail::kFeedbackTransportCapability;
+      observe_transient_hold_offer_locked(payload);
     }
   }
   return {{"session_id", session}, {"messages", messages}};
@@ -8386,6 +8405,11 @@ Json DriverConsoleRuntime::update_control_intent(const Json& input, const HttpRe
       throw std::invalid_argument("critical_video_sample_healthy is required; refresh the control page");
     }
     intent.critical_video_sample_healthy = !intent.estop && input.value("critical_video_sample_healthy", false);
+    if (input.contains("critical_video_transient")) {
+      if (!input.at("critical_video_transient").is_boolean())
+        throw std::invalid_argument("critical_video_transient must be a boolean");
+      intent.critical_video_transient = !intent.estop && input.at("critical_video_transient").get<bool>();
+    }
     if (!intent.estop) {
       for (const auto* field : {"critical_video_bad_sample_revision", "critical_video_brake_revision"}) {
         const auto& revision = input.at(field);
@@ -8452,6 +8476,7 @@ Json DriverConsoleRuntime::update_control_intent(const Json& input, const HttpRe
         {"takeover", takeover}, {"ui_instance_id", intent.ui_instance_id},
         {"critical_video_ready", intent.critical_video_ready},
         {"critical_video_sample_healthy", intent.critical_video_sample_healthy},
+        {"critical_video_transient", intent.critical_video_transient},
         {"received_at_monotonic_ms", received_at}, {"applied_at_monotonic_ms", applied_at},
         {"local_http_timing", timing}});
   }
@@ -8650,6 +8675,11 @@ Json DriverConsoleRuntime::status(bool omit_signaling_socket) {
         {"critical_video_required", !config_.mock_control_diagnostic},
         {"effective_critical_video_ready", native_sample.intent.critical_video_ready},
         {"effective_critical_video_sample_healthy", native_sample.intent.critical_video_sample_healthy},
+        {"effective_critical_video_transient", native_sample.intent.critical_video_transient},
+        {"transient_hold",
+         {{"negotiated", transient_hold_vehicle_capable_},
+          {"control_tolerance_ms", transient_control_tolerance_ms_},
+          {"video_tolerance_ms", transient_video_tolerance_ms_}}},
         {"websocket_connected", native_control_websocket_connected},
         {"next_connect_in_ms",
          std::max<std::int64_t>(
