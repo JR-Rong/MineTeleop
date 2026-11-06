@@ -68,14 +68,16 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $installer = Join-Path $env:RUNNER_TEMP 'gstreamer-1.28.1.exe'
           $url = 'https://gstreamer.freedesktop.org/data/pkg/windows/1.28.1/msvc/gstreamer-1.0-msvc-x86_64-1.28.1.exe'
-          # The installer is about 494 MiB and a single Invoke-WebRequest does not retry, but the server sometimes ends the
-          # response early. Retry the whole download; the SHA-256 check below still decides whether the file is accepted.
-          for ($attempt = 1; $attempt -le 4; $attempt++) {
-            try { Invoke-WebRequest -Uri $url -OutFile $installer; break }
+          # The installer is about 494 MiB and the server often ends the response early (CI saw 1 and 3 failed attempts
+          # before a success). Retry, and resume from the bytes already on disk so that every attempt makes progress.
+          # The SHA-256 check below still decides whether the file is accepted.
+          for ($attempt = 1; $attempt -le 8; $attempt++) {
+            try { Invoke-WebRequest -Uri $url -OutFile $installer -Resume; break }
             catch {
-              Write-Host "GStreamer download attempt $attempt failed: $($_.Exception.Message)"
-              if ($attempt -eq 4) { throw }
-              Start-Sleep -Seconds (20 * $attempt)
+              $have = if (Test-Path $installer) { (Get-Item $installer).Length } else { 0 }
+              Write-Host "GStreamer download attempt $attempt failed after $have bytes: $($_.Exception.Message)"
+              if ($attempt -eq 8) { throw }
+              Start-Sleep -Seconds (15 * $attempt)
             }
           }
           $expected = '2ec50356d2d0937a9ead0f99d322f81d8413b9514c9d58ed41ca58fbcf25bfde'
