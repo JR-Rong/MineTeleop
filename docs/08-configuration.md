@@ -140,6 +140,11 @@ control:
   max_command_gap_ms: 200
   degraded_timeout_ms: 300
   control_timeout_ms: 800
+  # 可选。底盘桥自己的 apply 看门狗，缺省等于 control_timeout_ms。
+  # bridge_apply_timeout_ms: 800
+  # 可选。瞬态链路保持，缺省关闭；开启方式见本文“瞬态链路保持参数”。
+  # transient_hold:
+  #   enabled: true
   # 非 mock 车辆适配器必须提供该标定证据，且 control_timeout_ms 不能超过上限。
   timeout_calibration:
     max_control_timeout_ms: 900
@@ -609,6 +614,32 @@ ChassisControl `chassis_control` 动态库；MinePilot `include/can/can_common.h
 - `control_timeout_ms`：持续没有有效控制心跳多久后进入 `TIMEOUT_BRAKE`。
 
 `control_timeout_ms` 不能只按网络体验调大。配置前必须结合车速上限、独立安全制动动作、坡道/松散路面和矿区安全距离，反推允许的最大控制超时。本地参考实现会在非 `mock` 车辆适配器配置中要求 `timeout_calibration` 标定证据，并拒绝超过标定上限的 `control_timeout_ms`。
+
+### 瞬态链路保持参数
+
+`control.bridge_apply_timeout_ms`：整数，20–60000，不大于 `control_timeout_ms`，不小于
+`field_safety.speed_feedback_timeout_ms`；缺省等于 `control_timeout_ms`（旧配置行为不变）。传给底盘桥的 apply
+看门狗，用来检测车端进程卡死。把 `control_timeout_ms` 放宽后它仍可保持较短。
+
+`control.transient_hold`：可选块，**缺省关闭**（没有该块、块为空、`enabled: false` 都是关闭）。字段、范围、默认值：
+
+| 字段 | 默认 | 范围 | 含义 |
+| --- | --- | --- | --- |
+| `enabled` | `false` | 布尔 | 总开关；还需要驾驶端声明 `transient-hold-v1` 才会生效 |
+| `max_hold_ms` | `700` | 100–1500 | 单次保持上限，超出升级为制动等待 |
+| `hold_brake` | `0.15` | 0–0.3 | 保持期间的最小制动（归一化），与驾驶员制动取较大值 |
+| `resume_fresh_commands` | `2` | 1–5 | 恢复所需的连续新鲜命令数 |
+| `budget_window_ms` | `60000` | 10000–600000 | 频次预算的滑动窗口 |
+| `max_holds_per_window` | `6` | 1–100 | 窗口内最多保持次数，第 N+1 次升级 |
+| `max_hold_time_per_window_ms` | `3000` | 100–`budget_window_ms` | 窗口内累计保持时长上限 |
+
+启动校验（任一不满足即拒绝启动并指出字段）：各字段在上述范围内；块内出现未知键（拼写错误不会静默回到默认值）；
+`transient_hold` 不是映射；开启时 `degraded_timeout_ms + max_hold_ms + 100 ≤ control_timeout_ms`。
+现场配置（`vehicle-agent.three-machine.field.yaml`、`vehicle-agent.ccg2-8m.yaml`）显式开启，并设
+`control_timeout_ms: 1200`、`bridge_apply_timeout_ms: 800`；开发、台架和 Orin 示例配置不变，保持关闭。
+生效值出现在 `config-check` 和启动日志的 `effective_vehicle_config` 里（`control_timeout_ms`、`bridge_apply_timeout_ms`、
+`transient_hold.{enabled,max_hold_ms,hold_brake}`）。运行时行为和安全约束见
+[控制与安全](07-control-and-safety.md) 的“瞬态链路保持”。
 
 ## 驾驶端配置示例
 

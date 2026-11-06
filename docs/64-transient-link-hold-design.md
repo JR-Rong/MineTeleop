@@ -1,6 +1,6 @@
 # 64 瞬态链路保持设计
 
-状态：设计已逐节确认（2026-11-04），待实施。适用分支：`rjr/cx/native-realtime-pr26`（PR #26）。
+状态：**已实现，待现场验收**（设计 2026-11-04 逐节确认，2026-11-05 实施完成；提交范围见 `git log`，第 14 节记录实施中与设计不同的地方）。适用分支：`rjr/cx/native-realtime-pr26`（PR #26）。
 
 ## 1. 背景与目标
 
@@ -485,3 +485,33 @@ MAC 保护。云端不需要更新，也不新增云端能力标志。
 | 默认值 | 代码默认关闭；仓库现场配置开启 |
 | 文档位置 | 本文件 |
 | 规划阶段修订 | 新增 `bridge_apply_timeout_ms`（现场 800），保持底盘桥对车端进程卡死的检测时间不变；制动下限不改变急停锁存时机；回程单独延迟改为单元测试覆盖；A6 挪到阶段 2 |
+
+## 14. 实施记录（2026-11-05）
+
+实施按 `docs/superpowers/plans/2026-11-04-pr26-remediation-and-transient-hold.md` 的任务 12–22 逐个提交，每个提交都在
+Ubuntu 22.04 容器里跑完整 CTest。与上文设计不同或设计没有写明的地方：
+
+- **进入保持必须有真实断流。** 设计 5.2 写的是"进入 `DEGRADED`（距最后一条有效命令 ≥ `degraded_timeout_ms`）"，首版实现只检查了
+  `DEGRADED`。但 `set_control_braking_wait(false)` 会经 `require_input_rearm()` 强制进入 `DEGRADED`，此时命令一直在到达。
+  结果是每次制动等待恢复后都会产生一次假的 `control_gap` 保持。现在两个条件都要满足；该缺陷由真实回环集成测试发现。
+- **视频分类不能改变未协商时的规则。** 车端逐路判定拆成 `effective_lane_anomalies` 和 `vehicle_video_lane_blocks_control`
+  两个纯函数，并有穷举测试证明未协商时与原有布尔表达式逐位一致（连续 1–2 帧丢帧仍然容忍，第 3 帧才计）。
+- **已认证的 ESTOP 不依赖保持字段。** 命令里未知或自相矛盾的 `transient_hold` 字段对 ESTOP 被忽略，对普通命令仍然拒绝。
+- **ACK 容忍在每个周期里先于 ACK 消费设置**，对 WSS 和 DC 两个恢复对象同时生效，容忍为 0 时规则完全不变。
+- **网络层测试用 100% 丢包，不是延迟。** 9.3 节写的是 netem 延迟尖峰；实现用 `loss 100%`（350 ms 与 1500 ms），因为丢包才会触发
+  TCP 重传和队头阻塞——350 ms 的丢包使车端投递间隔延长到约 600 ms，仍应被保持吸收；测试同时断言丢包确实打断了投递，
+  不会空过。需要 root 和 `sch_netem`，不满足时返回 77（CTest 记为跳过，不计为通过）。
+- **集成测试夹具用真实单调时钟。** Colima VM 的挂钟约每 12 秒倒退约 100 ms，保持按设计看到时间倒退就升级（`clock_reversed`），
+  所以夹具给车端服务注入 `steady_clock`。生产里车端本来就用 `steady_clock`。
+- **页面文案：** 过期画面标签由"画面中断 / 暂无新帧"改为"画面短暂中断"。
+
+## 15. 现场验收清单
+
+1. 在车端导出 `vehicle-runtime.log`，用 `python3 scripts/test/transient_hold_analyze.py <日志文件...>` 汇总保持次数、时长分布
+   （p50/p95/max）、升级原因和硬停车次数。
+2. 验收标准同 9.4：短于容忍上限的尖峰没有任何升级；每次升级都能归因到超过上限的中断、频次预算用尽或故障类原因。
+3. `escalation_reason` 的全部取值：`hold_duration_exceeded`（超过 `max_hold_ms`）、`budget_count_exceeded`、`budget_time_exceeded`、
+   `clock_reversed`、`fault_during_hold`（保持期间出现故障类原因）、`transport_epoch_changed`（传输代际变化）、`hard_timeout`
+   （硬看门狗接管）、`safety_latched`（故障/急停锁存接管）、`estop`（已认证的急停）。后三项表示更强的停车接管了保持，不是保持本身的失败。
+4. 事件名：`vehicle_transient_hold_entered` / `vehicle_transient_hold_resumed` / `vehicle_transient_hold_escalated`
+   （见 `docs/24-vehicle-runtime-diagnostics.md`），驾驶端页面日志里对应 `driver_transient_hold_observed`。
