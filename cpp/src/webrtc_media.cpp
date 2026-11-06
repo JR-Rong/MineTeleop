@@ -4,6 +4,22 @@
 #include "mine_teleop/detail/emergency_stop.hpp"
 #include "mine_teleop/detail/feedback_transport.hpp"
 #include "mine_teleop/detail/diagnostic_queue.hpp"
+#include "mine_teleop/detail/ice_diagnostics.hpp"
+#include "mine_teleop/detail/ice_route_policy.hpp"
+#include "mine_teleop/detail/isolated_mock_bench.hpp"
+#include "mine_teleop/detail/transient_hold.hpp"
+
+// Release bundles define MINE_TELEOP_BENCH_EXPERIMENTS=0 (CMake option MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS=OFF),
+// which compiles the isolated-mock bench tracing out. Anything else, including a build that never sets it, keeps it.
+#ifndef MINE_TELEOP_BENCH_EXPERIMENTS
+#define MINE_TELEOP_BENCH_EXPERIMENTS 1
+#endif
+namespace {
+constexpr bool kBenchExperimentsCompiled = MINE_TELEOP_BENCH_EXPERIMENTS != 0;
+}  // namespace
+#include "mine_teleop/detail/gstreamer_rtp_marker.hpp"
+#include "mine_teleop/detail/gstreamer_ice_servers.hpp"
+#include <agent.h>
 
 #include "mine_teleop/gstreamer_media.hpp"
 #include "mine_teleop/detail/gstreamer_freshness.hpp"
@@ -582,6 +598,9 @@ struct VehicleMediaRuntime::Impl {
     GstElement* peer{nullptr};
     std::string negotiation_id;
     std::string compatibility_issue;
+    std::string ice_route_mode{"all"};
+    Json selected_pair{Json::object()};
+    std::uint64_t selected_pair_changes{0};
     bool local_description_ready{false};
     bool offer_queued{false};
     bool answer_apply_pending{false};
@@ -602,6 +621,7 @@ struct VehicleMediaRuntime::Impl {
       answer_apply_pending = false; answer_applied = false;
       local_ufrags.clear(); remote_ufrags.clear();
       pending_local_candidates.clear(); pending_remote_candidates.clear(); pending.clear();
+      selected_pair = Json::object(); selected_pair_changes = 0;
       ++attempt_count;
     }
   };
@@ -679,6 +699,10 @@ struct VehicleMediaRuntime::Impl {
     std::atomic<std::uint64_t> encoded{0};
     std::atomic<std::uint64_t> dropped{0};
     std::atomic<std::uint64_t> encoded_queue_backpressure{0};
+    // Enabled only for traced, isolated mock runs; no RTP contents are kept.
+    std::atomic<std::uint64_t> mock_rtp_output_events{0};
+    std::atomic<std::int64_t> mock_last_rtp_output_steady_ms{0};
+    std::atomic<std::int64_t> mock_rtp_output_max_gap_ms{0};
     std::atomic<bool> source_sequence_valid{false};
     std::atomic<std::uint64_t> source_sequence{0};
     std::atomic<std::uint64_t> source_sequence_gap{0};
@@ -688,6 +712,7 @@ struct VehicleMediaRuntime::Impl {
     std::atomic<std::int64_t> last_encoded_ms{0};
     std::atomic<std::int64_t> last_encoded_steady_ms{0};
     std::atomic<std::uint64_t> encode_latency_samples{0};
+    detail::LatencyHistogram capture_to_encoded_latency;
     std::atomic<std::uint64_t> encode_latency_total_ms{0};
     std::atomic<std::uint64_t> encode_latency_max_ms{0};
     std::atomic<std::uint64_t> encode_latency_invalid_samples{0};
@@ -969,6 +994,7 @@ struct VehicleMediaRuntime::Impl {
       }
       if (latency) {
         const auto latency_ms = *latency;
+        lane->capture_to_encoded_latency.add(latency_ms);
         ++lane->encode_latency_samples;
         lane->encode_latency_total_ms += latency_ms;
         auto observed = lane->encode_latency_max_ms.load();
@@ -993,7 +1019,9 @@ struct VehicleMediaRuntime::Impl {
     const auto ufrag = candidate_ufrag(Json{{"candidate", candidate}});
     if (!ufrag.empty() && std::find(state->local_ufrags.begin(), state->local_ufrags.end(), ufrag) == state->local_ufrags.end()) return;
     const auto count = ++self->local_ice_candidate_count;
-    if (count == 1) {
+    if (count <= 64) {
+      auto summary = detail::ice_candidate_summary(candidate);
+      summary.update({{"candidate_count", count}, {"sdp_mline_index", mline_index}, {"media_negotiation_id", state->negotiation_id}});
       self->emit_diagnostic(
           "vehicle_webrtc_ice_candidate_discovered",
           "webrtc_local_ice_candidate_available",
@@ -1001,7 +1029,7 @@ struct VehicleMediaRuntime::Impl {
           "",
           "No action is required; this is a connectivity milestone.",
           true,
-          {{"candidate_count", count}, {"sdp_mline_index", mline_index}});
+          std::move(summary));
     }
     Json payload{{"candidate", candidate}, {"sdpMLineIndex", mline_index},
         {"media_negotiation_id", state->negotiation_id}};
@@ -1143,6 +1171,18 @@ struct VehicleMediaRuntime::Impl {
         nullptr);
   }
 
+  // The single definition of the isolated zero-speed mock bench. It gates the
+  // bench-only diagnostics below and is the attestation, carried in the offer,
+  // that a native mock client requires before it will send any control.
+  bool isolated_mock_bench_attested() const {
+    return detail::isolated_mock_bench(config.vehicle_id, config.vehicle_adapter.type,
+        config.field_safety.max_speed_kph, config.field_safety.commissioning_mode);
+  }
+  bool isolated_mock_trace() const {
+    return detail::isolated_mock_trace_enabled(
+        kBenchExperimentsCompiled, config.runtime.control_log_commands, isolated_mock_bench_attested());
+  }
+
   static void on_offer_created(GstPromise* promise, gpointer user_data) {
     const auto* context = static_cast<MediaOfferContext*>(user_data);
     const auto state = context->state;
@@ -1217,10 +1257,18 @@ struct VehicleMediaRuntime::Impl {
     state->pending.emplace_back("webrtc_offer", Json{
          {"type", "offer"},
          {"control_transport_capability", self->signaling.transport_mac_key().size() >= 32 ? detail::kControlTransportCapability : std::string_view{}},
+         {"isolated_mock_bench_capability", self->isolated_mock_bench_attested() ? detail::kIsolatedMockBenchCapability : std::string_view{}},
+         {"transient_hold_capability", self->config.control.transient_hold.enabled ? detail::kTransientHoldCapability : std::string_view{}},
+         {"transient_hold", self->config.control.transient_hold.enabled
+             ? Json{{"control_tolerance_ms", self->config.control.degraded_timeout_ms + self->config.control.transient_hold.max_hold_ms},
+                    {"video_tolerance_ms", self->config.runtime.critical_camera_stale_brake_ms + self->config.control.transient_hold.max_hold_ms},
+                    {"max_hold_ms", self->config.control.transient_hold.max_hold_ms}}
+             : Json(nullptr)},
          {"emergency_stop_capability", self->config.runtime.experimental_direct_authority_max_ms > 0 && self->signaling.transport_mac_key().size() >= 32 ? detail::kEmergencyStopCapability : std::string_view{}},
          {"feedback_transport_capability", self->config.runtime.experimental_direct_authority_max_ms > 0 && self->signaling.transport_mac_key().size() >= 32 ? detail::kFeedbackTransportCapability : std::string_view{}},
          {"sdp", text == nullptr ? "" : text},
          {"media_negotiation_id", negotiation_id},
+         {"ice_route_mode", state->ice_route_mode},
          {"legacy_bootstrap_allowed", state->attempt_count == 1 && state->offer_count == 1},
          {"codec", (self->config.runtime.mock_control_diagnostic ? std::string("none") : to_string(self->active_candidate.codec))},
          {"backend", (self->config.runtime.mock_control_diagnostic ? std::string("none") : to_string(self->active_candidate.backend))},
@@ -1920,6 +1968,7 @@ struct VehicleMediaRuntime::Impl {
         }
         if (decision.changed) {
           invalidate_native_control_trusted_gear_locked();
+          control_service->note_transport_epoch_changed(signaling.now_ms());
           control_service->set_control_braking_wait(true, signaling.now_ms(), ControlRecoveryCause::ControlLink);
         }
       } else {
@@ -3043,6 +3092,23 @@ struct VehicleMediaRuntime::Impl {
     if (sequence == last_vehicle_telemetry_seq) return;
     auto payload_value = telemetry;
     payload_value["control_status_seq"] = ++control_status_seq;
+    // Bench-only metadata: distinguish a stopped telemetry producer from a
+    // status lost after publication. Never log the telemetry payload itself.
+    const auto trace_now = steady_now_ms();
+    if (isolated_mock_trace() && trace_now - last_mock_telemetry_trace_ms >= 1000) {
+      guint64 buffered_bytes = 0;
+      if (control_channel) g_object_get(control_channel, "buffered-amount", &buffered_bytes, nullptr);
+      enqueue_control_trace({{"stage", "mock_telemetry_publish"}, {"seq", sequence},
+          {"event_monotonic_ms", trace_now}, {"bytes", payload_value.dump().size()},
+          {"channel_buffered_bytes", buffered_bytes},
+          {"channel_open", control_link_open.load()},
+          {"feedback_path", feedback_transport_fence.negotiated() ?
+              Json(std::string(detail::control_path_name(feedback_transport_fence.path()))) : Json(nullptr)},
+          {"feedback_epoch", feedback_transport_fence.negotiated() ?
+              feedback_transport_fence.state().at("epoch") : Json(nullptr)},
+          {"control_path", std::string(detail::control_path_name(control_transport_fence.path()))}});
+      last_mock_telemetry_trace_ms = trace_now;
+    }
     send_control_status_locked(std::move(payload_value));
     last_vehicle_telemetry_seq = sequence;
   }
@@ -3275,6 +3341,7 @@ struct VehicleMediaRuntime::Impl {
     bool soft_brake_applied_this_transition = false;
     Json control_snapshot;
     Json critical_lanes;
+    Json mock_ice_output_markers = Json::object();
     std::int64_t sampled_at_monotonic_ms = 0;
     const auto sample_readiness = [&] {
       sampled_at_monotonic_ms = steady_now_ms();
@@ -3283,11 +3350,15 @@ struct VehicleMediaRuntime::Impl {
         if (!lane->camera.critical_for_control) continue;
         const auto last_capture = lane->last_capture_steady_ms.load();
         const auto last_encoded = lane->last_encoded_steady_ms.load();
+        const auto last_mock_rtp = lane->mock_last_rtp_output_steady_ms.load();
         critical_lanes.push_back({{"camera_id", lane->camera.id}, {"device", lane->camera.device},
             {"recording", recording_status_for(*lane)},
           {"captured_frames", lane->captured.load()}, {"encoded_frames", lane->encoded.load()},
             {"last_capture_age_ms", last_capture > 0 ? Json(std::max<std::int64_t>(0, sampled_at_monotonic_ms - last_capture)) : Json(nullptr)},
             {"last_encoded_age_ms", last_encoded > 0 ? Json(std::max<std::int64_t>(0, sampled_at_monotonic_ms - last_encoded)) : Json(nullptr)},
+            {"mock_rtp_output_events", lane->mock_rtp_output_events.load()},
+            {"mock_last_rtp_output_age_ms", last_mock_rtp > 0 ? Json(std::max<std::int64_t>(0, sampled_at_monotonic_ms - last_mock_rtp)) : Json(nullptr)},
+            {"mock_rtp_output_max_gap_ms", lane->mock_rtp_output_max_gap_ms.load()},
             {"recovery_encoded_baseline", lane->video_wait_encoded_baseline.load()},
             {"encoded_queue_backpressure_count", lane->encoded_queue_backpressure.load()},
           {"send_freshness_scope", "capture_pts_to_send_queue_source_monotonic_not_network_delivery"},
@@ -3302,10 +3373,22 @@ struct VehicleMediaRuntime::Impl {
           {"send_dependent_access_units_dropped", lane->send_freshness == nullptr ? 0 : lane->send_freshness->dropped_waiting_idr.load()},
           {"send_key_unit_requests", lane->send_freshness == nullptr ? 0 : lane->send_freshness->key_unit_requests.load()},
           {"send_key_unit_request_failures", lane->send_freshness == nullptr ? 0 : lane->send_freshness->key_unit_request_failures.load()},
+          {"send_idr_recoveries", lane->send_freshness == nullptr ? 0 : lane->send_freshness->idr_recoveries.load()},
+          {"send_idr_recovery_timeouts", lane->send_freshness == nullptr ? 0 : lane->send_freshness->idr_recovery_timeouts.load()},
+          {"send_idr_recovery_last_ms", lane->send_freshness == nullptr ? 0 : lane->send_freshness->idr_recovery_last_ms.load()},
+          {"send_idr_recovery_max_ms", lane->send_freshness == nullptr ? 0 : lane->send_freshness->idr_recovery_max_ms.load()},
           {"last_forwarded_frame_age_ms", lane->send_freshness == nullptr ? Json(nullptr) : Json(lane->send_freshness->last_forwarded_age_ms.load())},
             {"failure_count", lane->failure_count.load()}, {"camera_faulted", lane->camera_faulted.load()},
             {"disabled", lane->disabled.load()}});
       }
+      const auto [ice_samples, ice_dropped] = mock_ice_marker_counters->snapshot();
+      auto ice_streams = Json::array();
+      for (const auto& sample : ice_samples) {
+        ice_streams.push_back({{"ssrc", sample.ssrc}, {"marker_events", sample.count},
+            {"last_marker_age_ms", sample.last_ms > 0 ? Json(std::max<std::int64_t>(0, sampled_at_monotonic_ms - sample.last_ms)) : Json(nullptr)},
+            {"max_marker_gap_ms", sample.max_gap_ms}});
+      }
+      mock_ice_output_markers = {{"streams", std::move(ice_streams)}, {"dropped_sources", ice_dropped}};
     };
     try {
       std::lock_guard lock(control_mutex);
@@ -3374,6 +3457,7 @@ struct VehicleMediaRuntime::Impl {
                {"time_sync", signaling.time_sync_status().to_json()},
                {"readiness_sampled_at_monotonic_ms", sampled_at_monotonic_ms},
                {"critical_lanes", std::move(critical_lanes)},
+               {"mock_ice_output_markers", std::move(mock_ice_output_markers)},
                {"control_snapshot", std::move(control_snapshot)},
                {"soft_brake_request_active", soft_brake_request_active},
                {"soft_brake_applied_this_transition", soft_brake_applied_this_transition},
@@ -3406,27 +3490,51 @@ struct VehicleMediaRuntime::Impl {
     bool ready = true;
     auto cause = ControlRecoveryCause::CriticalVideo;
     const Lane* failed_lane = nullptr;
+    // A negotiated transient hold absorbs stale and IDR-wait video stalls on the
+    // vehicle: only fault-class lane events (invalid samples, disabled or faulted
+    // cameras) reach the recovery latch. Without it every rule below is unchanged.
+    bool hold_mode = false;
+    {
+      std::lock_guard lock(control_mutex);
+      hold_mode = control_service_started && control_service && control_service->transient_hold_enabled();
+    }
     std::vector<ReadinessSampleRevision> revisions;
     for (const auto& lane : lanes) {
-      if (lane->camera.critical_for_control && lane->send_freshness)
+      if (!lane->camera.critical_for_control || !lane->send_freshness) continue;
+      if (hold_mode) {
+        const auto fault = lane->send_freshness->invalid_brake_revision.load();
+        revisions.push_back({"video:" + lane->camera.id, fault, fault});
+      } else {
         revisions.push_back({"video:" + lane->camera.id,
             lane->send_freshness->bad_sample_revision.load(), lane->send_freshness->brake_sample_revision.load()});
+      }
     }
+    bool vehicle_video_stale = false;
     for (const auto& lane : lanes) {
       if (!lane->camera.critical_for_control) continue;
       if (lane->send_freshness) lane->send_freshness->max_age_ms = stale_brake_ms;
-      if (lane->disabled.load() || lane->camera_faulted.load() || !lane->send_freshness ||
-          lane->send_freshness->invalid_sample_blocked.load() ||
-          lane->send_freshness->consecutive_anomalies.load() >= 3 ||
-          !camera_encoded_frame_fresh(lane->send_freshness->last_fresh_frame_ms.load(), now_ms, stale_brake_ms) ||
-          (was_waiting && (lane->send_freshness->consecutive_anomalies.load() != 0 ||
-           lane->send_freshness->fresh_frames.load() < lane->video_wait_encoded_baseline.load() + 3))) {
+      const bool has_freshness = lane->send_freshness != nullptr;
+      const unsigned anomalies = has_freshness ? lane->send_freshness->consecutive_anomalies.load() : 0U;
+      const bool awaiting_recovery = (was_waiting || vehicle_video_hold_active) && has_freshness &&
+          lane->send_freshness->fresh_frames.load() < lane->video_wait_encoded_baseline.load() + 3;
+      const auto lane_state = detail::classify_vehicle_video_lane(lane->disabled.load(), lane->camera_faulted.load(),
+          has_freshness, has_freshness && lane->send_freshness->invalid_sample_blocked.load(),
+          has_freshness && camera_encoded_frame_fresh(lane->send_freshness->last_fresh_frame_ms.load(), now_ms, stale_brake_ms),
+          detail::effective_lane_anomalies(anomalies, hold_mode, was_waiting), awaiting_recovery);
+      if (detail::vehicle_video_lane_blocks_control(lane_state, hold_mode)) {
         ready = false;
         failed_lane = lane.get();
         break;
       }
+      if (lane_state == detail::VehicleVideoLaneState::Stale) vehicle_video_stale = true;
     }
+    // A new stall restarts the "three fresh encoded frames" recovery window.
+    if (hold_mode && vehicle_video_stale && !vehicle_video_hold_active)
+      for (const auto& lane : lanes)
+        lane->video_wait_encoded_baseline = lane->send_freshness ? lane->send_freshness->fresh_frames.load() : 0;
+    vehicle_video_hold_active = hold_mode && vehicle_video_stale;
     bool receive_path_waiting = false;
+    std::vector<Json> transient_events;
     {
       std::lock_guard lock(control_mutex);
       if (control_service_started && control_service) {
@@ -3437,8 +3545,13 @@ struct VehicleMediaRuntime::Impl {
         if (receive_path_waiting && !failed_lane) cause = control_service->control_recovery_cause();
         revisions.push_back({"driver", control_service->recovery_bad_sample_revision(),
             control_service->recovery_brake_revision()});
-        ready = ready && control_service->driver_critical_video_ready();
-        if (!control_service->driver_critical_video_ready()) cause = ControlRecoveryCause::CriticalVideo;
+        // A stale or recovering driver view is transient only under a negotiated hold.
+        const bool driver_video_fault = hold_mode ? control_service->driver_critical_video_fault()
+                                                  : !control_service->driver_critical_video_ready();
+        ready = ready && !driver_video_fault;
+        if (driver_video_fault) cause = ControlRecoveryCause::CriticalVideo;
+        control_service->observe_vehicle_video_transient(vehicle_video_hold_active, signaling.now_ms());
+        transient_events = control_service->drain_transient_hold_events();
         if (was_waiting || receive_path_waiting)
           ready = ready && control_service->recovery_samples_healthy() &&
               control_service->control_timing(signaling.now_ms()).value("consecutive_late_frames", 0) == 0;
@@ -3446,6 +3559,17 @@ struct VehicleMediaRuntime::Impl {
         if (!control_service->driver_control_link_ready()) { ready = false; cause = ControlRecoveryCause::ControlLink; }
         if (!control_service->driver_time_sync_ready()) { ready = false; cause = ControlRecoveryCause::TimeSynchronization; }
       }
+    }
+    // Report hold transitions now: the startup-grace return below must not drop events
+    // that were already drained from the service.
+    for (auto& event : transient_events) {
+      const auto name = event.value("event", std::string("vehicle_transient_hold"));
+      const bool escalated = name == "vehicle_transient_hold_escalated";
+      event["severity"] = escalated ? "warning" : "info";
+      emit_diagnostic(name, name, "transient_hold", "",
+          escalated ? "The link or video did not recover within the hold limit; follow the braking-wait guidance."
+                    : "No action is required.",
+          true, std::move(event));
     }
     const auto time_readiness = vehicle_time_readiness();
     if (config.field_safety.require_time_sync)
@@ -3853,58 +3977,64 @@ struct VehicleMediaRuntime::Impl {
     return pipeline_text.str();
   }
 
-  [[nodiscard]] std::string gstreamer_ice_uri(std::string url) const {
-    const auto separator = url.find(':');
-    if (separator == std::string::npos) return url;
-    auto remainder = url.substr(separator + 1);
-    while (remainder.starts_with("//")) remainder.erase(0, 2);
-    return url.substr(0, separator) + "://" + remainder;
+  static void on_selected_ice_pair(NiceAgent* agent, guint stream, guint component,
+      NiceCandidate* local, NiceCandidate* remote, gpointer data) {
+    if (!local || !remote) return;
+    const auto state = *static_cast<std::shared_ptr<MediaSignalState>*>(data);
+    std::lock_guard lock(state->mutex);
+    auto* self = state->owner;
+    if (!self || !state->peer || self->ice_agent != agent) return;
+    const auto describe = [](NiceCandidate* value) {
+      char address[NICE_ADDRESS_STRING_LEN]{};
+      nice_address_to_string(&value->addr, address);
+      auto result = detail::ice_address_summary(address);
+      result["candidate_type"] = value->type == NICE_CANDIDATE_TYPE_HOST ? "host" :
+          value->type == NICE_CANDIDATE_TYPE_SERVER_REFLEXIVE ? "srflx" :
+          value->type == NICE_CANDIDATE_TYPE_PEER_REFLEXIVE ? "prflx" : "relay";
+      result["protocol"] = value->transport == NICE_CANDIDATE_TRANSPORT_UDP ? "udp" : "tcp";
+      return result;
+    };
+    if (!state->selected_pair.empty()) ++state->selected_pair_changes;
+    state->selected_pair = {{"local", describe(local)}, {"remote", describe(remote)},
+        {"stream", stream}, {"component", component}, {"source", "libnice-new-selected-pair-full"},
+        {"selected_at_monotonic_ms", steady_now_ms()}};
+    self->emit_diagnostic("vehicle_ice_selected_pair", "ice_pair_selected", "ice_connectivity", "",
+        "Inspect candidate generation separately from selected path; this event is not a latency measurement.", true,
+        {{"media_negotiation_id", state->negotiation_id}, {"pair", state->selected_pair}, {"changes", state->selected_pair_changes}});
   }
 
-  [[nodiscard]] std::string gstreamer_turn_uri(
-      std::string url,
-      std::string_view username,
-      std::string_view credential) const {
-    const auto separator = url.find(':');
-    if (separator == std::string::npos) throw std::invalid_argument("TURN URL has no scheme");
-    auto remainder = url.substr(separator + 1);
-    while (remainder.starts_with("//")) remainder.erase(0, 2);
-    return url.substr(0, separator) + "://" + signaling.url_encode(username) + ":" +
-        signaling.url_encode(credential) + "@" + remainder;
+  // Diagnostic only: the selected pair is never required to stream media.
+  // Upstream documents the libnice "agent" property as unsafe to rely on, so
+  // its absence must not fail the pipeline.
+  bool observe_ice_agent() {
+    GObject* ice = nullptr;
+    g_object_get(webrtc, "ice-agent", &ice, nullptr);
+    if (ice) {
+      if (g_object_class_find_property(G_OBJECT_GET_CLASS(ice), "agent")) g_object_get(ice, "agent", &ice_agent, nullptr);
+      g_object_unref(ice);
+    }
+    if (!ice_agent) {
+      std::string negotiation;
+      { std::lock_guard lock(media_signal_state->mutex); negotiation = media_signal_state->negotiation_id; }
+      emit_diagnostic("vehicle_ice_selected_pair_unavailable", "ice_selected_pair_unavailable", "ice_connectivity", "",
+          "Media continues; selected-pair diagnostics are unavailable on this GStreamer build.", true,
+          {{"media_negotiation_id", negotiation}});
+      return false;
+    }
+    auto* state = new std::shared_ptr<MediaSignalState>(media_signal_state);
+    g_signal_connect_data(ice_agent, "new-selected-pair-full", G_CALLBACK(on_selected_ice_pair), state,
+        +[](gpointer data, GClosure*) { delete static_cast<std::shared_ptr<MediaSignalState>*>(data); }, static_cast<GConnectFlags>(0));
+    return true;
   }
 
   void configure_ice_servers() {
-    bool stun_configured = false;
-    bool turn_configured = false;
-    for (const auto& server : ice_configuration.value("ice_servers", Json::array())) {
-      if (!server.is_object()) continue;
-      Json urls = server.value("urls", Json::array());
-      if (urls.is_string()) urls = Json::array({urls});
-      if (!urls.is_array()) continue;
-      for (const auto& value : urls) {
-        if (!value.is_string()) continue;
-        const auto url = value.get<std::string>();
-        if (!stun_configured && (url.starts_with("stun:") || url.starts_with("stuns:"))) {
-          const auto configured = gstreamer_ice_uri(url);
-          g_object_set(webrtc, "stun-server", configured.c_str(), nullptr);
-          stun_configured = true;
-        }
-        if (url.starts_with("turn:") || url.starts_with("turns:")) {
-          const auto username = server.value("username", "");
-          const auto credential = server.value("credential", "");
-          if (username.empty() || credential.empty()) throw std::runtime_error("TURN ICE server lacks credentials");
-          const auto configured = gstreamer_turn_uri(url, username, credential);
-          if (!turn_configured) {
-            g_object_set(webrtc, "turn-server", configured.c_str(), nullptr);
-            turn_configured = true;
-          } else {
-            gboolean added = FALSE;
-            g_signal_emit_by_name(webrtc, "add-turn-server", configured.c_str(), &added);
-            if (!added) throw std::runtime_error("webrtcbin rejected an additional TURN server");
-          }
-        }
-      }
-    }
+    const auto applied = detail::configure_webrtc_ice_servers(webrtc,
+        ice_configuration.value("ice_servers", Json::array()), ice_route_policy->mode() != "direct");
+    emit_diagnostic("vehicle_ice_configuration", "ice_configuration_applied", "ice_configuration", "",
+        "ICE servers originate from authenticated signaling, not vehicle YAML ice keys.", true,
+        {{"source", "authenticated_signaling"}, {"route_mode", ice_route_policy->mode()},
+         {"stun_applied", applied.at("stun_applied")}, {"turn_available", detail::ice_has_turn(ice_configuration)}, {"turn_applied", applied.at("turn_applied")},
+         {"address_families", {"ipv4", "ipv6"}}, {"direct_timeout_ms", config.cloud.ice_direct_timeout_ms}});
   }
 
   void prepare_lanes() {
@@ -4040,6 +4170,10 @@ struct VehicleMediaRuntime::Impl {
       pipeline = gst_pipeline_new(nullptr);
       gst_bin_add(GST_BIN(pipeline), transport);
     }
+    mock_ice_marker_counters->clear();
+    if (isolated_mock_trace()) {
+      detail::install_ice_output_marker_probe(pipeline, mock_ice_marker_counters);
+    }
     webrtc = gst_bin_get_by_name(GST_BIN(pipeline), "webrtc");
     if (webrtc == nullptr) {
       set_pipeline_error(
@@ -4052,6 +4186,8 @@ struct VehicleMediaRuntime::Impl {
       return false;
     }
     media_signal_state->begin_attempt(this, webrtc, signaling.session_id());
+    media_signal_state->ice_route_mode = ice_route_policy->mode();
+    ice_route_policy->begin_attempt();
     const auto connect_media_signal = [&](const char* name, GCallback callback) {
       auto* state = new std::shared_ptr<MediaSignalState>(media_signal_state);
       g_signal_connect_data(webrtc, name, callback, state,
@@ -4062,6 +4198,7 @@ struct VehicleMediaRuntime::Impl {
     connect_media_signal("on-ice-candidate", G_CALLBACK(on_ice_candidate));
     try {
       configure_ice_servers();
+      observe_ice_agent();
     } catch (const std::exception& error) {
       set_pipeline_error(
           "ICE server configuration failed: " + std::string(error.what()),
@@ -4121,6 +4258,25 @@ struct VehicleMediaRuntime::Impl {
         return false;
       }
       isolate_bundled_rtp_lane_eos(rtp_src_pad, stop_requested);
+      lane->mock_rtp_output_events.store(0, std::memory_order_relaxed);
+      lane->mock_last_rtp_output_steady_ms.store(0, std::memory_order_relaxed);
+      lane->mock_rtp_output_max_gap_ms.store(0, std::memory_order_relaxed);
+      if (isolated_mock_trace()) {
+        gst_pad_add_probe(rtp_src_pad, static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
+            +[](GstPad*, GstPadProbeInfo*, gpointer data) -> GstPadProbeReturn {
+              auto* current = static_cast<Lane*>(data);
+              current->mock_rtp_output_events.fetch_add(1, std::memory_order_relaxed);
+              const auto now = steady_now_ms();
+              const auto previous = current->mock_last_rtp_output_steady_ms.exchange(now, std::memory_order_relaxed);
+              if (previous > 0 && now >= previous) {
+                const auto gap = now - previous;
+                auto maximum = current->mock_rtp_output_max_gap_ms.load(std::memory_order_relaxed);
+                while (gap > maximum && !current->mock_rtp_output_max_gap_ms.compare_exchange_weak(
+                           maximum, gap, std::memory_order_relaxed)) {}
+              }
+              return GST_PAD_PROBE_OK;
+            }, lane.get(), nullptr);
+      }
       gst_object_unref(rtp_src_pad);
       g_signal_connect(lane->send_queue, "overrun", G_CALLBACK(+[](GstElement*, gpointer data) {
         ++static_cast<Lane*>(data)->encoded_queue_backpressure;
@@ -4523,6 +4679,7 @@ struct VehicleMediaRuntime::Impl {
         gst_object_unref(lane->record_tap); lane->record_tap = nullptr;
       }
     }
+    if (ice_agent != nullptr) { g_object_unref(ice_agent); ice_agent = nullptr; }
     if (webrtc != nullptr) {
       gst_object_unref(webrtc);
       webrtc = nullptr;
@@ -4585,9 +4742,11 @@ struct VehicleMediaRuntime::Impl {
     if (candidate.empty()) return;
     if (candidate.size() > 8192) throw std::runtime_error("WebRTC ICE candidate exceeds limit");
     GstElement* source = nullptr;
+    std::string negotiation;
     {
       std::lock_guard lock(media_signal_state->mutex);
       auto& state = *media_signal_state;
+      if (state.ice_route_mode == "direct" && detail::ice_candidate_summary(candidate)["candidate_type"] == "relay") return;
       if (state.peer == nullptr || state.negotiation_id.empty()) return;
       const auto id = payload.value("media_negotiation_id", "");
       if (!id.empty() && id != state.negotiation_id) return;
@@ -4603,20 +4762,28 @@ struct VehicleMediaRuntime::Impl {
         if (std::find(state.remote_ufrags.begin(), state.remote_ufrags.end(), ufrag) == state.remote_ufrags.end()) return;
       } else if (id.empty() && (state.attempt_count != 1 || state.offer_count != 1)) return;
       source = GST_ELEMENT(gst_object_ref(state.peer));
+      negotiation = state.negotiation_id;
     }
     MediaPeerReference reference{source};
     const auto index = payload.value("sdpMLineIndex", 0U);
     g_signal_emit_by_name(source, "add-ice-candidate", index, candidate.c_str());
+    std::lock_guard lock(media_signal_state->mutex);
+    if (media_signal_state->peer != source || media_signal_state->negotiation_id != negotiation) return;
     const auto count = ++remote_ice_candidate_count;
-    if (count == 1) emit_diagnostic("vehicle_webrtc_remote_ice_candidate_received",
+    auto summary = detail::ice_candidate_summary(candidate);
+    summary.update({{"candidate_count", count}, {"sdp_mline_index", index}, {"media_negotiation_id", negotiation}});
+    if (count <= 64) emit_diagnostic("vehicle_webrtc_remote_ice_candidate_received",
         "webrtc_remote_ice_candidate_available", "ice_connectivity", "",
         "No action is required; this is a connectivity milestone.", true,
-        {{"candidate_count", count}, {"sdp_mline_index", index}});
+        std::move(summary));
   }
 
   Json media_scope_status() const {
     std::lock_guard lock(media_signal_state->mutex);
     return {{"id", media_signal_state->negotiation_id},
+        {"ice_route_mode", media_signal_state->ice_route_mode},
+        {"selected_pair", media_signal_state->selected_pair},
+        {"selected_pair_changes", media_signal_state->selected_pair_changes},
         {"answer_apply_pending", media_signal_state->answer_apply_pending},
         {"answer_applied", media_signal_state->answer_applied},
         {"issue_code", media_signal_state->compatibility_issue},
@@ -4632,7 +4799,7 @@ struct VehicleMediaRuntime::Impl {
       if (type == "control_management") { process_control_management(message, payload); continue; }
       if (type == "webrtc_answer") {
         GstElement* source = nullptr;
-        std::string negotiation_id;
+        std::string negotiation_id, route_mode;
         {
           std::lock_guard lock(media_signal_state->mutex);
           if (media_signal_state->peer == nullptr || media_signal_state->negotiation_id.empty()) continue;
@@ -4653,9 +4820,10 @@ struct VehicleMediaRuntime::Impl {
           }
           source = GST_ELEMENT(gst_object_ref(media_signal_state->peer));
           negotiation_id = media_signal_state->negotiation_id;
+          route_mode = media_signal_state->ice_route_mode;
         }
         MediaPeerReference reference{source};
-        const auto sdp_text = payload.value("sdp", "");
+        const auto sdp_text = route_mode == "direct" ? detail::ice_direct_sdp(payload.value("sdp", "")) : payload.value("sdp", "");
         GstSDPMessage* sdp = nullptr;
         if (gst_sdp_message_new(&sdp) != GST_SDP_OK ||
             gst_sdp_message_parse_buffer(
@@ -4835,6 +5003,10 @@ struct VehicleMediaRuntime::Impl {
           {"send_dependent_access_units_dropped", lane->send_freshness == nullptr ? 0 : lane->send_freshness->dropped_waiting_idr.load()},
           {"send_key_unit_requests", lane->send_freshness == nullptr ? 0 : lane->send_freshness->key_unit_requests.load()},
           {"send_key_unit_request_failures", lane->send_freshness == nullptr ? 0 : lane->send_freshness->key_unit_request_failures.load()},
+          {"send_idr_recoveries", lane->send_freshness == nullptr ? 0 : lane->send_freshness->idr_recoveries.load()},
+          {"send_idr_recovery_timeouts", lane->send_freshness == nullptr ? 0 : lane->send_freshness->idr_recovery_timeouts.load()},
+          {"send_idr_recovery_last_ms", lane->send_freshness == nullptr ? 0 : lane->send_freshness->idr_recovery_last_ms.load()},
+          {"send_idr_recovery_max_ms", lane->send_freshness == nullptr ? 0 : lane->send_freshness->idr_recovery_max_ms.load()},
           {"last_forwarded_frame_age_ms", lane->send_freshness == nullptr ? Json(nullptr) : Json(lane->send_freshness->last_forwarded_age_ms.load())},
           {"failure_count", lane->failure_count.load()},
           {"reopen_count", lane->reopen_count.load()},
@@ -4844,6 +5016,8 @@ struct VehicleMediaRuntime::Impl {
                                            : static_cast<double>(lane->encode_latency_total_ms.load()) /
                                                  static_cast<double>(lane->encode_latency_samples.load())},
           {"capture_to_encoded_max_ms", lane->encode_latency_max_ms.load()},
+          {"capture_to_encoded_distribution", lane->capture_to_encoded_latency.json()},
+          {"send_idr_recovery_distribution", lane->send_freshness == nullptr ? Json(nullptr) : lane->send_freshness->idr_recovery_latency.json()},
           {"capture_to_encoded_valid", lane->encode_latency_current_valid.load()},
           {"capture_to_encoded_samples", lane->encode_latency_samples.load()},
           {"capture_to_encoded_invalid_samples", lane->encode_latency_invalid_samples.load()},
@@ -5000,6 +5174,8 @@ struct VehicleMediaRuntime::Impl {
           true);
       throw;
     }
+    ice_route_policy = std::make_unique<detail::IceRoutePolicy>(config.cloud.ice_direct_timeout_ms,
+        detail::ice_has_turn(ice_configuration), config.cloud.ice_transport_policy == "relay");
     std::vector<VideoCodec> codecs;
     try {
       if (!config.runtime.mock_control_diagnostic) codecs = negotiate_codecs(3000);
@@ -5037,11 +5213,13 @@ struct VehicleMediaRuntime::Impl {
     std::int64_t total_started_ms = signaling.now_ms();
     EncoderCandidate successful = candidates.front();
 
-    for (std::size_t candidate_index = 0; candidate_index < candidates.size(); ++candidate_index) {
+    for (std::size_t candidate_index = 0; candidate_index < candidates.size();) {
       check_stop();
       answer_received = false;
       simulated_failure_fired = false;
       codec_fallback_requested = false;
+      bool route_retry = false;
+      bool peer_connected = false;
       const auto candidate = candidates[candidate_index];
       const auto attempt_started = signaling.now_ms();
       if (!start_pipeline(candidate, capture_interval_ms)) {
@@ -5056,6 +5234,7 @@ struct VehicleMediaRuntime::Impl {
         errors.push_back(error);
         stop_pipeline();
         if (candidate_index + 1 < candidates.size()) ++failover_count;
+        ++candidate_index;
         continue;
       }
       const auto deadline = duration_ms > 0 ? total_started_ms + duration_ms : std::numeric_limits<std::int64_t>::max();
@@ -5096,6 +5275,26 @@ struct VehicleMediaRuntime::Impl {
         }
         poll_bus();
         if (!current_pipeline_error().empty()) break;
+        GstWebRTCPeerConnectionState peer_state = GST_WEBRTC_PEER_CONNECTION_STATE_NEW;
+        g_object_get(webrtc, "connection-state", &peer_state, nullptr);
+        if (!peer_connected && peer_state == GST_WEBRTC_PEER_CONNECTION_STATE_CONNECTED) {
+          peer_connected = true;
+          emit_diagnostic("vehicle_ice_connected", "ice_connection_established", "ice_connectivity", "",
+              "Peer connected; this does not establish video freshness or control readiness.", true,
+              {{"media_negotiation", media_scope_status()}, {"attempt_elapsed_ms", signaling.now_ms() - attempt_started}});
+        }
+        bool answer_ready = false;
+        {
+          std::lock_guard lock(media_signal_state->mutex);
+          answer_ready = media_signal_state->answer_applied;
+        }
+        if (ice_route_policy->allow_relay_retry(steady_now_ms(), answer_ready,
+              peer_state == GST_WEBRTC_PEER_CONNECTION_STATE_CONNECTED, peer_state == GST_WEBRTC_PEER_CONNECTION_STATE_FAILED)) {
+          route_retry = true;
+          set_pipeline_error("direct ICE attempt failed or exceeded its connection budget", "ice_direct_fallback",
+              "ice_connectivity", "Starting a fresh media negotiation with configured TURN servers; control remains gated.", true);
+          break;
+        }
         enforce_control_recovery();
         start_control_when_cameras_ready();
         // The independent native-control watchdog thread owns the VCU tick;
@@ -5192,6 +5391,8 @@ struct VehicleMediaRuntime::Impl {
           {"passed", passed},
           {"answer_received", answer_received},
           {"answer_applied", answer_applied},
+          {"peer_connected_observed", peer_connected},
+          {"media_negotiation", media_scope_status()},
           {"duration_ms", elapsed},
           {"lanes", final_lanes},
           {"failure", current_pipeline_failure()},
@@ -5207,12 +5408,29 @@ struct VehicleMediaRuntime::Impl {
         break;
       }
       errors.push_back(error);
+      if (route_retry) {
+        // A connected direct path can outlive the original short-lived TURN
+        // credentials. Fetch again only after the control-safe teardown. A
+        // transient signaling failure keeps the previous list rather than
+        // ending the runtime; a stop request still propagates.
+        auto [refreshed_ice, ice_refreshed] = detail::refresh_ice_configuration(
+            [this] { return signaling.ice_servers(); }, check_stop, ice_configuration);
+        if (!ice_refreshed)
+          emit_diagnostic("vehicle_ice_refresh_fallback", "ice_refresh_failed", "ice_configuration", "",
+              "Retrying with the previous ICE list; TURN credentials may be expired.", true);
+        ice_configuration = std::move(refreshed_ice);
+        emit_diagnostic("vehicle_ice_relay_fallback", "ice_direct_fallback", "ice_connectivity", "",
+            "A new Peer/negotiation is required; prior control readiness is not restored.", true,
+            {{"fallback_count", ice_route_policy->fallbacks()}, {"next_mode", ice_route_policy->mode()}, {"safety_action", "control_closed_before_retry"}});
+        continue; // Retry the same encoder, after stop_pipeline closed control.
+      }
       if (codec_fallback_requested) {
         while (candidate_index + 1 < candidates.size() && candidates[candidate_index + 1].codec == candidate.codec) {
           ++candidate_index;
         }
       }
       if (candidate_index + 1 < candidates.size()) ++failover_count;
+      ++candidate_index;
     }
 
     const auto total_elapsed = std::max<std::int64_t>(1, signaling.now_ms() - total_started_ms);
@@ -5380,8 +5598,11 @@ struct VehicleMediaRuntime::Impl {
   bool recording_session_incomplete{false};
   std::optional<std::string> forced_codec;
   int simulate_primary_failure_after_frames;
+  std::unique_ptr<detail::IceRoutePolicy> ice_route_policy;
+  NiceAgent* ice_agent{nullptr};
   GstElement* pipeline{nullptr};
   GstElement* webrtc{nullptr};
+  const std::shared_ptr<detail::RtpMarkerCounters> mock_ice_marker_counters = std::make_shared<detail::RtpMarkerCounters>();
   detail::ControlTransportFence control_transport_fence;
   detail::DirectAuthorityLease direct_authority;
   bool direct_authority_stop_failed{false}; // control_mutex; terminal until new runtime/session setup
@@ -5434,6 +5655,7 @@ struct VehicleMediaRuntime::Impl {
   std::mutex control_mutex;
   // Acquired before control_mutex; no control handler takes this mutex.
   std::mutex control_recovery_phase_mutex;
+  bool vehicle_video_hold_active{false};  // Only accessed under control_recovery_phase_mutex.
   std::unique_ptr<VehicleControlService> control_service;
   // Guarded by control_mutex. Stale-safe heartbeats may only preserve this
   // accepted fresh gear; ESTOP freezes its gear for the pipeline lifetime.
@@ -5497,6 +5719,7 @@ struct VehicleMediaRuntime::Impl {
   std::atomic<std::int64_t> native_control_transport_last_error_log_monotonic_ms{0};
   std::optional<std::int64_t> last_vcu_status_ms;
   std::uint64_t last_vehicle_telemetry_seq{0};
+  std::int64_t last_mock_telemetry_trace_ms{0};
   std::string control_status_session_id;
   std::uint64_t control_status_seq{0};
   std::uint64_t last_control_rejection_status_seq{0};

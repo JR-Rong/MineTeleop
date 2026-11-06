@@ -1,0 +1,654 @@
+{
+  "schema": "mac-receiver-ab-evidence-v1",
+  "created_at_utc": "2026-10-27T14:48:23.074416+00:00",
+  "source_base_commit": "55367bcab28e7ebcd4988b059dc574a57df1d62e",
+  "target_base_branch": "rjr/cx/orin-isx031-cpu",
+  "source_file_sha256": {
+    "cpp/tests/native_receiver_probe.cpp": "cce08413916b8895fca3aaac1692d49cb66beb7096e82663cd404de589f070db",
+    "scripts/test/receiver_ab_browser.js": "dec9b1bbca49023a963975e24a5a582c84aa9d8159f537df5074ef27963ebcdf",
+    "scripts/test/receiver_ab_analyze.py": "75bd78d769b89b967759211530c5615d3d5237dc937470157f980406d334bcda"
+  },
+  "measured_native_binary_sha256": "890e21d4f16c71d22ad1a3b7c880ee196dbcb3683d8371f77a64c151b2e496d6",
+  "final_validated_native_binary_sha256": "2e929883c3e1795e5ed6b884100a2a314db4b54d2a2e3db38b62c9c2d5603861",
+  "post_measurement_native_changes": [
+    "stricter loopback origin/port validation",
+    "scope description distinguishes GL draw from scan-out"
+  ],
+  "sender_binary_sha256": "e50d6c384bf6f6a58be49db8956fb63d02bef30cd35c6e90e8f17e19307103d6",
+  "sender_config_sha256": "2d18249c7b5440565e4ab775da26fc690f7eae0ace2e06c50135720ff7076966",
+  "environment": {
+    "receiver": "Mac mini M4, 16 GB, arm64",
+    "macos": "26.5.2",
+    "chrome": "156.0.8078.48",
+    "native_gstreamer": "1.28.8",
+    "native_libnice": "0.1.24",
+    "native_decoder": "vtdec_hw hardware only",
+    "chromium_renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M4, Version 26.5.2 (Build 25F84))",
+    "chromium_features": {
+      "2d_canvas": "enabled",
+      "direct_rendering_display_compositor": "disabled_off_ok",
+      "gpu_compositing": "enabled",
+      "multiple_raster_threads": "enabled_on",
+      "opengl": "enabled_on",
+      "rasterization": "enabled",
+      "raw_draw": "disabled_off_ok",
+      "skia_graphite": "enabled_on",
+      "trees_in_viz": "disabled_off",
+      "video_decode": "enabled",
+      "video_encode": "enabled",
+      "webgl": "enabled",
+      "webgpu": "enabled",
+      "webnn": "disabled_off"
+    },
+    "browser_actual_decoder_implementation": null,
+    "display_mode_hz": 180,
+    "post_run_raf": {
+      "mean_ms": 22.222500000000583,
+      "p50_ms": 22.199999999953434,
+      "p95_ms": 23.300000000046566,
+      "max_ms": 23.5
+    },
+    "sender": "Jetson Orin, R36.5.0, GStreamer 1.20.3",
+    "video": "2x ISX031 -> 960x768/30fps/2500kbps H264 x264 CPU",
+    "native_jitter_target_ms": 30,
+    "browser_jitter": "default adaptive",
+    "control_enabled": false,
+    "adapter": "mock",
+    "max_speed_kph": 0,
+    "recording": false,
+    "upload": false,
+    "transport": "WebRTC DTLS/SRTP, UDP over gbe1 LAN; loopback signaling forwarded via SSH",
+    "turn": false,
+    "power_or_clock_settings_changed": false,
+    "mac_system_disk_free_mb_observed": [
+      113,
+      172
+    ],
+    "mac_swap_used_mb_observed": 18026.81
+  },
+  "analysis_window": {
+    "start_s": 10,
+    "end_s": 50,
+    "requested_run_s": 60,
+    "raw_startup_and_teardown_retained": true
+  },
+  "trials": [
+    {
+      "name": "native-B1",
+      "analysis": {
+        "kind": "native",
+        "seconds": 39.08518904209137,
+        "passed": true,
+        "tracks": [
+          {
+            "pad": "src_0",
+            "decoded_fps": 29.98578307342603,
+            "decoded_frames": 1172,
+            "decode_gap_mean_ms": 33.33380574042644,
+            "decode_gap_stddev_ms": 3.1891186478819082,
+            "decode_gap": {
+              "count": 1199,
+              "mean_ms": 33.33380574042644,
+              "stddev_ms": 3.1891186478819082,
+              "p95_ms": 39.08958339691162,
+              "p99_ms": 41.79762554168701,
+              "max_ms": 45.157249450683594
+            },
+            "depay_to_decode_mean_ms": 1.4018937638188385,
+            "draw_fps": 29.99958659861839,
+            "draw_gap": {
+              "count": 1199,
+              "mean_ms": 33.33379267453153,
+              "stddev_ms": 3.1874745447794974,
+              "p95_ms": 39.191917419433594,
+              "p99_ms": 41.79633331298828,
+              "max_ms": 45.34137535095215
+            },
+            "decode_to_draw": {
+              "count": 1200,
+              "mean_ms": 0.6461669810612997,
+              "stddev_ms": 0.27204081093014065,
+              "p95_ms": 1.0654573440551758,
+              "p99_ms": 1.3145408630371094,
+              "max_ms": 2.044750213623047
+            },
+            "whole_run_rtp_frames": 1744,
+            "whole_run_decoded_frames": 1744,
+            "duplicate_pts": 0
+          },
+          {
+            "pad": "src_1",
+            "decoded_fps": 29.98578307342603,
+            "decoded_frames": 1172,
+            "decode_gap_mean_ms": 33.33255834794223,
+            "decode_gap_stddev_ms": 3.1306632987113066,
+            "decode_gap": {
+              "count": 1199,
+              "mean_ms": 33.33255834794223,
+              "stddev_ms": 3.1306632987113066,
+              "p95_ms": 38.513084411621094,
+              "p99_ms": 41.22591686248779,
+              "max_ms": 44.98775005340576
+            },
+            "depay_to_decode_mean_ms": 1.4100609313912766,
+            "draw_fps": 30.000895742398992,
+            "draw_gap": {
+              "count": 1199,
+              "mean_ms": 33.33233809371706,
+              "stddev_ms": 3.123900168922698,
+              "p95_ms": 38.513916969299316,
+              "p99_ms": 41.35720920562744,
+              "max_ms": 44.899166107177734
+            },
+            "decode_to_draw": {
+              "count": 1200,
+              "mean_ms": 0.6471230538686117,
+              "stddev_ms": 0.26156167687825443,
+              "p95_ms": 1.0439996719360352,
+              "p99_ms": 1.2904167175292969,
+              "max_ms": 2.1482906341552734
+            },
+            "whole_run_rtp_frames": 1744,
+            "whole_run_decoded_frames": 1744,
+            "duplicate_pts": 0
+          }
+        ],
+        "selected_pair": {
+          "component": 1,
+          "local_address": "fe80::1092:9eac:9477:7044",
+          "local_transport": "udp",
+          "local_type": "host",
+          "remote_address": "fe80::4ebb:47ff:fe24:fd56",
+          "remote_transport": "udp",
+          "remote_type": "host",
+          "source": "libnice-new-selected-pair-full",
+          "stream": 1
+        },
+        "packet_loss": [
+          0,
+          0
+        ],
+        "jitterbuffer": [
+          {
+            "avg-jitter": 363389,
+            "num-duplicates": 0,
+            "num-late": 0,
+            "num-lost": 0,
+            "num-pushed": 17899,
+            "rfc7273-active": false,
+            "rtx-count": 0,
+            "rtx-per-packet": 0.0,
+            "rtx-rtt": 0,
+            "rtx-success-count": 0
+          },
+          {
+            "avg-jitter": 363389,
+            "num-duplicates": 0,
+            "num-late": 0,
+            "num-lost": 0,
+            "num-pushed": 17899,
+            "rfc7273-active": false,
+            "rtx-count": 0,
+            "rtx-per-packet": 0.0,
+            "rtx-rtt": 0,
+            "rtx-success-count": 0
+          }
+        ],
+        "note": "GL draw callback is not scan-out; depay-to-decode includes parsing and differs from browser decodeTime"
+      },
+      "monitor": {
+        "run": "native-B1",
+        "started_at": 1793110873.9420638,
+        "conflicts": [],
+        "ended_at": 1793111003.795683,
+        "exit_codes": [
+          0,
+          143,
+          -15
+        ],
+        "can_after": "can0             DOWN           <NOARP,ECHO>"
+      },
+      "report_sha256": "6779abcc029a5eeb5ad7994de251fd283a000d144114df009ec8e405742f54a6",
+      "resource_log_sha256": "95723c87a3313c2537f87b35b49d3c0ce77696e51f2a72de70c702b02269bf7c"
+    },
+    {
+      "name": "browser-A2",
+      "analysis": {
+        "kind": "browser",
+        "seconds": 40.00060000038147,
+        "tracks": [
+          {
+            "mid": "video0",
+            "decoded_fps": 29.999550006463807,
+            "decoded_frames": 1200,
+            "decode_gap_mean_ms": 33.344166666666666,
+            "decode_gap_stddev_ms": 4.6625153410509155,
+            "decode_mean_ms": 0.8181541666666665,
+            "jitter_buffer_mean_ms": 4.803390833333332,
+            "jitter_target_mean_ms": 13.924113333333331,
+            "dropped_delta": 0,
+            "lost_delta": 0,
+            "freeze_delta": 0,
+            "decoder_implementation": null,
+            "hardware_decoder": null
+          },
+          {
+            "mid": "video1",
+            "decoded_fps": 29.999550006463807,
+            "decoded_frames": 1200,
+            "decode_gap_mean_ms": 33.343333333333334,
+            "decode_gap_stddev_ms": 4.71138219869721,
+            "decode_mean_ms": 0.7770941666666665,
+            "jitter_buffer_mean_ms": 5.619308333333333,
+            "jitter_target_mean_ms": 15.146838333333335,
+            "dropped_delta": 0,
+            "lost_delta": 0,
+            "freeze_delta": 0,
+            "decoder_implementation": null,
+            "hardware_decoder": null
+          }
+        ],
+        "display": [
+          {
+            "presented_counter_fps": 29.966750937713766,
+            "callback_count": 947,
+            "callback_coverage": 0.7909698996655519,
+            "observed_presentation_gap_ms": {
+              "count": 946,
+              "mean_ms": 42.18911205073995,
+              "stddev_ms": 17.286879193041408,
+              "p95_ms": 66.80000000001746,
+              "p99_ms": 67.29999999998836,
+              "max_ms": 89.10000000000582
+            },
+            "receive_to_presentation_ms": {
+              "count": 947,
+              "mean_ms": 23.71351636747647,
+              "stddev_ms": 8.676245775118437,
+              "p95_ms": 39.79999999998836,
+              "p99_ms": 41.0,
+              "max_ms": 42.40000000002328
+            },
+            "note": "RVFC can skip frames; gaps are observations, not proof of dropped frames"
+          },
+          {
+            "presented_counter_fps": 29.924899770367073,
+            "callback_count": 1045,
+            "callback_coverage": 0.8736401673640167,
+            "observed_presentation_gap_ms": {
+              "count": 1044,
+              "mean_ms": 38.250287356321856,
+              "stddev_ms": 15.18405123130253,
+              "p95_ms": 66.70000000001164,
+              "p99_ms": 67.29999999998836,
+              "max_ms": 67.5
+            },
+            "receive_to_presentation_ms": {
+              "count": 1045,
+              "mean_ms": 24.04641148325448,
+              "stddev_ms": 9.353232895178852,
+              "p95_ms": 39.90000000002328,
+              "p99_ms": 47.89999999999418,
+              "max_ms": 52.0
+            },
+            "note": "RVFC can skip frames; gaps are observations, not proof of dropped frames"
+          }
+        ],
+        "selected_pair": {
+          "id": "CPI8U/M6hc_2mnQGzCh",
+          "selection_method": "transport",
+          "state": "succeeded",
+          "nominated": true,
+          "transport_id": "Tvideo01",
+          "local_candidate_type": "prflx",
+          "remote_candidate_type": "host",
+          "protocol": "udp",
+          "relay_protocol": null,
+          "current_round_trip_time_s": 0.001,
+          "available_outgoing_bitrate_bps": 300000,
+          "bytes_sent": 22744,
+          "bytes_received": 33080855,
+          "requests_sent": 25,
+          "responses_received": 25
+        },
+        "visibility": [
+          {
+            "at": 130237.89999961853,
+            "hidden": false,
+            "focused": true
+          },
+          {
+            "at": 190239.69999980927,
+            "hidden": false,
+            "focused": true
+          }
+        ],
+        "long_tasks": 0,
+        "errors": []
+      },
+      "monitor": {
+        "run": "browser-A2",
+        "started_at": 1793111043.5067563,
+        "conflicts": [],
+        "ended_at": 1793111208.3736832,
+        "exit_codes": [
+          0,
+          143,
+          -15
+        ],
+        "can_after": "can0             DOWN           <NOARP,ECHO>"
+      },
+      "report_sha256": "9da53a1bfe02afc027104c89b40196df567a1db022d2e5dc895aa734274a6e8d",
+      "resource_log_sha256": "a58151cda872c20b7de3bf7d0e84a96a23d61b748b7805160a4ca126ff1aa2ad"
+    },
+    {
+      "name": "native-B2",
+      "analysis": {
+        "kind": "native",
+        "seconds": 40.10397829151154,
+        "passed": true,
+        "tracks": [
+          {
+            "pad": "src_0",
+            "decoded_fps": 29.99702401730625,
+            "decoded_frames": 1203,
+            "decode_gap_mean_ms": 33.33476886956069,
+            "decode_gap_stddev_ms": 3.2283843215990506,
+            "decode_gap": {
+              "count": 1199,
+              "mean_ms": 33.33476886956069,
+              "stddev_ms": 3.2283843215990506,
+              "p95_ms": 39.28033447265625,
+              "p99_ms": 42.31208324432373,
+              "max_ms": 44.61954116821289
+            },
+            "depay_to_decode_mean_ms": 1.6706476798180432,
+            "draw_fps": 29.998495165485856,
+            "draw_gap": {
+              "count": 1199,
+              "mean_ms": 33.335005455557955,
+              "stddev_ms": 3.2302328344758973,
+              "p95_ms": 39.22858238220215,
+              "p99_ms": 42.261542320251465,
+              "max_ms": 44.90950012207031
+            },
+            "decode_to_draw": {
+              "count": 1200,
+              "mean_ms": 0.6998458663622539,
+              "stddev_ms": 0.26657711027821795,
+              "p95_ms": 1.0911245346069336,
+              "p99_ms": 1.3907499313354492,
+              "max_ms": 3.459000587463379
+            },
+            "whole_run_rtp_frames": 1743,
+            "whole_run_decoded_frames": 1743,
+            "duplicate_pts": 0
+          },
+          {
+            "pad": "src_1",
+            "decoded_fps": 29.99702401730625,
+            "decoded_frames": 1203,
+            "decode_gap_mean_ms": 33.33459174304927,
+            "decode_gap_stddev_ms": 3.246685037601802,
+            "decode_gap": {
+              "count": 1199,
+              "mean_ms": 33.33459174304927,
+              "stddev_ms": 3.246685037601802,
+              "p95_ms": 39.017958641052246,
+              "p99_ms": 41.493791580200195,
+              "max_ms": 44.73254203796387
+            },
+            "depay_to_decode_mean_ms": 1.6143988500707662,
+            "draw_fps": 29.99849206901988,
+            "draw_gap": {
+              "count": 1199,
+              "mean_ms": 33.33500889642125,
+              "stddev_ms": 3.2733782790847825,
+              "p95_ms": 39.09991645812988,
+              "p99_ms": 41.71891689300537,
+              "max_ms": 44.38099956512451
+            },
+            "decode_to_draw": {
+              "count": 1200,
+              "mean_ms": 0.685885755221049,
+              "stddev_ms": 0.2842982747105654,
+              "p95_ms": 1.0813751220703125,
+              "p99_ms": 1.3924999237060547,
+              "max_ms": 4.907083511352539
+            },
+            "whole_run_rtp_frames": 1743,
+            "whole_run_decoded_frames": 1743,
+            "duplicate_pts": 0
+          }
+        ],
+        "selected_pair": {
+          "component": 1,
+          "local_address": "192.168.2.1",
+          "local_transport": "udp",
+          "local_type": "host",
+          "remote_address": "192.168.2.2",
+          "remote_transport": "udp",
+          "remote_type": "host",
+          "source": "libnice-new-selected-pair-full",
+          "stream": 1
+        },
+        "packet_loss": [
+          0,
+          0
+        ],
+        "jitterbuffer": [
+          {
+            "avg-jitter": 179044,
+            "num-duplicates": 0,
+            "num-late": 0,
+            "num-lost": 0,
+            "num-pushed": 17380,
+            "rfc7273-active": false,
+            "rtx-count": 0,
+            "rtx-per-packet": 0.0,
+            "rtx-rtt": 0,
+            "rtx-success-count": 0
+          },
+          {
+            "avg-jitter": 179044,
+            "num-duplicates": 0,
+            "num-late": 0,
+            "num-lost": 0,
+            "num-pushed": 17380,
+            "rfc7273-active": false,
+            "rtx-count": 0,
+            "rtx-per-packet": 0.0,
+            "rtx-rtt": 0,
+            "rtx-success-count": 0
+          }
+        ],
+        "note": "GL draw callback is not scan-out; depay-to-decode includes parsing and differs from browser decodeTime"
+      },
+      "monitor": {
+        "run": "native-B2",
+        "started_at": 1793111212.9747593,
+        "conflicts": [],
+        "ended_at": 1793111350.0602145,
+        "exit_codes": [
+          0,
+          143,
+          -15
+        ],
+        "can_after": "can0             DOWN           <NOARP,ECHO>"
+      },
+      "report_sha256": "e5ed27bc166a25181056b7b4c4afe8ae433002e3ff1c0d9aa4fa5a5982d0956e",
+      "resource_log_sha256": "76e6598bda5d2fd7c80c9dca76c5a8e447744337a03be078c6cb5db8deaee116"
+    },
+    {
+      "name": "browser-A5",
+      "analysis": {
+        "kind": "browser",
+        "seconds": 40.000699999809264,
+        "tracks": [
+          {
+            "mid": "video0",
+            "decoded_fps": 29.974475446822613,
+            "decoded_frames": 1199,
+            "decode_gap_mean_ms": 33.346121768140115,
+            "decode_gap_stddev_ms": 4.861840954795122,
+            "decode_mean_ms": 0.8215421184320267,
+            "jitter_buffer_mean_ms": 5.028084166666666,
+            "jitter_target_mean_ms": 15.236206666666666,
+            "dropped_delta": 0,
+            "lost_delta": 0,
+            "freeze_delta": 0,
+            "decoder_implementation": null,
+            "hardware_decoder": null
+          },
+          {
+            "mid": "video1",
+            "decoded_fps": 29.999475009330386,
+            "decoded_frames": 1200,
+            "decode_gap_mean_ms": 33.33166666666667,
+            "decode_gap_stddev_ms": 4.062224007716552,
+            "decode_mean_ms": 0.7754658333333334,
+            "jitter_buffer_mean_ms": 3.4083449999999993,
+            "jitter_target_mean_ms": 12.651695,
+            "dropped_delta": 0,
+            "lost_delta": 0,
+            "freeze_delta": 0,
+            "decoder_implementation": null,
+            "hardware_decoder": null
+          }
+        ],
+        "display": [
+          {
+            "presented_counter_fps": 29.99135587487316,
+            "callback_count": 874,
+            "callback_coverage": 0.7293233082706767,
+            "observed_presentation_gap_ms": {
+              "count": 873,
+              "mean_ms": 45.7176403207331,
+              "stddev_ms": 18.282480185060038,
+              "p95_ms": 67.39999999996508,
+              "p99_ms": 67.90000000002328,
+              "max_ms": 89.09999999997672
+            },
+            "receive_to_presentation_ms": {
+              "count": 874,
+              "mean_ms": 23.421281464531038,
+              "stddev_ms": 8.894134812100269,
+              "p95_ms": 39.09999999997672,
+              "p99_ms": 43.79999999998836,
+              "max_ms": 45.5
+            },
+            "note": "RVFC can skip frames; gaps are observations, not proof of dropped frames"
+          },
+          {
+            "presented_counter_fps": 29.917501738517007,
+            "callback_count": 1070,
+            "callback_coverage": 0.8938127090301003,
+            "observed_presentation_gap_ms": {
+              "count": 1069,
+              "mean_ms": 37.396258185219864,
+              "stddev_ms": 14.972841176691869,
+              "p95_ms": 66.79999999998836,
+              "p99_ms": 67.79999999998836,
+              "max_ms": 68.09999999997672
+            },
+            "receive_to_presentation_ms": {
+              "count": 1070,
+              "mean_ms": 25.82420560747644,
+              "stddev_ms": 10.67322018145765,
+              "p95_ms": 42.90000000002328,
+              "p99_ms": 44,
+              "max_ms": 46.20000000001164
+            },
+            "note": "RVFC can skip frames; gaps are observations, not proof of dropped frames"
+          }
+        ],
+        "selected_pair": {
+          "id": "CPOy64Nu8W_tAKAUINW",
+          "selection_method": "transport",
+          "state": "succeeded",
+          "nominated": true,
+          "transport_id": "Tvideo01",
+          "local_candidate_type": "prflx",
+          "remote_candidate_type": "host",
+          "protocol": "udp",
+          "relay_protocol": null,
+          "current_round_trip_time_s": 0.001,
+          "available_outgoing_bitrate_bps": 300000,
+          "bytes_sent": 22881,
+          "bytes_received": 32976697,
+          "requests_sent": 25,
+          "responses_received": 25
+        },
+        "visibility": [
+          {
+            "at": 444303.30000019073,
+            "hidden": false,
+            "focused": true
+          },
+          {
+            "at": 504308.20000076294,
+            "hidden": false,
+            "focused": true
+          }
+        ],
+        "long_tasks": 0,
+        "errors": []
+      },
+      "monitor": {
+        "run": "browser-A5",
+        "started_at": 1793111954.633842,
+        "conflicts": [],
+        "ended_at": 1793112155.5582447,
+        "exit_codes": [
+          0,
+          143,
+          -15
+        ],
+        "can_after": "can0             DOWN           <NOARP,ECHO>"
+      },
+      "report_sha256": "f75db4c08bb505e5c0306d0442d28f6ed970e6cae139526420fc0bc6751b62c4",
+      "resource_log_sha256": "f321e7d36e989f1a453e8402429c261b4a4bd04459a153be38a11cc596a351a6"
+    }
+  ],
+  "excluded": [
+    {
+      "name": "browser-A1",
+      "reason": "compute-sanitizer appeared ~40s after collection ended; conservatively excluded from primary comparison",
+      "report_sha256": "de88a2ac90be8e89e72281e3361ef390db04765227fda3e32c415d405bcd13e5"
+    },
+    {
+      "name": "browser-A3",
+      "reason": "180s service guard expired during collection; receiver detected disconnect",
+      "report_sha256": "db8c174897a310c7dc61f4af83de712ff90ebee65e79322e081327fb1182de90"
+    },
+    {
+      "name": "browser-A4",
+      "reason": "preflight competition detected; no stream started"
+    }
+  ],
+  "validation": {
+    "macos_build": "passed",
+    "targeted_ctest": "3/3 passed",
+    "analysis_numeric_cases": 3,
+    "control_logic_cases": 104,
+    "linux_local_rebuild": "not run: existing Docker container fails to start with /etc/resolv.conf input/output error",
+    "prior_full_suite": "previous revision: 64/65 cumulative pass; product-direct failure reproduced on PR25; not rerun for this change",
+    "hardware_cleanup": "owned bench processes stopped, cameras unoccupied, can0 DOWN"
+  },
+  "limitations": [
+    "Two short runs per receiver, normal LAN only; not a causal estimate of full native client benefit",
+    "Native GL draw and browser compositor callbacks are not equivalent scan-out boundaries",
+    "RVFC skips callbacks; presentedFrames counter is used for FPS",
+    "Browser actual hardware decoder not exposed; GPU capability enabled is not per-stream decoder proof",
+    "Native B1 used IPv6 link-local; other accepted paths used IPv4 on the same Orin interface",
+    "Native prototype has no full control UI; Mac background load and swap were not isolated",
+    "Competition sampled once/sec; initial runs watched FrameForge/ncu/compute-sanitizer, final run additionally watched nsys",
+    "No optical latency, WAN/CGNAT, impairment, control input or real vehicle acceptance"
+  ],
+  "conclusions": {
+    "native_decode_cadence_improvement_observed": true,
+    "large_overall_latency_or_stability_gain_proven": false,
+    "next_step": "align display cadence and decoder evidence, then test equal UI load and optical end-to-end latency"
+  },
+  "raw_artifact_directory": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/mac-receiver-ab-20261027"
+}

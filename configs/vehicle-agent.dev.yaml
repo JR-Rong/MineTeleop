@@ -6,10 +6,7 @@ cloud:
   signaling_url: ws://127.0.0.1:8765/signaling
   auth_url: http://127.0.0.1:8765/auth
 
-ice:
-  stun_servers:
-    - stun:127.0.0.1:3478
-  turn_servers: []
+# ICE servers are supplied by the authenticated signaling service.
 
 control:
   rate_hz: 20

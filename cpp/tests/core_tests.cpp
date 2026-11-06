@@ -499,6 +499,129 @@ void test_config_loads_current_vehicle_yaml() {
       "safe default ordinary brake pressure changed");
 }
 
+void test_ice_configuration_source_and_direct_budget() {
+  const auto base = read_text("configs/vehicle-agent.dev.yaml");
+  expect(mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml").cloud.ice_direct_timeout_ms == 0,
+         "direct-first retry must be opt-in");
+  for (const auto budget : {0, 3000, 30000, -1, 30001}) {
+    auto source = base;
+    replace_once(source, "cloud:\n", "cloud:\n  ice_direct_timeout_ms: " + std::to_string(budget) + "\n");
+    const auto path = write_temp_vehicle_config("ice-budget", source);
+    if (budget < 0 || budget > 30000) {
+      expect_throws([&] { static_cast<void>(mine_teleop::load_vehicle_config(path)); }, "invalid ICE budget accepted");
+    } else {
+      const auto config = mine_teleop::load_vehicle_config(path);
+      expect(config.cloud.ice_direct_timeout_ms == budget, "ICE budget lost");
+      expect(config.redacted_summary().at("ice_servers_source") == "authenticated_signaling", "ICE source missing");
+    }
+    std::filesystem::remove(path);
+  }
+  for (const auto* key : {"stun_servers", "turn_servers"}) {
+    const auto path = write_temp_vehicle_config("dead-ice-key", base + "\nice:\n  " + key + ": []\n");
+    expect_throws([&] { static_cast<void>(mine_teleop::load_vehicle_config(path)); }, "unused vehicle ICE key silently accepted");
+    std::filesystem::remove(path);
+  }
+}
+
+void test_transient_hold_configuration() {
+  const auto base = read_text("configs/vehicle-agent.dev.yaml");
+  // The dev YAML carries exactly one "  control_timeout_ms: 800\n" under control:
+  // and a 300 ms degraded threshold, which the validation rule below relies on.
+  const std::string anchor = "  control_timeout_ms: 800\n";
+  const auto load = [&](const std::string& control_timeout, const std::string& extra, std::string_view name) {
+    auto source = base;
+    replace_once(source, anchor, "  control_timeout_ms: " + control_timeout + "\n" + extra);
+    const auto path = write_temp_vehicle_config(name, source);
+    struct Cleanup {
+      std::filesystem::path path;
+      ~Cleanup() { std::error_code ignored; std::filesystem::remove(path, ignored); }
+    } cleanup{path};
+    return mine_teleop::load_vehicle_config(path);
+  };
+  const auto rejects = [&](const std::string& control_timeout, const std::string& extra, std::string_view name,
+                           std::string_view message) {
+    expect_throws([&] { static_cast<void>(load(control_timeout, extra, name)); }, message);
+  };
+  const std::string enable = "  transient_hold:\n    enabled: true\n";
+
+  const auto defaults = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  expect(!defaults.control.transient_hold.enabled &&
+             defaults.control.bridge_apply_timeout_ms == defaults.control.control_timeout_ms,
+         "missing transient_hold must be disabled and the bridge timeout must default to control_timeout_ms");
+
+  const auto enabled = load("1200", "  bridge_apply_timeout_ms: 800\n" + enable, "transient-ok");
+  expect(enabled.control.transient_hold.enabled && enabled.control.transient_hold.max_hold_ms == 700 &&
+             enabled.control.transient_hold.resume_fresh_commands == 2 &&
+             enabled.control.transient_hold.budget_window_ms == 60000 &&
+             enabled.control.transient_hold.max_holds_per_window == 6 &&
+             enabled.control.transient_hold.max_hold_time_per_window_ms == 3000 &&
+             enabled.control.bridge_apply_timeout_ms == 800 && enabled.control.control_timeout_ms == 1200,
+         "transient_hold defaults or bridge timeout not loaded");
+  expect_near(enabled.control.transient_hold.hold_brake, 0.15, 1e-12, "default hold brake changed");
+
+  const auto explicit_values = load("1200",
+      "  transient_hold:\n    enabled: true\n    max_hold_ms: 500\n    hold_brake: 0.2\n"
+      "    resume_fresh_commands: 3\n    budget_window_ms: 30000\n    max_holds_per_window: 4\n"
+      "    max_hold_time_per_window_ms: 2000\n", "transient-explicit");
+  const auto& explicit_hold = explicit_values.control.transient_hold;
+  expect(explicit_hold.max_hold_ms == 500 && explicit_hold.resume_fresh_commands == 3 &&
+             explicit_hold.budget_window_ms == 30000 && explicit_hold.max_holds_per_window == 4 &&
+             explicit_hold.max_hold_time_per_window_ms == 2000,
+         "explicit transient_hold values were not loaded");
+  expect_near(explicit_hold.hold_brake, 0.2, 1e-12, "explicit hold brake not loaded");
+  // Absent bridge_apply_timeout_ms follows control_timeout_ms, so a hold-enabled
+  // vehicle without the key keeps its bridge watchdog at the longer window.
+  expect(explicit_values.control.bridge_apply_timeout_ms == 1200, "bridge timeout did not follow control_timeout_ms");
+
+  // degraded (300) + max_hold (700) + 100 ms margin must fit inside the hard watchdog.
+  static_cast<void>(load("1100", enable, "transient-boundary-ok"));
+  rejects("1099", enable, "transient-boundary", "hold window one millisecond past the hard watchdog was accepted");
+  rejects("800", enable, "transient-too-long", "hold window longer than the hard watchdog allows was accepted");
+  static_cast<void>(load("800", "", "transient-disabled-800"));  // Disabled hold keeps the legacy 800 ms watchdog.
+
+  const std::pair<const char*, const char*> bad_fields[]{
+      {"max_hold_ms: 99", "max_hold_ms below 100"}, {"max_hold_ms: 1501", "max_hold_ms above 1500"},
+      {"hold_brake: 0.4", "hold_brake above 0.3"}, {"hold_brake: -0.1", "negative hold_brake"},
+      {"resume_fresh_commands: 0", "zero fresh commands"}, {"resume_fresh_commands: 6", "six fresh commands"},
+      {"budget_window_ms: 9999", "budget window below 10 s"}, {"budget_window_ms: 600001", "budget window above 600 s"},
+      {"max_holds_per_window: 0", "zero holds per window"}, {"max_holds_per_window: 101", "101 holds per window"},
+      {"max_hold_time_per_window_ms: 99", "hold time budget below 100 ms"},
+      {"max_hold_time_per_window_ms: 70000", "hold time budget beyond the window"}};
+  for (const auto& [line, label] : bad_fields)
+    rejects("2000", enable + "    " + line + "\n", "transient-bad-field", std::string(label) + " was accepted");
+
+  // A malformed block must fail loudly instead of leaving a safety setting at its default.
+  rejects("1200", "  transient_hold: true\n", "transient-scalar", "scalar transient_hold block was accepted");
+  rejects("1200", enable + "    max_hold_msec: 900\n", "transient-typo", "misspelled transient_hold key was ignored");
+  expect(!load("1200", "  transient_hold:\n", "transient-empty").control.transient_hold.enabled,
+         "an empty transient_hold block must stay disabled");
+
+  rejects("1200", "  bridge_apply_timeout_ms: 5000\n", "bridge-too-long",
+          "bridge timeout longer than control_timeout_ms was accepted");
+  rejects("1200", "  bridge_apply_timeout_ms: 100\n", "bridge-below-feedback",
+          "bridge timeout below the speed feedback timeout was accepted");
+
+  // The shipped field configs opt in with the longer hard watchdog; every other
+  // example and bench config keeps the legacy behavior.
+  for (const auto* path : {"configs/vehicle-agent.three-machine.field.yaml", "configs/vehicle-agent.ccg2-8m.yaml"}) {
+    const auto field = mine_teleop::load_vehicle_config(path);
+    expect(field.control.transient_hold.enabled && field.control.transient_hold.max_hold_ms == 700 &&
+               field.control.control_timeout_ms == 1200 && field.control.bridge_apply_timeout_ms == 800,
+           std::string("field config does not carry the transient hold settings: ") + path);
+    const auto summary = field.redacted_summary();
+    expect(summary.at("control_timeout_ms") == 1200 && summary.at("bridge_apply_timeout_ms") == 800 &&
+               summary.at("transient_hold").at("enabled") == true,
+           std::string("effective config summary hides the transient hold settings: ") + path);
+  }
+  for (const auto* path : {"configs/vehicle-agent.dev.yaml", "configs/vehicle-agent.bench.yaml",
+                           "configs/vehicle-agent.orin-cpu-bench.yaml", "configs/vehicle-agent.orin-isx031-bench.yaml"}) {
+    const auto other = mine_teleop::load_vehicle_config(path);
+    expect(!other.control.transient_hold.enabled && other.control.control_timeout_ms == 800 &&
+               other.control.bridge_apply_timeout_ms == 800,
+           std::string("example or bench config changed its control timing: ") + path);
+  }
+}
+
 void test_camera_identity_contract() {
   const auto base = read_text("configs/vehicle-agent.dev.yaml");
   for (const auto& id : {"fish_front", "fish_rear", "fish_left", "fish_right",
@@ -1868,6 +1991,59 @@ void test_control_command_json_round_trip_and_validation() {
   auto invalid = original;
   invalid.throttle = 1.5;
   expect_throws([&] { invalid.validate(); }, "invalid throttle was accepted");
+}
+
+void test_transient_hold_command_fields() {
+  auto value = command(1, 1000);
+  value.transient_hold_capable = true;
+  value.critical_video_ready = false;
+  value.critical_video_transient = true;
+  const auto json = value.to_json();
+  expect(json.at("transient_hold") == "transient-hold-v1" && json.at("critical_video_transient") == true,
+         "transient hold fields not serialized");
+  const auto parsed = ControlCommand::from_json(json);
+  expect(parsed.transient_hold_capable && parsed.critical_video_transient, "transient hold fields not parsed");
+
+  auto legacy = command(2, 1000).to_json();
+  expect(!legacy.contains("transient_hold") && !legacy.contains("critical_video_transient"),
+         "legacy command gained new keys");
+  expect(!ControlCommand::from_json(legacy).transient_hold_capable, "legacy command negotiated hold");
+  // Capable but with healthy video: the marker is present, the transient flag is explicit false.
+  auto capable = command(3, 1000);
+  capable.transient_hold_capable = true;
+  const auto capable_json = capable.to_json();
+  expect(capable_json.at("transient_hold") == "transient-hold-v1" && capable_json.at("critical_video_transient") == false,
+         "capable command with healthy video serialized the wrong transient flag");
+
+  const auto rejects = [&](const std::function<void(mine_teleop::Json&)>& change, std::string_view message) {
+    auto broken = json;
+    change(broken);
+    expect_throws([&] { static_cast<void>(ControlCommand::from_json(broken)); }, message);
+  };
+  rejects([](mine_teleop::Json& body) { body["transient_hold"] = "transient-hold-v2"; }, "unknown capability accepted");
+  rejects([](mine_teleop::Json& body) { body["transient_hold"] = true; }, "non-string capability accepted");
+  rejects([](mine_teleop::Json& body) { body["critical_video_transient"] = "yes"; }, "non-boolean transient video flag accepted");
+  rejects([](mine_teleop::Json& body) { body["critical_video_ready"] = true; },
+          "transient video flag accepted while video was ready");
+  rejects([](mine_teleop::Json& body) { body.erase("transient_hold"); },
+          "transient video flag accepted without the hold capability");
+
+  auto direct = value;
+  direct.critical_video_ready = true;
+  expect_throws([&] { direct.validate(); }, "validate accepted a transient video flag with ready video");
+
+  // A verified ESTOP never depends on the optional hold schema: unknown or
+  // contradictory hold fields are ignored instead of rejecting the stop.
+  auto stop = json;
+  stop["estop"] = true;
+  stop["transient_hold"] = "transient-hold-v2";
+  stop["critical_video_ready"] = true;
+  const auto parsed_stop = ControlCommand::from_json(stop);
+  expect(parsed_stop.estop && !parsed_stop.transient_hold_capable && !parsed_stop.critical_video_transient,
+         "estop kept unverified hold fields");
+  auto direct_stop = direct;
+  direct_stop.estop = true;
+  direct_stop.validate();
 }
 
 void test_session_control_profile_json_round_trip_and_physical_units() {
@@ -5133,6 +5309,8 @@ void test_uploader_requires_closed_fragment_and_defers_digest() {
 int main() {
   const std::vector<std::pair<std::string, std::function<void()>>> tests{
       {"config_loads_current_vehicle_yaml", test_config_loads_current_vehicle_yaml},
+      {"ice_configuration_source_and_direct_budget", test_ice_configuration_source_and_direct_budget},
+      {"transient_hold_configuration", test_transient_hold_configuration},
       {"camera_identity_contract", test_camera_identity_contract},
       {"vehicle_config_rejects_unimplemented_control_safety_options", test_vehicle_config_rejects_unimplemented_control_safety_options},
       {"vehicle_config_validates_full_scale_motor_torque", test_vehicle_config_validates_full_scale_motor_torque},
@@ -5168,6 +5346,7 @@ int main() {
       {"bench_config_drives_unified_vehicle_runtime", test_bench_config_drives_unified_vehicle_runtime},
       {"field_config_pins_tls_route_without_system_dns", test_field_config_pins_tls_route_without_system_dns},
       {"control_command_json_round_trip_and_validation", test_control_command_json_round_trip_and_validation},
+      {"transient_hold_command_fields", test_transient_hold_command_fields},
       {"session_control_profile_json_round_trip_and_physical_units", test_session_control_profile_json_round_trip_and_physical_units},
       {"shared_protocol_v1_vectors_and_session_states", test_shared_protocol_v1_vectors_and_session_states},
       {"control_receiver_enforces_token_sequence_and_gap", test_control_receiver_enforces_token_sequence_and_gap},

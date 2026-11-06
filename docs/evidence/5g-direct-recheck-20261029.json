@@ -1,0 +1,49 @@
+{
+  "date": "2026-10-29",
+  "source_commit": "0602c52e2e18a1f108c3811c1e206cd845885e10",
+  "safety": "mock bench control disabled, CAN DOWN, temporary 100ms time-sync limit; no vehicle-control validation",
+  "route": "IPv6 native selected socket bound to Mac physical en0; Orin route monitored once per second; cloud signaling over independently routed SSH; VPN remained active",
+  "ipv6_native": {
+    "seconds": 60.00989999999851,
+    "direct_observed_seconds": 60.008799999997,
+    "relay_observed_seconds": 0.0,
+    "pair_changes": 0,
+    "tracks": [
+      {
+        "pad": "src_1",
+        "decode_fps": 29.965,
+        "decode_gap_p99_ms": 49.222,
+        "decode_gap_max_ms": 125.584
+      },
+      {
+        "pad": "src_0",
+        "decode_fps": 29.965,
+        "decode_gap_p99_ms": 49.962,
+        "decode_gap_max_ms": 99.381
+      }
+    ]
+  },
+  "ipv4_native": {
+    "startup": "timed out before selected pair",
+    "local_candidates": 2,
+    "selected_pair_changes": 0,
+    "frames": 0
+  },
+  "stun": "Two public STUN destinations tested using same socket on each physical interface; Mac mapping stable, Orin mapped ports differed; this does not prove filtering behavior.",
+  "other_attempt": "First IPv4 rerun stopped before launch due to another GPU benchmark; excluded. Its start time was after the IPv6 test ended.",
+  "limitations": [
+    "No browser A/B because browser traffic defaults to VPN and VPN must remain untouched.",
+    "No inference that all cellular IPv4 cannot connect.",
+    "No scanout or end-to-end latency and no radio access technology verification."
+  ],
+  "sha256": {
+    "native-ipv6-recheck-20261029-analysis.json": "1f2efc7fcf475c775f6624c519792e719841900ee85f85fb2ecb5c69599aa57e",
+    "native-ipv6-recheck-20261029/native.json": "5e8495c5e8a2024ba92d2579c1f521e4601cb18a741971df5b79df1f67f7728c",
+    "native-ipv6-recheck-20261029-orin/metadata.json": "4ccd5c344227c98cd0da244c8c8b4c9093bcf76b5630347acc5615ec6d9e6502",
+    "native-ipv4-recheck-02-20261029/native.json": "16086478a0d290c7351c087132f8a3fe533d007dba8064d5177e46e532d1b968",
+    "native-ipv4-recheck-02-20261029/events.jsonl": "648d5ad1694da19ae25c784fc2badfb249b46795cf617e6d9fc008facfa0a27c",
+    "native-ipv4-recheck-02-20261029-orin/metadata.json": "12df9c0aa385b381f56aa6b0016717eebd1e9616c33dc7185c230c84a5e6d30d",
+    "mac-stun-20261029.json": "a9f6b8225b3860068a455bc3a458569ac56a192120b5a86edca6e9ba9a50b60f",
+    "orin-stun-20261029.json": "c605b10c9d8f109e46b6b1bc6eab4b14b0bb7b0b254bbe6e478dafa531ed12de"
+  }
+}

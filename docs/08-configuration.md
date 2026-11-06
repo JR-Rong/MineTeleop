@@ -131,16 +131,8 @@ cloud:
   auth_url: https://teleop.example.com/auth
   device_cert: /etc/mine-teleop/certs/vehicle.crt
   device_key: /etc/mine-teleop/certs/vehicle.key
-
-ice:
-  stun_servers:
-    - stun:turn.example.com:3478
-  turn_servers:
-    - url: turn:turn.example.com:3478?transport=udp
-      username: mine-teleop
-      credential_mode: turn_rest
-      static_auth_secret_file: /etc/mine-teleop/turn-static-auth.secret
-      credential_ttl_seconds: 600
+  # 0 保持原有 ICE 并发选路；例如 3000 启用一次直连优先、失败后允许 TURN 的重试。
+  ice_direct_timeout_ms: 0
 
 control:
   rate_hz: 20
@@ -148,6 +140,11 @@ control:
   max_command_gap_ms: 200
   degraded_timeout_ms: 300
   control_timeout_ms: 800
+  # 可选。底盘桥自己的 apply 看门狗，缺省等于 control_timeout_ms。
+  # bridge_apply_timeout_ms: 800
+  # 可选。瞬态链路保持，缺省关闭；开启方式见本文“瞬态链路保持参数”。
+  # transient_hold:
+  #   enabled: true
   # 非 mock 车辆适配器必须提供该标定证据，且 control_timeout_ms 不能超过上限。
   timeout_calibration:
     max_control_timeout_ms: 900
@@ -618,6 +615,32 @@ ChassisControl `chassis_control` 动态库；MinePilot `include/can/can_common.h
 
 `control_timeout_ms` 不能只按网络体验调大。配置前必须结合车速上限、独立安全制动动作、坡道/松散路面和矿区安全距离，反推允许的最大控制超时。本地参考实现会在非 `mock` 车辆适配器配置中要求 `timeout_calibration` 标定证据，并拒绝超过标定上限的 `control_timeout_ms`。
 
+### 瞬态链路保持参数
+
+`control.bridge_apply_timeout_ms`：整数，20–60000，不大于 `control_timeout_ms`，不小于
+`field_safety.speed_feedback_timeout_ms`；缺省等于 `control_timeout_ms`（旧配置行为不变）。传给底盘桥的 apply
+看门狗，用来检测车端进程卡死。把 `control_timeout_ms` 放宽后它仍可保持较短。
+
+`control.transient_hold`：可选块，**缺省关闭**（没有该块、块为空、`enabled: false` 都是关闭）。字段、范围、默认值：
+
+| 字段 | 默认 | 范围 | 含义 |
+| --- | --- | --- | --- |
+| `enabled` | `false` | 布尔 | 总开关；还需要驾驶端声明 `transient-hold-v1` 才会生效 |
+| `max_hold_ms` | `700` | 100–1500 | 单次保持上限，超出升级为制动等待 |
+| `hold_brake` | `0.15` | 0–0.3 | 保持期间的最小制动（归一化），与驾驶员制动取较大值 |
+| `resume_fresh_commands` | `2` | 1–5 | 恢复所需的连续新鲜命令数 |
+| `budget_window_ms` | `60000` | 10000–600000 | 频次预算的滑动窗口 |
+| `max_holds_per_window` | `6` | 1–100 | 窗口内最多保持次数，第 N+1 次升级 |
+| `max_hold_time_per_window_ms` | `3000` | 100–`budget_window_ms` | 窗口内累计保持时长上限 |
+
+启动校验（任一不满足即拒绝启动并指出字段）：各字段在上述范围内；块内出现未知键（拼写错误不会静默回到默认值）；
+`transient_hold` 不是映射；开启时 `degraded_timeout_ms + max_hold_ms + 100 ≤ control_timeout_ms`。
+现场配置（`vehicle-agent.three-machine.field.yaml`、`vehicle-agent.ccg2-8m.yaml`）显式开启，并设
+`control_timeout_ms: 1200`、`bridge_apply_timeout_ms: 800`；开发、台架和 Orin 示例配置不变，保持关闭。
+生效值出现在 `config-check` 和启动日志的 `effective_vehicle_config` 里（`control_timeout_ms`、`bridge_apply_timeout_ms`、
+`transient_hold.{enabled,max_hold_ms,hold_brake}`）。运行时行为和安全约束见
+[控制与安全](07-control-and-safety.md) 的“瞬态链路保持”。
+
 ## 驾驶端配置示例
 
 控制台启动后，在网页填写驾驶员 ID 和密码。旧配置的 `driver.id` 仅保留为原生开发接口兼容项；网页 `/api/login` 必须同时提交两个字段，不使用默认密码。退出成功后清除内存密码；切换账号必须先退出，网络故障导致退出失败时保留原身份供重试。
@@ -751,6 +774,39 @@ sender 调度延迟、建连耗时、ACK 排空、WSS send 起止/耗时以及 U
 profile/握手门禁和实际 apply。任何单侧“已提交”或“已发送”都不能作为车端已接受的
 ACK。现场三机配置启用此项，并使用 `16 MiB × 4` 轮转容量；复现完成后应按现场保留
 策略归档或删除。
+
+## ICE 配置来源与直连回退
+
+车端和网页从经过认证的信令接口 `/sessions/{session_id}/ice_servers` 取得相同的
+ICE 服务列表。STUN/TURN 地址在信令服务的 `--stun-urls` / `--turn-urls` 配置，
+短期 TURN 凭据由服务端签发；不在车辆 YAML 保存 TURN secret。
+历史示例中的 `ice.stun_servers` / `ice.turn_servers` 从未被 C++ 读取，现已删除；
+如旧配置还含这两个键，加载时会明确报错，要求迁移到信令服务，避免继续静默忽略。
+
+`cloud.ice_direct_timeout_ms` 范围为 0–30000，默认 0 保持既有同时收集候选的行为。
+设为正数且信令提供 TURN、`cloud.ice_transport_policy` 非 `relay` 时：首次 offer
+携带 `ice_route_mode: direct`，两端暂不配置 TURN，车端过滤远端 SDP/trickle 的 relay。
+从 matching answer 成功应用后起计时，未连接超时或连接状态 terminal failed 时，
+先执行已有 `stop_pipeline`，关闭控制服务与旧 Peer，再用相同编码器发起新代际 offer
+(`ice_route_mode: all`)，允许 TURN。车端在安全关闭后、网页/原生接收端在新代际协商时重新获取短期凭据，
+避免长时间直连后回退使用已过期 credential；迟到的获取结果受代际围栏保护。
+每次媒体 runtime 最多一次这种回退，
+不承诺新尝试一定成功，也不会继承旧控制就绪状态。未收到 answer 是信令问题，不启动
+此计时；没有 TURN 时不进行无意义重试。强制 relay 配置保持强制 relay。
+
+这不是原 Peer 的 `restartIce()`，不实现健康 relay 的周期性直连升级或基于 RTT/丢包
+阈值的自动重协商。双栈候选由 WebRTC/libnice 收集和检查，产品没有禁用公网 IPv6；
+最终使用哪个地址族以选中候选对为准。不能根据设置支持双栈就认定当前运营商可达。
+GStreamer 的 `stun-server` 属性仅配置列表中第一个 STUN，TURN 则逐项配置；浏览器可使用
+整个列表。固定地址族 A/B 应使用对应族可达的同一 STUN 服务，不能假定原生同时完成
+两族、多 STUN 映射探测。公网 IPv6 host 不需要先形成 srflx。
+
+产品事件 `vehicle_ice_configuration` 明确记录配置来源、STUN/TURN 是否应用与 route mode；
+每代前 64 个本地/远端候选记录类型、UDP/TCP、地址族、地址类别；
+`vehicle_ice_selected_pair` / `media_negotiation.selected_pair` 记录实际连接对与变更计数；
+`vehicle_ice_connected` 记录连接里程碑，`vehicle_ice_relay_fallback` 记录回退。
+新增候选诊断不含地址、端口、ufrag 或凭据。`peer_connected_observed` 不代表视频新鲜或
+控制可以恢复；原安全门禁仍必须满足。
 
 ## 配置校验
 

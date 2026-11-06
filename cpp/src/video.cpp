@@ -241,7 +241,8 @@ Json probe_video_encoders() {
       });
     }
   }
-  return {{"event", "video_encoder_probe"}, {"runtime", "cpp"}, {"probes", std::move(probes)}};
+  return {{"event", "video_encoder_probe"}, {"runtime", "cpp"}, {"availability_scope", "factory_only"},
+      {"functional_validation", "not_run"}, {"probes", std::move(probes)}};
 }
 
 }  // namespace mine_teleop

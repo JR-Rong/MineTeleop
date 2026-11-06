@@ -195,7 +195,8 @@ class ControlTransportFence {
       last_seq_ = command.seq; return {true, false, "legacy_wss"};
     }
     const auto stamp = ControlTransportStamp::from_json(*stamp_json);
-    if (stamp.path != received_path || (stamp.path == ControlPath::DataChannel && stamp.media_attempt != current_media_attempt))
+    if (stamp.path != received_path ||
+        (stamp.path == ControlPath::DataChannel && stamp.media_attempt != current_media_attempt))
       return {false, false, "transport_path_or_attempt_mismatch"};
     bool changed = false;
     if (stamp.select) {

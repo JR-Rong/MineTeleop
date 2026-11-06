@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <deque>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -149,10 +150,20 @@ class NativeControlAckRecovery {
     deadline_ = now + timeout_ms_;
     observed_ack_seq_ = 0;
     consecutive_anomalies_ = 0;
+    anomaly_since_.reset();
     // Reopening a socket within the same session never erases fault history.
     // A fresh ACK may restore this category, but its next carrier must still
     // report the brake/bad events which happened before transport recovery.
   }
+  // 0 keeps the existing rule. A positive tolerance is the vehicle's declared
+  // control tolerance: RTT-only anomalies and ACK stalls escalate only once they
+  // have lasted that long; the vehicle owns shorter transients.
+  void set_tolerance_ms(int tolerance_ms) {
+    tolerance_ms_ = tolerance_ms > 0 ? tolerance_ms : 0;
+    if (tolerance_ms_ == 0) anomaly_since_.reset();
+  }
+  [[nodiscard]] int tolerance_ms() const { return tolerance_ms_; }
+  [[nodiscard]] std::optional<std::int64_t> rtt_anomaly_since() const { return anomaly_since_; }
   // The caller must first prove this ACK advanced an actually sent identity.
   // Duplicate/regressing/retired ACKs must not be supplied as normal samples.
   Transition note_ack_progress(std::int64_t now, std::uint64_t ack_seq,
@@ -163,12 +174,20 @@ class NativeControlAckRecovery {
     if (ack_packet_age_ms > kFreshAckMs) {
       advance_revision(bad_sample_revision_);
       consecutive_anomalies_ = std::min(consecutive_anomalies_ + 1, kConsecutiveAnomalies);
-      if (!waiting_ && consecutive_anomalies_ >= kConsecutiveAnomalies) {
+      if (tolerance_ms_ > 0) {
+        // Escalate on the duration of the anomaly, not on how many samples it spans.
+        if (!anomaly_since_) anomaly_since_ = now;
+        if (!waiting_ && now - *anomaly_since_ >= tolerance_ms_) {
+          enter(now, timeout_ms, ack_seq);
+          result.entered = true;
+        }
+      } else if (!waiting_ && consecutive_anomalies_ >= kConsecutiveAnomalies) {
         enter(now, timeout_ms, ack_seq);
         result.entered = true;
       }
     } else {
       consecutive_anomalies_ = 0;
+      anomaly_since_.reset();
       if (waiting_) {
         waiting_ = false;
         result.recovered = true;
@@ -183,7 +202,8 @@ class NativeControlAckRecovery {
     if (ack_seq > observed_ack_seq_) {
       result = note_ack_progress(now, ack_seq, ack_packet_age_ms, timeout_ms);
     }
-    if (!waiting_ && pending > 0 && stall_ms >= kStallMs) {
+    const int stall_threshold = tolerance_ms_ > 0 ? tolerance_ms_ : kStallMs;
+    if (!waiting_ && pending > 0 && stall_ms >= stall_threshold) {
       enter(now, timeout_ms, ack_seq);
       result.entered = true;
     }
@@ -211,6 +231,8 @@ class NativeControlAckRecovery {
   unsigned consecutive_anomalies_{0};
   std::uint64_t bad_sample_revision_{0};
   std::uint64_t brake_sample_revision_{0};
+  int tolerance_ms_{0};
+  std::optional<std::int64_t> anomaly_since_;
 };
 
 }  // namespace mine_teleop::detail

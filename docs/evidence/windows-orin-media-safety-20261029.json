@@ -1,0 +1,117 @@
+{
+  "date": "2026-10-29",
+  "source": {
+    "pr26_head_before_evidence": "fe3a04714161116d1fec273fcbcda933a958987c",
+    "windows_control_ci_head": "0602c52e2e18a1f108c3811c1e206cd845885e10",
+    "orin_runtime": "920e019029c7c7593843fb182ba58026276ba822",
+    "product_source_diff_since_orin_runtime": "no changes in cpp/src or cpp/include through PR26 head"
+  },
+  "network": "Windows WLAN and Orin cellular use separate networks; isolated cloud signaling over restricted SSH, media selected IPv6 UDP host/host, no TURN; Orin management used Mac LAN only",
+  "candidate_configuration": "Edge headless, GPU disabled, WebRtcHideLocalIpsWithMdns disabled; browser remote ICE filtered to the selected public peer; not production-default behavior",
+  "strict_mock_control_startup": {
+    "control_enabled": true,
+    "adapter": "mock",
+    "max_speed_kph": 0,
+    "can": "DOWN",
+    "time_uncertainty_limit_ms": 25,
+    "time_uncertainty_ms": 36,
+    "rtt_samples_ms": [
+      53,
+      54,
+      54,
+      54,
+      63,
+      64,
+      59
+    ],
+    "result": "rejected before control readiness; runtime child reports local_full_stop; no continuous control session was exercised"
+  },
+  "media_only_configuration": {
+    "control_enabled": false,
+    "adapter": "mock",
+    "max_speed_kph": 0,
+    "can": "DOWN",
+    "time_uncertainty_limit_ms": 100,
+    "reason": "diagnostic media-only setting, not safety acceptance"
+  },
+  "first_media_attempt": {
+    "decoded_video_until_seconds": 1542.129,
+    "ice_disconnected_seconds": 1555.015,
+    "route_guard_failed": true,
+    "networkmanager_observation": "IPv4 default switched from cellular to Mac-shared at 01:57:24 UTC, returned to cellular at 01:57:25 UTC; guard did not record which of its two route checks failed",
+    "frame_deltas": [
+      46219,
+      46213
+    ],
+    "freeze_counts": [
+      11,
+      11
+    ],
+    "freeze_duration_seconds": [
+      4.084,
+      4.03
+    ]
+  },
+  "second_media_attempt": {
+    "duration_seconds": 1800.217,
+    "samples": 1794,
+    "sample_gap_ms": {
+      "p95": 1017.4,
+      "p99": 1018.5,
+      "max": 1209.6
+    },
+    "candidate_pair_state_counts": {
+      "succeeded": 1778,
+      "in_progress": 16
+    },
+    "peer_connection_state": "connected on all 1794 samples; no peer state change events",
+    "candidate_type": "host/host",
+    "transport": "IPv6 UDP",
+    "selected_endpoint_match": "all samples matched both expected public IPv6 addresses",
+    "route_guard_failed": false,
+    "orin_conflicts": [],
+    "can_after": "can0             DOWN           <NOARP,ECHO>",
+    "rtt_ms": {
+      "p50": 23.0,
+      "p95": 31.0,
+      "p99": 39.0,
+      "max": 74.0
+    },
+    "tracks": [
+      {
+        "decoded_frames": 53995,
+        "received_frames": 54005,
+        "dropped_frames": 10,
+        "packets_lost": 8,
+        "freezes": 6,
+        "freeze_duration_s": 1.901
+      },
+      {
+        "decoded_frames": 53994,
+        "received_frames": 54005,
+        "dropped_frames": 11,
+        "packets_lost": 3,
+        "freezes": 6,
+        "freeze_duration_s": 1.881
+      }
+    ],
+    "freeze_observation": "All 6 freezes per track were recorded within seconds 1268.6–1270.6; event counts do not identify the root cause."
+  },
+  "limits": [
+    "The two media windows are distinct; do not add durations together.",
+    "ICE and route observations are sampled, not continuous packet-level proof.",
+    "Headless Edge with GPU disabled is not an interactive display or optical end-to-end latency test.",
+    "Media-only tests do not establish ready control, control continuity, or absence of a safety stop.",
+    "The observed cellular interface was used, but current NR radio mode was not reverified: modem AT port permission was denied.",
+    "Temporary test keys and credentials were removed; Windows firewall rule was removed."
+  ],
+  "sha256": {
+    "media-30-attempt-01.json": "8c896bc2ead134a8cf1e262f0464d015d2cf7251d2d9c93fe9a21b72de6ac90e",
+    "media-30-attempt-01-orin-metadata.json": "4935ba1089a47cfaa5280275690af51ec6d67af899420a09e7348d8f688fe0b8",
+    "media-30-snapshot-02.json": "43d91f57c0de1f8b28e261d804e8626d202dbabb6e7ea847431dd3eca0f1d855",
+    "media-30-attempt-02-orin-metadata.json": "470a1c810b6328a540a50abc1b19749c8cf4fb4988e57d29c7e849a6b841ab93",
+    "media-30-attempt-02-vehicle.log": "0593367635e3ba24d279962ba0a98b532a59583f4fa9741bf6939685fd326e5f",
+    "media-30-attempt-02-resources.log": "c3923a5e18c04fe1d4b0315527c0a81386bdb1cd3d4d87cf3e847a8588aace32",
+    "strict-startup-vehicle.log": "013c783eac16bf3af908085e348c2966ecefa8bd8feaba1b26cb51178cb21e1e"
+  }
+}
