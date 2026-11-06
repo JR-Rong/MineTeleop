@@ -116,6 +116,10 @@ struct Fixture {
   std::jthread car_watchdog;
   std::filesystem::path authority_directory;
   bool direct_enabled{false}, cloud_online{true};
+  // transient: the vehicle allows the hold and offers transient-hold-v1. tick_vehicle: run the
+  // production-style independent watchdog tick even without a direct-authority lease.
+  bool transient_hold{false};
+  MockVehicleAdapter* mock_adapter{nullptr};
   bool refresh_input{true}, video_ready{true}, video_sample_healthy{true};
   std::uint64_t video_bad_revision{0}, video_brake_revision{0};
   NativeVideoHealth* synthetic_video_health{nullptr};
@@ -137,9 +141,9 @@ struct Fixture {
   std::unique_ptr<NativeControlCourier> native_courier;
   std::deque<std::string> courier_receipts;
   explicit Fixture(bool direct = false, bool feedback = false, bool product = false,
-      std::string mode = "p2p_preferred", bool defer_owner = false)
+      std::string mode = "p2p_preferred", bool defer_owner = false, bool transient = false, bool tick_vehicle = false)
       : vehicle_name("transport-vehicle"),
-        feedback_enabled(feedback), direct_enabled(direct) {
+        feedback_enabled(feedback), direct_enabled(direct), transient_hold(transient) {
     SignalingServerConfig config;
     if (direct_enabled) {
       authority_directory = std::filesystem::temp_directory_path() / ("mine-direct-loopback-" + std::to_string(steady()));
@@ -182,11 +186,27 @@ struct Fixture {
       car_authority.configure(authority.at("issuer").get<std::string>(), vehicle_name, "transport-driver", session, generation, 600);
     }
     auto config_vehicle = load_vehicle_config("configs/vehicle-agent.dev.yaml"); config_vehicle.vehicle_id = vehicle_name;
-    vehicle = std::make_unique<test::LogicalTimeControlService>(config_vehicle, "transport-driver", session,
-        control_token, std::make_unique<MockVehicleAdapter>());
+    if (transient_hold) { config_vehicle.control.control_timeout_ms = 1200; config_vehicle.control.transient_hold.enabled = true; }
+    const auto make_adapter = [this] { auto adapter = std::make_unique<MockVehicleAdapter>(); mock_adapter = adapter.get(); return adapter; };
+    if (transient_hold || tick_vehicle) {
+      // The hold fails closed on a reversed clock, as it must. utc() is wall time, which steps backwards in some VMs
+      // (the Colima VM does by ~100 ms every ~12 s), so these fixtures drive elapsed time from a real steady clock.
+      vehicle = std::make_unique<test::LogicalTimeControlService>(config_vehicle, "transport-driver", session,
+          control_token, make_adapter(), [] { return steady(); });
+    } else {
+      vehicle = std::make_unique<test::LogicalTimeControlService>(config_vehicle, "transport-driver", session,
+          control_token, make_adapter());
+    }
     vehicle->start(utc());
     SessionControlProfileRequest profile; profile.vehicle_id = vehicle_name; profile.driver_id = "transport-driver";
     profile.session_id = session; profile.control_token = control_token; profile.seq = 1; profile.sent_at_utc_ms = utc();
+    if (transient_hold || tick_vehicle) {
+      // The default profile has a zero target speed, which would pin traction to zero.
+      profile.profile.target_speed_kph = 20.0; profile.profile.max_motor_torque_nm = 100.0;
+      profile.profile.max_brake_pressure_bar = 100.0; profile.profile.service_brake_pressure_bar = 30.0;
+      profile.profile.hard_brake_pressure_bar = 100.0; profile.profile.max_steering_angle_deg = 3.0;
+      profile.profile.consecutive_late_frame_limit = 3;
+    }
     expect(vehicle->receive_session_profile(profile, utc()).accepted, "offline vehicle profile rejected");
     fence.reset(vehicle_name, "transport-driver", session, control_token);
     emergency_receiver.reset(vehicle_name, "transport-driver", session, control_token);
@@ -199,16 +219,20 @@ struct Fixture {
         {"payload", {{"type", "offer"}, {"sdp", "v=0\r\na=ice-ufrag:offline\r\n"},
                      {"media_negotiation_id", media_attempt}, {"control_transport_capability", kControlTransportCapability},
                      {"emergency_stop_capability", direct_enabled ? kEmergencyStopCapability : std::string_view{}},
-                     {"feedback_transport_capability", feedback_enabled ? kFeedbackTransportCapability : std::string_view{}}}}});
+                     {"feedback_transport_capability", feedback_enabled ? kFeedbackTransportCapability : std::string_view{}},
+                     {"transient_hold_capability", transient_hold ? kTransientHoldCapability : std::string_view{}},
+                     {"transient_hold", transient_hold ? Json{{"control_tolerance_ms", 1000}, {"video_tolerance_ms", 1200}, {"max_hold_ms", 700}} : Json(nullptr)}}}});
     static_cast<void>(http.post_json_response(base + "/signaling/" + session + "/messages", offer));
     static_cast<void>(driver->poll_signaling());
     if (!defer_owner) input();
-    if (direct_enabled) {
-      renew_authority(true);
+    if (direct_enabled) renew_authority(true);
+    // The production watchdog ticks the service independently of command arrival. A hold can only
+    // start during a delivery gap if the fixture does the same.
+    if (direct_enabled || transient_hold || tick_vehicle) {
       car_watchdog = std::jthread([this](std::stop_token token) {
         while (!token.stop_requested()) {
           { std::lock_guard lock(car_mutex);
-            if (car_authority.observe_expiry(steady())) vehicle->set_control_braking_wait(true, utc(), ControlRecoveryCause::ControlLink);
+            if (direct_enabled && car_authority.observe_expiry(steady())) vehicle->set_control_braking_wait(true, utc(), ControlRecoveryCause::ControlLink);
             vehicle->tick(utc()); emergency_receiver.observe_latched(vehicle->safety_state() == SafetyState::Estop); }
           std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
@@ -1213,7 +1237,163 @@ void emergency_broker_delivers_after_ordinary_wss_is_already_blocked() {
   std::cout << "[STOP_REFETCH] " << refetch_evidence.dump() << '\n';
 }
 }  // namespace
+// ---- Transient hold over the real loopback path. Native producer, cloud HTTP/WSS, signing, the transport
+// fence and the common vehicle safety service are real; only the vehicle's socket reads are paused.
+struct VehicleView { Json timing; VehicleTelemetry output; };
+VehicleView vehicle_view(Fixture& fixture) {
+  std::lock_guard lock(fixture.car_mutex);  // One lock: timing and output must come from the same instant.
+  return {fixture.vehicle->control_timing(utc()), fixture.mock_adapter->read_telemetry()};
+}
+Json vehicle_timing(Fixture& fixture) { return vehicle_view(fixture).timing; }
+// "last" is null until a hold has finished; reading it must fail an assertion, not throw a JSON type error.
+std::string last_hold_field(const Json& timing, const char* key) {
+  const auto& last = timing.at("transient_hold").at("last");
+  return last.is_object() && last.contains(key) && last.at(key).is_string() ? last.at(key).get<std::string>() : std::string{};
+}
+struct Cut {
+  bool saw_hold{false}, saw_wait{false};
+  double max_throttle_in_hold{0.0}, min_brake_in_hold{1.0};
+  std::int64_t longest_pump_ms{0};
+};
+Json observe(Fixture& fixture, Cut& cut) {
+  const auto view = vehicle_view(fixture);
+  const bool hold = view.timing.at("transient_hold").value("active", false);
+  const bool wait = view.timing.value("control_braking_wait", false);
+  cut.saw_hold = cut.saw_hold || hold;
+  cut.saw_wait = cut.saw_wait || wait;
+  if (hold && !wait) {  // Judge the hold's own output, not an escalated braking wait.
+    cut.max_throttle_in_hold = std::max(cut.max_throttle_in_hold, view.output.throttle_feedback);
+    cut.min_brake_in_hold = std::min(cut.min_brake_in_hold, view.output.brake_feedback);
+  }
+  return view.timing;
+}
+std::string summary(const Cut& cut, const Json& timing) {
+  return Json{{"saw_hold", cut.saw_hold}, {"saw_wait", cut.saw_wait}, {"max_throttle_in_hold", cut.max_throttle_in_hold},
+      {"min_brake_in_hold", cut.min_brake_in_hold}, {"longest_pump_ms", cut.longest_pump_ms}, {"timing", timing}}.dump();
+}
+// This fixture has no VehicleMediaRuntime recovery coordinator, so the vehicle's initial transport-selection
+// braking wait is released explicitly once every readiness input is healthy (the same model as the existing safety
+// fixtures; it is not a recovery test). Motion is then re-armed the way the page does it: neutral first, then press.
+void drive_until_motion(Fixture& fixture, bool expect_negotiated) {
+  fixture.requested_throttle = 0.0;
+  const auto started = steady();
+  const auto deadline = started + 10000;
+  bool released = false, pressed = false;
+  std::string timeline, last_key;  // State changes only, so a failure shows how the vehicle got where it is.
+  while (steady() < deadline) {
+    fixture.pump(false);
+    const auto view = vehicle_view(fixture);
+    const auto key = std::string(view.timing.value("control_braking_wait", false) ? "wait " : "run ") +
+        (view.timing.at("transient_hold").value("active", false) ? "hold " : "nohold ") +
+        std::to_string(view.output.throttle_feedback > 0.0) + " " + fixture.last_result_reason;
+    if (key != last_key) { timeline += std::to_string(steady() - started) + "ms:" + key + " | "; last_key = key; }
+    const bool ready = view.timing.value("driver_critical_video_ready", false) && view.timing.value("operator_input_ready", false) &&
+        view.timing.value("driver_time_sync_ready", false) && view.timing.value("driver_control_link_ready", false);
+    if (!released && ready && view.timing.value("control_braking_wait", false) && fixture.wss_commands >= 3) {
+      { std::lock_guard lock(fixture.car_mutex); fixture.vehicle->set_control_braking_wait(false, utc(), ControlRecoveryCause::ControlLink); }
+      released = true;
+    }
+    // The vehicle re-arms on an accepted neutral command; pressing before that is rejected as degraded_neutral_required.
+    if (released && !pressed && !view.timing.value("control_braking_wait", true) && !view.timing.value("rearm_required", true)) {
+      fixture.requested_throttle = 0.4; fixture.input(); pressed = true;
+    }
+    if (pressed && !view.timing.value("control_braking_wait", true) && view.output.throttle_feedback > 0.0 &&
+        view.timing.at("transient_hold").value("enabled", false) == expect_negotiated) return;
+  }
+  throw std::runtime_error("transient fixture never reached motion; timeline: " + timeline + " final: " + vehicle_timing(fixture).dump());
+}
+// Stop the vehicle's socket reads for `duration_ms`; the driver and the cloud keep running at 20 Hz.
+void cut_vehicle_delivery(Fixture& fixture, std::int64_t duration_ms, Cut& cut) {
+  fixture.cloud_online = false;
+  const auto started = steady();
+  while (steady() - started < duration_ms) {
+    const auto before = steady();
+    fixture.pump(false);
+    cut.longest_pump_ms = std::max(cut.longest_pump_ms, steady() - before);
+    static_cast<void>(observe(fixture, cut));
+  }
+  fixture.cloud_online = true;
+}
+void transient_hold_absorbs_short_spikes_and_escalates_long_outage() {
+  Fixture fixture(false, false, false, "cloud_only", false, true);
+  drive_until_motion(fixture, true);
+  {
+    std::lock_guard lock(fixture.car_mutex);
+    expect(fixture.last_received_payload.value("transient_hold", "") == "transient-hold-v1" &&
+               fixture.last_received_payload.contains("critical_video_transient"),
+        "the driver did not declare transient-hold-v1 on its signed command: " + fixture.last_received_payload.dump());
+  }
+  Cut cut;
+  cut_vehicle_delivery(fixture, 450, cut);
+  Json timing;
+  const auto resume_deadline = steady() + 2000;
+  while (steady() < resume_deadline) {
+    fixture.pump(false);
+    timing = observe(fixture, cut);
+    if (last_hold_field(timing, "outcome") == "resumed") break;
+  }
+  expect(cut.saw_hold && !cut.saw_wait, "450 ms delivery gap did not hold without a braking wait: " + summary(cut, timing));
+  expect(last_hold_field(timing, "outcome") == "resumed", "short spike did not resume automatically: " + summary(cut, timing));
+  expect(cut.max_throttle_in_hold == 0.0 && cut.min_brake_in_hold >= 0.15,
+      "the hold did not withdraw traction with the light brake: " + summary(cut, timing));
+  // The driver never released the key: motion must come back by itself, without a re-press.
+  const auto motion_deadline = steady() + 1000;
+  while (steady() < motion_deadline && vehicle_view(fixture).output.throttle_feedback <= 0.0) fixture.pump(false);
+  expect(vehicle_view(fixture).output.throttle_feedback > 0.0, "traction did not resume after the spike: " + summary(cut, timing));
+  expect(!fixture.driver->status().at("native_control").at("requires_fresh_input").get<bool>(),
+      "short spike invalidated the held driver input");
+  Cut outage;
+  cut_vehicle_delivery(fixture, 1150, outage);
+  timing = vehicle_timing(fixture);
+  expect(outage.saw_hold, "long outage never started a hold: " + summary(outage, timing));
+  expect(outage.saw_wait, "1150 ms delivery gap did not escalate to braking wait: " + summary(outage, timing));
+  expect(last_hold_field(timing, "escalation_reason") == "hold_duration_exceeded",
+      "long outage escalated for the wrong reason: " + summary(outage, timing));
+  expect(vehicle_view(fixture).output.brake_feedback >= 1.0, "escalation did not apply the full braking-wait brake");
+}
+void transient_hold_budget_escalates_repeated_spikes() {
+  Fixture fixture(false, false, false, "cloud_only", false, true);
+  drive_until_motion(fixture, true);
+  Cut total;
+  bool escalated = false;
+  for (int spike = 0; spike < 8 && !escalated; ++spike) {
+    Cut cut;
+    cut_vehicle_delivery(fixture, 420, cut);
+    const auto settle = steady() + 600;
+    while (steady() < settle) { fixture.pump(false); static_cast<void>(observe(fixture, cut)); }
+    total.longest_pump_ms = std::max(total.longest_pump_ms, cut.longest_pump_ms);
+    escalated = cut.saw_wait;
+  }
+  const auto timing = vehicle_timing(fixture);
+  const auto reason = last_hold_field(timing, "escalation_reason");
+  expect(escalated && (reason == "budget_count_exceeded" || reason == "budget_time_exceeded"),
+      "repeated spikes did not exhaust the hold budget: " + summary(total, timing));
+}
+// Same network event, vehicle without the hold: the spike still becomes a braking wait.
+void vehicle_without_hold_brakes_on_the_same_spike() {
+  Fixture fixture(false, false, false, "cloud_only", false, false, true);
+  drive_until_motion(fixture, false);
+  Cut cut;
+  cut_vehicle_delivery(fixture, 450, cut);
+  const auto settle = steady() + 600;
+  Json timing;
+  while (steady() < settle) { fixture.pump(false); timing = observe(fixture, cut); }
+  expect(!cut.saw_hold, "a vehicle without the hold entered one: " + summary(cut, timing));
+  {
+    std::lock_guard lock(fixture.car_mutex);
+    expect(!fixture.last_received_payload.contains("transient_hold") && !fixture.last_received_payload.contains("critical_video_transient"),
+        "the driver declared transient-hold-v1 to a vehicle that never offered it: " + fixture.last_received_payload.dump());
+  }
+  expect(cut.saw_wait, "the same 450 ms gap did not brake a vehicle without the hold: " + summary(cut, timing));
+}
+void transient_hold_scenarios() {
+  transient_hold_absorbs_short_spikes_and_escalates_long_outage();
+  transient_hold_budget_escalates_repeated_spikes();
+  vehicle_without_hold_brakes_on_the_same_spike();
+  std::cout << "Transient hold over the real loopback path: short spike held and resumed without a re-press, long outage and repeated spikes escalated, legacy vehicle braked\n";
+}
+
 int main(int argc, char** argv) {
-  try { courier_status_does_not_wait_for_signaling_poll(); if (argc > 1 && std::string_view(argv[1]) == "--mock-estop-only") { native_mock_estop_reaches_vehicle_after_input_loss(); native_mock_estop_reaches_vehicle_after_input_loss(true); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--feedback-only") { actual_feedback_selection_is_independent_and_rejects_retired_statuses(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-courier-only") { native_courier_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-dual-video-only") { native_dual_video_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-safety-only") { native_publication_safety_interlocks(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-publication-only") { native_publication_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--outage-only") { actual_native_short_cloud_outage_and_independent_vehicle_expiry(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--product-only") { product_recovery_withdraws_unfetched_motion(); product_wss_reconnect_retires_dc_and_recovers_ack(); product_startup_and_p2p_cloud_recovery(); product_cloud_only_never_trials_dc(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } native_publication_bridge_integration(); native_courier_bridge_integration(); native_publication_safety_interlocks(); native_dual_video_bridge_integration(); integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
+  try { courier_status_does_not_wait_for_signaling_poll(); if (argc > 1 && std::string_view(argv[1]) == "--transient-hold-only") { transient_hold_scenarios(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--mock-estop-only") { native_mock_estop_reaches_vehicle_after_input_loss(); native_mock_estop_reaches_vehicle_after_input_loss(true); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--feedback-only") { actual_feedback_selection_is_independent_and_rejects_retired_statuses(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-courier-only") { native_courier_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-dual-video-only") { native_dual_video_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-safety-only") { native_publication_safety_interlocks(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-publication-only") { native_publication_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--outage-only") { actual_native_short_cloud_outage_and_independent_vehicle_expiry(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--product-only") { product_recovery_withdraws_unfetched_motion(); product_wss_reconnect_retires_dc_and_recovers_ack(); product_startup_and_p2p_cloud_recovery(); product_cloud_only_never_trials_dc(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } native_publication_bridge_integration(); native_courier_bridge_integration(); native_publication_safety_interlocks(); native_dual_video_bridge_integration(); integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
