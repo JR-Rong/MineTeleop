@@ -40,11 +40,12 @@ scripts/test/check.sh
 - `mine-teleop-recovery-enforcer-tests`、`mine-teleop-media-freshness-gstreamer-tests`、`mine-teleop-ice-vehicle-callback-mock-tests`：车端视频分类、故障类修订号、offer 声明；
 - `mine-teleop-native-control-ack-tests`：驾驶端 ACK 容忍模式；
 - `mine-teleop-transient-hold-integration-tests`：真实回环 WSS 上的断流尖峰，以及同一断流下无保持能力的车端仍制动的对照；
-  这组测试用真实定时器对 700 ms 的保持上限计时，对调度敏感：整个进程停顿约 350 ms 以上，正确的保持就会变成正确的升级。
-  夹具记录 `pump()` 两次调用之间的最大间隔；断言失败时若该间隔不小于 100 ms，就在新夹具上重跑，最多再跑两次，每次打印
-  `[RETRY] ... reason=scheduler_stall_ms=N`；没有停顿证据，或三次都失败，失败就成立（保持恢复变慢而没有停顿，是回归，不会被重试掉）。
-  本地在 8 核加 8 个忙循环、2 核加 2 个忙循环下各 15/15 通过；2 核加 6 个忙循环（三倍超订）下全部失败，且测到的最大间隔只有 77–86 ms，
-  检测不会触发，那是持续饥饿而不是单次停顿，不要在那种条件下运行它。
+  这组测试用真实定时器对 700 ms 的保持上限计时，对夹具的吞吐敏感：断流结束后，车端要先读完套接字里积压的命令，积压的命令全部过期，
+  只有读完之后到达的新鲜命令才能让保持恢复。夹具像车端那样每次 `pump()` 把已排队的事件读空；如果每次只读一条，而 `pump()` 一轮要
+  25–60 ms（驾驶端和 courier 也在这个循环里，GitHub 的 macOS 运行器上就是这样），读取速度追不上 20 Hz 的命令流，保持会用满 700 ms 后升级。
+  失败信息附带按命令排列的时间线和最大 `pump()` 间隔，不重试任何东西。
+  本地对照：每轮 `pump()` 额外加 15 ms，每次读一条的旧夹具 0/6 通过，读空的新夹具 6/6；加 25 ms 新夹具 6/6。
+  2 核加 6 个忙循环（三倍超订）下仍会失败，那是持续的 CPU 饥饿，不要在那种条件下运行它。
 - `mine-teleop-transient-hold-netem-tests`：用 `tc netem` 在回环口注入真实丢包。需要 root 和 `sch_netem`，不满足时退出码 77，CTest 记为**跳过**——跳过不计为通过，汇报时必须单独列出。
 
 页面逻辑由 `cpp/tests/camera_view.test.cjs`、`cpp/tests/control_logic.test.cjs` 覆盖，随 `scripts/test/run_offline_regressions.py` 运行。

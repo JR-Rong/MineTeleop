@@ -13,7 +13,7 @@
 本轮按审查意见修复生产路径，删除未通过验收的 mock 双路实验（DC/WSS 镜像、紧凑控制与遥测格式），
 并实现瞬态链路保持（设计见 [docs/64](../../64-transient-link-hold-design.md)）。
 Windows 与 Orin 的 30 分钟 mock 控制验收此前多轮未通过，本 PR 不声称通过，也不声称真实车辆安全。
-下文的本地验证只覆盖 Linux 容器和 Orin 台架上的原生测试；Windows 工作流和真实双端会话尚未验证。
+下文的验证覆盖 Linux 容器、Orin 台架上的原生测试和 CI；真实双端会话尚未验证。
 
 ## 生产改动
 
@@ -85,7 +85,9 @@ Windows 与 Orin 的 30 分钟 mock 控制验收此前多轮未通过，本 PR �
 
 ## 已知限制与验证情况
 
-**CI**：`【用户填写：推送后的检查链接】`。Windows 工作流尚未运行：阶段 2、3、4 改动过 `windows_native_viewer.cpp`，只能由 Windows 工作流编译验证。
+**CI**：`【用户填写：推送后的检查链接】`。
+- Windows x64 receive-only probe 在 `588acd7` 上通过：MSVC Release 编译了 `mine-teleop-windows-viewer`（阶段 2、3、4 改动过的 `windows_native_viewer.cpp`），查看器观察测试、containment 测试、DataChannel 与相机 MID 回环测试和 `-CheckOnly` 都通过。下载约 494 MiB 的 GStreamer SDK 被对方服务器断开过一次，重试后成功（该重试是本轮加的）。
+- macOS 上的 `transient-hold-integration-tests` 在 CI 上失败过三次，原因已查明：夹具每轮只读一条积压事件，读取速度追不上 20 Hz 的命令流，保持用满 700 ms 后升级；不是产品行为问题。夹具已改为读空积压，在容器里用每轮加 15 ms 的方式复现并确认修复（旧夹具 0/6，新夹具 6/6）。**修复后在 GitHub 的 macOS 运行器上的结果：`【推送后填写】`。**
 
 **已做的本地验证**（命令与结果，未做的在下一节单列）
 
@@ -104,7 +106,7 @@ Orin 记录：`docs/evidence/pr26-orin-native-tests-20261105.md`。
 - 其余集成夹具仍把 `utc()` 当作车端服务的单调时钟；如果它们出现偶发，先用 `steady_clock` 做干预验证。
 
 **未验证或未执行（不得算作通过）**
-- Windows 工作流编译、真实 WebRTC 双端会话（浏览器或 Windows 查看器对 Orin）、5G / TURN、真相机与编码硬件、真实 CAN 与车辆、现场验收。
+- 真实 WebRTC 双端会话（浏览器或 Windows 查看器对 Orin）、5G / TURN、真相机与编码硬件、真实 CAN 与车辆、现场验收。
 - Orin 上没有跑通的 8 项：缺 `avdec_h264` 的 6 项（3 跳过、3 失败）、缺 turnserver 的 1 项（跳过）、内核没有 netem 的 1 项（跳过）。
   它们在容器里通过（真实 netem 丢包用例只在容器里执行过）。
 - `docker buildx` 发布路径只做了 `bash -n` 语法检查，没有端到端构建。
