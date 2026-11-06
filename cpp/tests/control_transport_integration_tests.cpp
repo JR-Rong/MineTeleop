@@ -98,53 +98,17 @@ void note_fixture_retry(std::string_view scenario, int attempt, std::string_view
 }
 void print_retry_summary() { std::cout << "[RETRY-SUMMARY] total=" << g_fixture_retries.load() << std::endl; }
 
-// The hold scenarios measure real time against a 700 ms limit, so a stall of the test process itself (a descheduled
-// CI runner) can turn a correct hold into a correct escalation, which these assertions then report as a failure.
-// Fixture::pump() is the loop that also drives the vehicle, so the longest gap between two of its calls is direct
-// evidence of such a stall. If an assertion fails while that gap reached kSchedulerStallMs, the scenario is repeated
-// from a fresh fixture, visibly ([RETRY]) and at most twice more. Without that evidence, or when the failure
-// repeats, it stands: a hold that resumes slowly with no stall is a regression and must not be retried away.
-constexpr std::int64_t kSchedulerStallMs = 100;
+// The hold scenarios measure real time against a 700 ms limit. When one fails, the longest gap between two pump()
+// calls (the loop that also drives the vehicle) is appended, so a failure caused by a descheduled process can be
+// told apart from one caused by the hold itself. Nothing is retried: the CI failure that led here was the fixture
+// reading queued events too slowly (see Fixture::pump()), and the test thread never stalled.
 template <typename Scenario>
-void run_realtime_scenario(std::string_view name, Scenario&& scenario, bool announce_retries = true) {
-  for (int attempt = 1;; ++attempt) {
-    std::int64_t stall_ms = 0;
-    try { scenario(stall_ms); return; }
-    catch (const std::runtime_error& error) {
-      if (attempt >= 3 || stall_ms < kSchedulerStallMs)
-        throw std::runtime_error(std::string(error.what()) + " [attempt " + std::to_string(attempt) +
-            ", longest gap between pump() calls " + std::to_string(stall_ms) + " ms]");
-      if (announce_retries) note_fixture_retry(name, attempt + 1, "scheduler_stall_ms=" + std::to_string(stall_ms));
-    }
+void run_hold_scenario(Scenario&& scenario) {
+  std::int64_t gap_ms = 0;
+  try { scenario(gap_ms); }
+  catch (const std::runtime_error& error) {
+    throw std::runtime_error(std::string(error.what()) + " [longest gap between pump() calls " + std::to_string(gap_ms) + " ms]");
   }
-}
-// The wrapper decides what gets repeated, so its own contract is checked without any real-time fixture.
-void realtime_scenario_wrapper_retries_only_on_stall_evidence() {
-  int calls = 0;
-  run_realtime_scenario("wrapper_self_test", [&](std::int64_t& stall) {
-    stall = kSchedulerStallMs;
-    if (++calls < 3) throw std::runtime_error("stalled twice");
-  }, false);
-  expect(calls == 3, "a failure with stall evidence was not repeated until it passed");
-
-  calls = 0;
-  std::string message;
-  try {
-    run_realtime_scenario("wrapper_self_test", [&](std::int64_t& stall) {
-      ++calls; stall = kSchedulerStallMs - 1; throw std::runtime_error("slow resume");
-    }, false);
-  } catch (const std::runtime_error& error) { message = error.what(); }
-  expect(calls == 1 && message.find("slow resume") != std::string::npos && message.find("attempt 1") != std::string::npos,
-      "a failure without stall evidence was retried or lost its message: " + message);
-
-  calls = 0; message.clear();
-  try {
-    run_realtime_scenario("wrapper_self_test", [&](std::int64_t& stall) {
-      ++calls; stall = 500; throw std::runtime_error("always");
-    }, false);
-  } catch (const std::runtime_error& error) { message = error.what(); }
-  expect(calls == 3 && message.find("always") != std::string::npos && message.find("attempt 3") != std::string::npos,
-      "a failure that repeats with stall evidence was not capped at three attempts: " + message);
 }
 
 void courier_status_does_not_wait_for_signaling_poll() {
@@ -187,6 +151,8 @@ struct Fixture {
   // transient: the vehicle allows the hold and offers transient-hold-v1. tick_vehicle: run the
   // production-style independent watchdog tick even without a direct-authority lease.
   bool transient_hold{false};
+  // The hold scenarios and their no-hold control read every queued vehicle event per pump() call (see pump()).
+  bool drain_backlog{false};
   MockVehicleAdapter* mock_adapter{nullptr};
   bool refresh_input{true}, video_ready{true}, video_sample_healthy{true};
   std::uint64_t video_bad_revision{0}, video_brake_revision{0};
@@ -197,6 +163,9 @@ struct Fixture {
   std::string base, session, control_token, signing_key;
   std::uint64_t generation{0}, native_generation{0}, ui_epoch{0}, intent_seq{0}, result_seq{0}, last_dc_seq{0};
   std::uint64_t wss_commands{0}, dc_commands{0};
+  // utc() minus the command's own sent_at_utc_ms when the vehicle read it: the quantity the transport fence compares with
+  // max_command_gap_ms. Kept for failure diagnostics only.
+  std::int64_t last_command_age_ms{0};
   std::int64_t last_input{0};
   std::deque<std::pair<std::int64_t, Json>> delayed;
   std::vector<Json> received_statuses;
@@ -212,6 +181,7 @@ struct Fixture {
       std::string mode = "p2p_preferred", bool defer_owner = false, bool transient = false, bool tick_vehicle = false)
       : vehicle_name("transport-vehicle"),
         feedback_enabled(feedback), direct_enabled(direct), transient_hold(transient) {
+    drain_backlog = transient || tick_vehicle;
     SignalingServerConfig config;
     if (direct_enabled) {
       authority_directory = std::filesystem::temp_directory_path() / ("mine-direct-loopback-" + std::to_string(steady()));
@@ -475,7 +445,7 @@ struct Fixture {
     for (const auto& status : response.at("statuses")) received_statuses.push_back(status);
     return response;
   }
-  // Interval between two consecutive pump() calls; see run_realtime_scenario().
+  // Interval between two consecutive pump() calls; see run_hold_scenario().
   std::int64_t last_pump_at{0}, longest_pump_gap_ms{0};
   void pump(bool dc_ready) {
     const auto pumped_at = steady();
@@ -483,11 +453,20 @@ struct Fixture {
     last_pump_at = pumped_at;
     renew_authority();
     if (refresh_input && steady() - last_input >= 60) input();
-    const auto received = cloud_online ? vehicle_socket.receive_json(std::chrono::milliseconds(1)) : WebSocketReceiveResult{};
-    if (received.status == WebSocketReceiveStatus::Message && received.message.value("event", "") == "signaling_messages") {
+    // The product's vehicle reads its control WebSocket on a dedicated thread that only reads, acknowledges and
+    // reports, so an outage's backlog is not held up by anything else. This loop also drives the driver and the
+    // courier. With one read per call, the backlog was drained at 25-60 ms per event on a macOS CI runner, which
+    // never caught up with the 20 Hz command stream inside the hold limit, and every backlogged command was
+    // stale on arrival. The hold fixtures therefore read everything that is queued. Other fixtures keep one read
+    // per call. How fast the product's own thread drains a backlog has not been measured.
+    for (int drained = 0; drained < (drain_backlog ? 64 : 1) && cloud_online; ++drained) {
+      const auto received = vehicle_socket.receive_json(std::chrono::milliseconds(drained == 0 ? 1 : 0));
+      if (received.status != WebSocketReceiveStatus::Message) break;
+      if (received.message.value("event", "") != "signaling_messages") continue;
       const auto& messages = received.message.at("messages");
       const auto& payload = messages.back().at("payload");
       ++wss_commands;
+      last_command_age_ms = utc() - payload.value("sent_at_utc_ms", std::int64_t{0});
       const bool dropped = drop_before_receiver(payload) || drop_wss_commands;
       auto result = dropped ? Json(nullptr) : apply(payload, ControlPath::Wss);
       vehicle_socket.send_json({{"event", "signaling_delivery_ack"}, {"delivery_cursor", received.message.at("delivery_cursor")},
@@ -1334,10 +1313,17 @@ struct Cut {
   double max_throttle_in_hold{0.0}, min_brake_in_hold{1.0};
   std::int64_t longest_pump_ms{0};
   // State changes since the cut was created, so that a failure shows what the vehicle did with every command it
-  // received: "<ms>:<hold|nohold>,<wait|run>,<result reason>,commands=<WSS commands read>,age=<last valid command ms>".
+  // received: "<ms>:<hold|nohold>,<wait|run>,<result reason>,commands=<WSS commands read>,cmd_age=<utc() - sent_at of the
+  // last command read>,drift=<wall clock vs steady clock>,age=<last valid command ms>".
   std::int64_t started_at{steady()};
   std::string timeline, last_key;
 };
+// How far the wall clock has moved relative to the steady clock since the first call. A virtual machine that steps its
+// wall clock shows up here as a jump, and the transport fence compares wall-clock stamps.
+std::int64_t wall_clock_drift_ms() {
+  static const std::int64_t base = utc() - steady();
+  return utc() - steady() - base;
+}
 Json observe(Fixture& fixture, Cut& cut) {
   const auto view = vehicle_view(fixture);
   const bool hold = view.timing.at("transient_hold").value("active", false);
@@ -1346,9 +1332,10 @@ Json observe(Fixture& fixture, Cut& cut) {
   cut.saw_wait = cut.saw_wait || wait;
   const auto key = std::string(hold ? "hold" : "nohold") + (wait ? ",wait," : ",run,") + fixture.last_result_reason +
       ",commands=" + std::to_string(fixture.wss_commands);
-  if (key != cut.last_key) {
+  if (key != cut.last_key) {  // Discrete state only; cmd_age and drift are values that jitter by a millisecond.
     cut.last_key = key;
-    cut.timeline += std::to_string(steady() - cut.started_at) + "ms:" + key + ",age=" +
+    cut.timeline += std::to_string(steady() - cut.started_at) + "ms:" + key + ",cmd_age=" + std::to_string(fixture.last_command_age_ms) +
+        ",drift=" + std::to_string(wall_clock_drift_ms()) + ",age=" +
         std::to_string(view.timing.value("last_valid_control_age_ms", std::int64_t{-1})) + " | ";
     if (cut.timeline.size() > 6000) cut.timeline.erase(0, cut.timeline.size() - 6000);
   }
@@ -1411,9 +1398,9 @@ struct StallReport {
   const Fixture& fixture; std::int64_t& out;
   ~StallReport() { out = fixture.longest_pump_gap_ms; }
 };
-void transient_hold_absorbs_short_spikes_and_escalates_long_outage(std::int64_t& stall_ms) {
+void transient_hold_absorbs_short_spikes_and_escalates_long_outage(std::int64_t& gap_ms) {
   Fixture fixture(false, false, false, "cloud_only", false, true);
-  StallReport report{fixture, stall_ms};
+  StallReport report{fixture, gap_ms};
   drive_until_motion(fixture, true);
   {
     std::lock_guard lock(fixture.car_mutex);
@@ -1449,9 +1436,9 @@ void transient_hold_absorbs_short_spikes_and_escalates_long_outage(std::int64_t&
       "long outage escalated for the wrong reason: " + summary(outage, timing));
   expect(vehicle_view(fixture).output.brake_feedback >= 1.0, "escalation did not apply the full braking-wait brake");
 }
-void transient_hold_budget_escalates_repeated_spikes(std::int64_t& stall_ms) {
+void transient_hold_budget_escalates_repeated_spikes(std::int64_t& gap_ms) {
   Fixture fixture(false, false, false, "cloud_only", false, true);
-  StallReport report{fixture, stall_ms};
+  StallReport report{fixture, gap_ms};
   drive_until_motion(fixture, true);
   Cut total;
   bool escalated = false;
@@ -1477,9 +1464,9 @@ void transient_hold_budget_escalates_repeated_spikes(std::int64_t& stall_ms) {
       "repeated spikes did not exhaust the hold budget after " + std::to_string(spikes) + " spikes: " + summary(total, timing));
 }
 // Same network event, vehicle without the hold: the spike still becomes a braking wait.
-void vehicle_without_hold_brakes_on_the_same_spike(std::int64_t& stall_ms) {
+void vehicle_without_hold_brakes_on_the_same_spike(std::int64_t& gap_ms) {
   Fixture fixture(false, false, false, "cloud_only", false, false, true);
-  StallReport report{fixture, stall_ms};
+  StallReport report{fixture, gap_ms};
   drive_until_motion(fixture, false);
   Cut cut;
   cut_vehicle_delivery(fixture, 450, cut);
@@ -1495,11 +1482,9 @@ void vehicle_without_hold_brakes_on_the_same_spike(std::int64_t& stall_ms) {
   expect(cut.saw_wait, "the same 450 ms gap did not brake a vehicle without the hold: " + summary(cut, timing));
 }
 void transient_hold_scenarios() {
-  realtime_scenario_wrapper_retries_only_on_stall_evidence();
-  run_realtime_scenario("transient_hold_absorbs_short_spikes_and_escalates_long_outage",
-      transient_hold_absorbs_short_spikes_and_escalates_long_outage);
-  run_realtime_scenario("transient_hold_budget_escalates_repeated_spikes", transient_hold_budget_escalates_repeated_spikes);
-  run_realtime_scenario("vehicle_without_hold_brakes_on_the_same_spike", vehicle_without_hold_brakes_on_the_same_spike);
+  run_hold_scenario(transient_hold_absorbs_short_spikes_and_escalates_long_outage);
+  run_hold_scenario(transient_hold_budget_escalates_repeated_spikes);
+  run_hold_scenario(vehicle_without_hold_brakes_on_the_same_spike);
   std::cout << "Transient hold over the real loopback path: short spike held and resumed without a re-press, long outage and repeated spikes escalated, legacy vehicle braked\n";
 }
 
