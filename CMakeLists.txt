@@ -30,6 +30,7 @@ option(MINE_TELEOP_BUILD_BENCH_PROBES "Build explicit camera bench tools (never 
 option(MINE_TELEOP_BUILD_WINDOWS_NATIVE_RECEIVER "Build the opt-in Windows receive-only diagnostic" OFF)
 option(MINE_TELEOP_BUILD_VENDOR_CAMERA_BRIDGES "Build camera bridges when bundled vendor SDKs are present" ON)
 option(MINE_TELEOP_BUILD_ARAVIS_CAMERA_BRIDGE "Build the lightweight Aravis USB3 Vision camera bridge" ON)
+option(MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS "Compile isolated-mock bench diagnostics into runtime binaries (release bundles set OFF)" ON)
 option(MINE_TELEOP_FETCH_MISSING_DEPS "Fetch pinned yaml-cpp and nlohmann-json sources when absent" OFF)
 set(MINE_TELEOP_MVS_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/vendor/mvs" CACHE PATH "Bundled Hikrobot MVS SDK root")
 set(MINE_TELEOP_CURL_LINKAGE "unknown" CACHE STRING "How libcurl is linked into the control client")
@@ -335,6 +336,9 @@ if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
     cpp/src/video.cpp
     cpp/src/webrtc_media.cpp
   )
+  # webrtc_media.cpp is part of this library. Release bundles build with the option OFF.
+  target_compile_definitions(mine_teleop_vehicle_runtime PRIVATE
+    MINE_TELEOP_BENCH_EXPERIMENTS=$<IF:$<BOOL:${MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS}>,1,0>)
   target_include_directories(mine_teleop_vehicle_runtime
     PUBLIC
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp/include>

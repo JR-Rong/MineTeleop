@@ -340,6 +340,18 @@ def main():
             raise AssertionError(f"isolated mock bench attestation no longer uses {needle}")
     if 'starts_with("test_bench_")' in source:
         raise AssertionError("scattered bench identity check; use isolated_mock_bench_attested()")
+    # Release bundles compile the bench tracing out. The switch gates diagnostics only: the attestation carried in the
+    # offer is a safety proof that a native mock client requires, so it must never depend on how the binary was built.
+    trace = section(source, "  bool isolated_mock_trace() const {", "\n  }\n")
+    if "isolated_mock_trace_enabled(" not in trace or "kBenchExperimentsCompiled" not in trace:
+        raise AssertionError("isolated mock tracing must honor the bench experiments compile switch")
+    if "kBenchExperimentsCompiled" in attested or "MINE_TELEOP_BENCH_EXPERIMENTS" in attested:
+        raise AssertionError("the isolated mock attestation must not depend on the bench experiments compile switch")
+    offer_payload = section(source, 'state->pending.emplace_back("webrtc_offer", Json{', "{\"media_tracks\"")
+    if "kBenchExperimentsCompiled" in offer_payload:
+        raise AssertionError("the offer's bench attestation must not depend on the bench experiments compile switch")
+    if source.count("kBenchExperimentsCompiled") != 2:
+        raise AssertionError("kBenchExperimentsCompiled must be defined once and used only by isolated_mock_trace()")
     epoch = section(source, "        if (decision.changed) {", "        }\n")
     if "note_transport_epoch_changed" not in epoch:
         raise AssertionError("transport epoch changes must escalate an active hold with their own reason")

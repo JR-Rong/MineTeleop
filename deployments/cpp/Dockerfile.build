@@ -214,6 +214,8 @@ RUN pkg-config --atleast-version=0.1.18 nice
 
 ARG MINE_TELEOP_BUILD_JOBS=2
 ARG MINE_TELEOP_BUILD_TESTS=OFF
+# Bench diagnostics are compiled out of release bundles; pass ON only for a bench bundle.
+ARG MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS=OFF
 
 # The test SDK uses Ubuntu's Gst 1.20 plugins, including NICE, and executes
 # shipped browser methods with the same Node major as the offline suite.
@@ -246,6 +248,7 @@ RUN --network=none cmake -S . -B /tmp/mine-teleop-build \
       -DCMAKE_BUILD_TYPE=RelWithDebInfo \
       -DCMAKE_INSTALL_PREFIX=/opt/mine-teleop \
       -DMINE_TELEOP_BUILD_TESTS="$MINE_TELEOP_BUILD_TESTS" \
+      -DMINE_TELEOP_ENABLE_BENCH_EXPERIMENTS="$MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS" \
     && cmake --build /tmp/mine-teleop-build --parallel "$MINE_TELEOP_BUILD_JOBS" \
     && cmake --install /tmp/mine-teleop-build \
     && if [ "$MINE_TELEOP_BUILD_TESTS" = "ON" ]; then \

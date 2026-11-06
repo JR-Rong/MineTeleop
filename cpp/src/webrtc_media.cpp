@@ -8,6 +8,15 @@
 #include "mine_teleop/detail/ice_route_policy.hpp"
 #include "mine_teleop/detail/isolated_mock_bench.hpp"
 #include "mine_teleop/detail/transient_hold.hpp"
+
+// Release bundles define MINE_TELEOP_BENCH_EXPERIMENTS=0 (CMake option MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS=OFF),
+// which compiles the isolated-mock bench tracing out. Anything else, including a build that never sets it, keeps it.
+#ifndef MINE_TELEOP_BENCH_EXPERIMENTS
+#define MINE_TELEOP_BENCH_EXPERIMENTS 1
+#endif
+namespace {
+constexpr bool kBenchExperimentsCompiled = MINE_TELEOP_BENCH_EXPERIMENTS != 0;
+}  // namespace
 #include "mine_teleop/detail/gstreamer_rtp_marker.hpp"
 #include "mine_teleop/detail/gstreamer_ice_servers.hpp"
 #include <agent.h>
@@ -1170,7 +1179,8 @@ struct VehicleMediaRuntime::Impl {
         config.field_safety.max_speed_kph, config.field_safety.commissioning_mode);
   }
   bool isolated_mock_trace() const {
-    return config.runtime.control_log_commands && isolated_mock_bench_attested();
+    return detail::isolated_mock_trace_enabled(
+        kBenchExperimentsCompiled, config.runtime.control_log_commands, isolated_mock_bench_attested());
   }
 
   static void on_offer_created(GstPromise* promise, gpointer user_data) {

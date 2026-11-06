@@ -14,6 +14,13 @@ int main() {
     require(!isolated_mock_bench_offer({{"isolated_mock_bench_capability", ""}}), "empty attestation accepted");
     require(!isolated_mock_bench_offer({{"isolated_mock_bench_capability", 1}}), "malformed attestation accepted");
     require(!isolated_mock_bench_offer(nlohmann::json::object()), "missing attestation accepted");
+    // Per-command bench tracing needs all three at once; the compile switch alone can turn it off for a release build.
+    for (int bits = 0; bits < 8; ++bits) {
+      const bool compiled = bits & 1, requested = bits & 2, attested = bits & 4;
+      require(isolated_mock_trace_enabled(compiled, requested, attested) == (compiled && requested && attested),
+              "bench trace is not exactly compiled && requested && attested");
+    }
+    require(!isolated_mock_trace_enabled(false, true, true), "a release build traced a bench vehicle");
     std::cout << "PASS isolated mock bench attestation\n";
     return 0;
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

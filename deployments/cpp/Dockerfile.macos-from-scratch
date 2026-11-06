@@ -99,6 +99,8 @@ RUN x86_64-linux-gnu-g++ --version \
 FROM cross-deps AS cross-build
 
 ARG MINE_TELEOP_BUILD_TESTS=OFF
+# Bench diagnostics are compiled out of release bundles; pass ON only for a bench bundle.
+ARG MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS=OFF
 
 WORKDIR /src
 COPY . .
@@ -112,6 +114,7 @@ RUN cmake -S . -B /tmp/mine-teleop-build \
       -DJPEG_LIBRARY=/opt/mine-teleop-amd64-sysroot/usr/lib/x86_64-linux-gnu/libjpeg.so \
       -DJPEG_INCLUDE_DIR=/opt/mine-teleop-amd64-sysroot/usr/include \
       -DMINE_TELEOP_BUILD_TESTS="$MINE_TELEOP_BUILD_TESTS" \
+      -DMINE_TELEOP_ENABLE_BENCH_EXPERIMENTS="$MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS" \
       -DMINE_TELEOP_BUILD_CONTROL_CLIENT=ON \
       -DMINE_TELEOP_BUILD_SIGNALING_SERVER=ON \
       -DMINE_TELEOP_BUILD_VEHICLE_RUNTIME=ON \
