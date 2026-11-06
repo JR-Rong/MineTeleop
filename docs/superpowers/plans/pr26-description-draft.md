@@ -86,8 +86,8 @@ Windows 与 Orin 的 30 分钟 mock 控制验收此前多轮未通过，本 PR �
 ## 已知限制与验证情况
 
 **CI**：`【用户填写：推送后的检查链接】`。
-- Windows x64 receive-only probe 在 `588acd7` 上通过：MSVC Release 编译了 `mine-teleop-windows-viewer`（阶段 2、3、4 改动过的 `windows_native_viewer.cpp`），查看器观察测试、containment 测试、DataChannel 与相机 MID 回环测试和 `-CheckOnly` 都通过。下载约 494 MiB 的 GStreamer SDK 被对方服务器断开过一次，重试后成功（该重试是本轮加的）。
-- macOS 上的 `transient-hold-integration-tests` 在 CI 上失败过三次，原因已查明：夹具每轮只读一条积压事件，读取速度追不上 20 Hz 的命令流，保持用满 700 ms 后升级；不是产品行为问题。夹具已改为读空积压，在容器里用每轮加 15 ms 的方式复现并确认修复（旧夹具 0/6，新夹具 6/6）。**修复后在 GitHub 的 macOS 运行器上的结果：`【推送后填写】`。**
+- Windows x64 receive-only probe 在 `588acd7`、`f31a932`、`014cbe2` 上都通过：MSVC Release 编译了 `mine-teleop-windows-viewer`（阶段 2、3、4 改动过的 `windows_native_viewer.cpp`），查看器观察测试、containment 测试、DataChannel 与相机 MID 回环测试和 `-CheckOnly` 都通过。下载约 494 MiB 的 GStreamer SDK 被对方服务器断开是常态（三次运行分别断开 1、3、1 次），本轮加了重试和断点续传；最近一次在 513.8 MB 处被断开，续传后完成，SHA-256 校验通过。
+- macOS 上的 `transient-hold-integration-tests` 在 CI 上失败过三次，原因已查明：夹具每轮只读一条积压事件，读取速度追不上 20 Hz 的命令流，保持用满 700 ms 后升级；不是产品行为问题。夹具已改为读空积压，在容器里用每轮加 15 ms 的方式复现并确认修复（旧夹具 0/6，新夹具 6/6）。**修复后在 GitHub 的 macOS 运行器上（`014cbe2`）：3 次有效运行 3 次通过（`transient-hold-integration-tests` 用时 11.4–11.8 秒），另有 1 次重跑因 GitHub 没有分到 macOS 运行器被取消，没有结果。之前三个提交上是 3 次失败。样本很少，不能说已经证明稳定。**
 
 **已做的本地验证**（命令与结果，未做的在下一节单列）
 
