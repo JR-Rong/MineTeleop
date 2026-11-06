@@ -3156,3 +3156,34 @@ git commit -m "Index PR #26 evidence files" -m "Co-Authored-By: Claude <noreply@
 - 提交：Task 12–22 共 12 个提交（Task 15 的缺陷修复单独一个）。每个提交都在 Ubuntu 22.04 容器里对最终树跑了完整 CTest，并跑了与改动对应的变异检查（策略 11 个以上、服务 17 个、媒体观察者 9 个、ACK 11 个、页面 27 个、集成 8 个、netem 4 个、分析脚本 8 个，最终全部被杀死，个别等价变异已说明）。
 - 完整 CTest 现为 93 项，全部通过；其中 `mine-teleop-transient-hold-netem-tests` 真正执行（不是跳过）。
 - **未验证：** `cpp/apps/windows_native_viewer.cpp`（阶段 2 的改动加上阶段 3 的一行 `config.disable_transient_hold = true;`）仍不能在本机编译，需推送后由 Windows 工作流验证；真实 WebRTC DataChannel、真实 5G/TURN 链路和实车都没有覆盖，只有回环 WSS 和回环丢包；现场验收清单见 `docs/64` 第 15 节。
+
+## 执行偏差记录（阶段 4，Task 23–25）
+
+**Task 23**
+- 在计划列出的 19 个头文件和 `native_receiver_core.hpp` 之外，还移动了阶段 2 新增的 `owned_callback_guard.hpp`（阶段 2 偏差记录里约定"Task 23 一起移动"）；共 21 个文件，`git mv` 保留重命名历史。
+- 运行库自己（`cpp/src/*.cpp` 和其余运行头文件）一处都不包含这批头文件；引用者只有测试、`windows_native_viewer.cpp` 和这组头文件彼此之间。因此移出只影响 17 个目标的链接，不影响运行库。`install(DIRECTORY cpp/include/)` 过去会把它们当作 SDK 头文件发布出去，现在不会了。
+- `mine_teleop_bench` **只携带 include 目录，不反向链接 `mine_teleop_runtime`**（计划写的是链接运行库）。原因：`windows-viewer-observation-tests`、`native-web-control-probe`、`native-video-health-tests` 是纯头文件测试，原本不链接运行库，强加依赖会改变它们的链接行为。
+- Windows 工作流的 `paths:` 改为目录通配（`cpp/**` 等）。原来的清单手工维护，已经漏掉多个头文件；移动后那些单文件路径也会过期。
+- 工具里没有按目录扫描 `detail/` 的脚本，所以移动不会让任何检查悄悄失效（已 grep 确认）。
+- 新增 `scripts/test/check_bench_header_links.py` 并注册进离线回归：每个使用 bench 头文件的目标必须链接 `mine_teleop_bench`（静态检查，所以也覆盖 Linux 编译不到的 Windows/macOS 专有目标），且运行库不得包含 bench 头文件。两条规则都做过变异验证。
+- 额外写了 include 解析检查器（`/tmp/mt-tools/check-includes.py`，未入库）：移动前后各 285 个工程内 include，未解析集合完全相同（11 个构建期生成物/厂商 SDK 头文件）。macOS 分支的 `native_receiver_probe.cpp`、`native_receiver_mid_integration_tests.cpp` 用主机 GStreamer 头文件做了语法检查。
+- 验证：Linux 完整 CTest 93/93；主机离线回归全过。
+
+**Task 24**
+- 开关绑定"是不是发布包"，不借用 `MINE_TELEOP_BUILD_TESTS`：两个车端 Dockerfile 和发布脚本里"测试开着"并不等于开发镜像（发布脚本也会传 `run_tests`）。所以新增独立的 `ARG MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS=OFF`；车端打包脚本透传同名环境变量（缺省 OFF），需要台架追踪的包显式传 `ON`。计划写的是无条件加 `-D...=OFF`。
+- "是否追踪"做成可测试的纯函数 `isolated_mock_trace_enabled(compiled, requested, attested)`，有真值表测试；`ice_vehicle_callbacks.test.py` 加了源码契约，保证开关只出现在 `isolated_mock_trace()`，且 offer 里的 `isolated_mock_bench_capability`（安全证明，不是诊断）与开关无关。
+- 验证：默认 ON 完整 CTest 92/93（唯一失败是已证实的基线偶发项 `media-time-sync-retry-loopback`）；OFF 配置确认车端运行库的编译定义是 `MINE_TELEOP_BENCH_EXPERIMENTS=0`，并构建到 96% 无编译错误。
+- **未验证：OFF 配置的 CTest 没有跑完**——本地 Colima 虚拟机在那时崩溃（Lima `VZErrorDomain Code=3 Invalid virtual machine state`）。CI 里的 Docker 门禁（`scripts/test/check.sh`）默认就是 OFF 形态，所以这一项必须在环境恢复后补跑。发布脚本的 `docker buildx` 路径也只做了 `bash -n`。
+
+**Task 25（范围按用户决定收窄）**
+- **只抽出 trace 记录器 `MockControlTrace`，不抽 `MockStatusTracker`。** 原因：状态跟踪器是 mock 客户端的人工安全门禁和输入撤销逻辑，约 125 行、读写约 25 个外部名字（其中 6 个是 input worker 线程同时读取的原子量）；Windows CI 只编译 viewer，不会驱动这段逻辑，而本机既无法编译也无法运行它，抽取后回调接线错了也会"编译通过、测试通过"。留待能在 Windows 上实测时再做。
+- 保留了两个独立的 flush（`flush_dc` 和 `flush_guard_and_input`），而不是计划的单个 `flush(session_id)`：原代码在收尾时先 flush dc、等两个 worker join 之后才 flush guard，合并会改变输出顺序。
+- 记录器测试把**原来的内联代码逐字保留在测试里作为参照**，对随机事件流逐字节比较输出（含超过 128 条上限、频繁 flush、禁用状态）。这个差分测试抓到了我实现里的一个真实缺陷：`nlohmann::json x{json::array()}` 得到 `[[]]` 而不是 `[]`，会让 DC 批次多出一个空记录；该缺陷无法被 Windows 上的任何自动化发现。
+- 其他验证：字段集合与事件名、128 条上限与丢弃计数、"重复 guard 状态过滤"和"1 秒输入节流"在 flush 之后仍然保持、并发保守性（一个记录线程 + 一个 flush 线程）；ThreadSanitizer 与 ASan+UBSan 在主机上干净，且 TSan 对"去掉互斥"的变异会报 data race；20 个变异体 17 个被杀死，另外 2 个是"禁用 gate"的双层纵深防御等价变异（两层同时去掉就被杀死）。
+- viewer 接线：net -68 行。没有遗留引用、定界符平衡、逐行审阅 diff、线程与生命周期关系与原来一致（所有 `throw` 都被主循环的 `catch(...)` 接住，之后统一 join worker 再销毁 `trace`）。**viewer 没有被编译**。
+- **未验证：** 本提交没有跑 Linux 完整 CTest（Colima 不可用），新测试只在主机上构建并运行。
+
+**阶段 4 的未验证项汇总（环境恢复后必须补做）**
+1. 在恢复的 Linux 环境里对最终树跑默认 ON 的完整 CTest，并跑 OFF 配置的完整 CTest。
+2. Windows 工作流编译 `windows_native_viewer.cpp`（阶段 2、3、4 都改过它，需要推送，Task 29）。
+3. `docker buildx` 发布路径端到端（`build_cpp_ubuntu_bundle.sh`、`build_macos_vehicle_from_scratch.sh`）。
