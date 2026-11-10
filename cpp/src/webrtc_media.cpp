@@ -2045,6 +2045,7 @@ struct VehicleMediaRuntime::Impl {
           const std::string_view reason = !profile_active
               ? "session_profile_not_ready"
               : "vcu_handshake_not_ready";
+          result_message["reason"] = std::string(reason);
           // Bootstrap and pre-handshake neutral packets are transport liveness
           // only. Feeding them to receive_command would trigger
           // SessionProfileRequired safe-stop and clear the profile needed to
