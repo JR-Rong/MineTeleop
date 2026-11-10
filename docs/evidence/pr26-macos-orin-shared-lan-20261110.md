@@ -1,0 +1,26 @@
+# PR26 shared-network browser mock test, 2026-11-10
+
+This is a **local shared-network test**, not independent WAN, 5G, real-vehicle, or physical-latency acceptance. The user explicitly allowed the Mac-to-Orin management network for this partial test. The Mac browser and Orin used `192.168.2.1` and `192.168.2.2` on that network; the isolated signaling service used an SSH loopback forward and the STUN server ran on Orin. No TURN server was configured. VPN settings were not changed.
+
+## Artifact and safeguards
+
+- Source: PR26 commit `e4592346b334423ae7a993281fd30021b9031d50`; base remains `rjr/cx/orin-isx031-cpu`. The tested Orin binary was built from the same runtime source before the test-only assertion was committed. Its SHA-256 is `544699c324f5e6b4c49df5e420d7c94a0d4968c57954592ee62099d80c889620`. The Mac browser backend is the `88b1bbc` CI artifact; its product runtime is unchanged by this commit.
+- Vehicle adapter: mock; CAN interface down. The vehicle acknowledged session limits of zero target speed, zero maximum motor torque and zero maximum steering angle. Existing safety thresholds were retained, including the 25 ms clock uncertainty limit. Two physical ISX031 cameras supplied video.
+- Before the successful run, both cameras had V4L2 errors/timeouts. Applying the repository's `scripts/deploy/setup_orin_isx031.sh` to the topology-matched camera nodes restored 10-frame capture checks. The first timed attempt stopped after 53.8 seconds because the harness required a selected ICE pair to report `succeeded` even while its check was in progress. That receipt was retained; the next run additionally checked the selected pair's nominated/writable state, peer and ICE connection, addresses, protocol, and the actual control path. Neither attempt weakens a product safety gate.
+
+## Timed run
+
+The successful sample window ran from `2026-11-10T07:51:22.527Z` through `2026-11-10T08:21:26.127Z`: **1,803.6 seconds**. The harness completed 74 cycles of forward, reverse, left, right, four diagonals and brake. Each scenario had 296 safety/path samples, 2,664 total. Browser keyboard state was verified for each scenario. The zero steering and torque limits mean the run does not prove physical steering or traction execution.
+
+- Every sample showed both camera lanes ready, accepted clock anchor uncertainty at most 10 ms, selected local UDP pair to Orin, and control over a qualified P2P DataChannel. The selected pair reported `succeeded` for 2,660 samples and `in-progress` for four; in all samples it remained nominated and writable, with peer/ICE connected and the same endpoints. Selected-pair state is not a direct measure of packet loss.
+- All 2,664 samples showed `CONTROL_ACTIVE` and stop sequence 0. Vehicle logs contain no `vehicle_control_braking_wait` event inside the sample window; braking-wait events occurred before it and after the requested safe logout.
+- The vehicle's timestamp-filtered `receive_apply` trace contained 34,790 accepted DataChannel commands, with no rejected `receive_apply` entries in the window. It included accepted drive, reverse, and brake requests; steering and throttle remained zero under the acknowledged limits.
+- The browser's sampled native dispatch-to-vehicle-result-received latency was p50 **16 ms**, p95 **28 ms**, p99 **31 ms**, max **45 ms** (2,664 samples of the latest reported result, not a complete command-level distribution). This is a command/result measurement, not camera-to-display or physical execution latency. At these sample points, command path was DataChannel; result feedback was DataChannel in 1,219 and WSS in 1,445. Feedback over WSS is not evidence that commands fell back to WSS.
+
+The raw local harness receipt SHA-256 is `857ee4b585a2d0bdded6fe1f3e52fa17c96973b91aa40c4a9beadac3c3aa140d`; the copied vehicle log SHA-256 is `d19fc30a3e27f0d4a999c91f14c1e1c143d2a804f906e57f29bf0d39084f468b`. They are retained outside the repository in `/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/pr26-local-web-88b1bbc-20261109-03/`.
+
+## Fix and validation
+
+Before this fix, vehicle tracing recorded `session_profile_not_ready` while the signed result sent to the controller still said `transport_command`. The sender's existing bounded profile-recovery retry therefore could not reliably observe the actual rejection. After correcting the returned reason, the live isolated mock session was observed falling back to WSS before profile confirmation, then qualifying and selecting the direct DataChannel after the zero profile was accepted. The regression test exercises the actual extracted vehicle guard, both WSS and DataChannel publication, signature preservation, and fail-closed non-application; the existing transport sender tests cover the bounded retry policy.
+
+The targeted macOS feedback and control-transport tests passed. The macOS CI build/test job passed on retry after its product-direct integration fixture hit its unchanged watchdog in the first run. The Ubuntu vehicle package job failed twice during dependency installation because Ubuntu's server returned HTTP 404 for indexed Perl packages; it did not complete vehicle-package validation. Other CI jobs must be checked against the current PR head.
