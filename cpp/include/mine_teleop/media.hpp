@@ -276,6 +276,9 @@ class CameraFrameSource {
 };
 
 class VehicleMediaRuntime {
+  // The integration fixture inspects lifecycle fences without a runtime hook
+  // or a second implementation of the production loop.
+  friend struct VehicleMediaRuntimeTestAccess;
  public:
   VehicleMediaRuntime(
       VehicleConfig config,

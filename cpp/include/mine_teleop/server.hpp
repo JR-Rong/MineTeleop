@@ -38,6 +38,7 @@ class ControllerLogExport;
 struct HttpRequest {
   std::string method;
   std::string target;
+  std::string http_version;
   std::string peer_address;
   std::string path;
   std::unordered_map<std::string, std::string> query;
@@ -61,6 +62,8 @@ struct ServerResponse {
   static ServerResponse text(int status, std::string body, std::string content_type = "text/plain; charset=utf-8");
 };
 
+enum class HttpConnectionPolicy { Close, BoundedKeepAlive };
+
 class SimpleHttpServer {
  public:
   using Handler = std::function<ServerResponse(const HttpRequest&)>;
@@ -71,7 +74,8 @@ class SimpleHttpServer {
       std::uint16_t port,
       Handler handler,
       std::size_t max_body_bytes = 8 * 1024 * 1024,
-      WebSocketHandler websocket_handler = {});
+      WebSocketHandler websocket_handler = {},
+      HttpConnectionPolicy connection_policy = HttpConnectionPolicy::Close);
   ~SimpleHttpServer();
 
   SimpleHttpServer(const SimpleHttpServer&) = delete;
@@ -91,6 +95,7 @@ class SimpleHttpServer {
   Handler handler_;
   std::size_t max_body_bytes_;
   WebSocketHandler websocket_handler_;
+  HttpConnectionPolicy connection_policy_;
   std::atomic<bool> stopping_{false};
   mutable std::mutex clients_mutex_;
   mutable std::condition_variable clients_stopped_;
@@ -385,6 +390,17 @@ struct DriverConfig {
   bool mock_control_diagnostic{false};
   bool enable_experimental_control_transport{false};
   bool enable_experimental_direct_authority{false};
+  // In-process opt-in for a video-only viewer. It is not a YAML option and
+  // must never start the control sender, control WSS, or accept control APIs.
+  bool receive_only{false};
+  // In-process switch, never read from YAML: the Windows mock client keeps the
+  // existing safety behavior and ignores a vehicle's transient hold offer.
+  bool disable_transient_hold{false};
+  // In-process opt-in for a control client that must verify its peer and
+  // video before creating the first input. Not loaded from YAML.
+  bool defer_control_bootstrap{false};
+  // In-process isolated zero-speed mock experiment; never loaded from YAML.
+  bool mock_idle_direct_reprobe{false};
   std::filesystem::path browser_event_log_path;
   std::uint64_t browser_event_log_max_bytes{2 * 1024 * 1024};
   int browser_event_log_files{3};
@@ -404,6 +420,11 @@ DriverConfig load_driver_config(const std::string& path);
 inline bool control_transport_mode_is_valid(std::string_view mode) {
   return mode == "p2p_preferred" || mode == "cloud_only";
 }
+
+struct DriverTimeSyncSnapshot {
+  TimeSyncStatus clock;
+  TimeSyncReadinessState readiness;
+};
 
 class DriverConsoleRuntime {
  public:
@@ -439,7 +460,12 @@ class DriverConsoleRuntime {
       std::string_view vehicle, std::string_view driver, std::int64_t now, bool direct_return = false);
   [[nodiscard]] Json update_control_intent(const Json& input, const HttpRequest* request = nullptr);
   [[nodiscard]] Json record_browser_event(const Json& input);
-  [[nodiscard]] Json status();
+  // The in-process courier can omit the signaling socket snapshot so a long
+  // poll cannot delay its safety-critical publication loop.
+  [[nodiscard]] Json status(bool omit_signaling_socket = false);
+  // Independent of signaling and control transport locks; retains the same
+  // clock uncertainty and readiness gate as the native sender.
+  [[nodiscard]] DriverTimeSyncSnapshot time_sync_snapshot();
   [[nodiscard]] Json log_sessions();
   [[nodiscard]] Json start_log_export(std::string_view key);
   [[nodiscard]] Json log_export_status() const;
@@ -604,6 +630,10 @@ class DriverConsoleRuntime {
   bool control_transport_vehicle_capable_{false}; // mutex_
   bool emergency_stop_vehicle_capable_{false}; // mutex_
   bool feedback_transport_vehicle_capable_{false}; // mutex_
+  bool transient_hold_vehicle_capable_{false};  // mutex_
+  int transient_control_tolerance_ms_{0};       // mutex_
+  int transient_video_tolerance_ms_{0};         // mutex_
+  void observe_transient_hold_offer_locked(const Json& payload);
   detail::FeedbackTransportSender feedback_transport_sender_; // existing transport mutex
   bool feedback_transport_enabled_{false};
   bool feedback_transport_dc_is_p2p_{false};
@@ -625,6 +655,7 @@ class DriverConsoleRuntime {
   detail::NativeControlAckRecovery control_dc_ack_recovery_;
   std::uint64_t control_dc_last_ack_seq_{0};
   detail::NativeControlAckRecovery control_signaling_ack_recovery_;
+  bool ack_rtt_anomaly_traced_{false};  // control_signaling_websocket_mutex_
   std::string control_signaling_recovery_gear_{"N"};
   std::int64_t control_signaling_next_connect_monotonic_ms_{0};
   int control_signaling_reconnect_delay_ms_{100};

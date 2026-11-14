@@ -525,7 +525,8 @@ int run_driver_console(const Arguments& arguments) {
   mine_teleop::SimpleHttpServer server(
       host,
       port_option(arguments, "--port", 8080),
-      [app](const auto& request) { return app->handle(request); });
+      [app](const auto& request) { return app->handle(request); },
+      8 * 1024 * 1024, {}, mine_teleop::HttpConnectionPolicy::BoundedKeepAlive);
   std::cout << Json({
                    {"event", "driver_console_started"},
                    {"runtime", "cpp"},

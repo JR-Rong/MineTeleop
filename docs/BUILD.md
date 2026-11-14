@@ -147,6 +147,24 @@ scripts/build/build_cpp_ubuntu_bundle.sh linux/amd64
 scripts/build/build_macos_vehicle_from_scratch.sh
 ```
 
+### 台架包与正式包
+
+车端包默认**不包含**台架诊断：脚本和 Dockerfile 都以 `MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS=OFF`
+构建，隔离 mock 台架（`test_bench_` 车辆 ID、`mock` 适配器、`max_speed_kph: 0`、
+`commissioning_mode: bench`）在 `control_log_commands: true` 时才会输出的逐命令 mock 追踪因此被编译掉。
+只受这个开关影响的就是这几条追踪；offer 里的 `isolated_mock_bench_capability`（原生 mock 客户端
+发送控制前要求的安全证明）、`control_hard_stop_transition` 等其他诊断不受影响。
+
+给台架（例如 `vehicle-agent.orin-cpu-bench.yaml`、`vehicle-agent.orin-isx031-bench.yaml`）打需要这些追踪的包时，
+显式开启：
+
+```bash
+MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS=ON scripts/build/build_cpp_ubuntu_bundle.sh linux/amd64
+```
+
+开发机上直接用 CMake 构建时该选项默认为 `ON`，不需要额外参数；确认某个二进制是哪种：
+构建目录里 `CMakeFiles/mine_teleop_vehicle_runtime.dir/flags.make` 含 `MINE_TELEOP_BENCH_EXPERIMENTS=1` 或 `=0`。
+
 这个路径不依赖历史基础包。它会：
 
 1. 从干净的 Ubuntu 22.04 amd64 镜像准备目标 sysroot；
