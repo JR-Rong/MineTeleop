@@ -100,3 +100,32 @@ records the actual adapter settings and recovery checks. It is separate from
 the 60-minute directional control test.
 The [subsequent control attempts](evidence/pr26-windows-performance-control-20261115.md)
 failed before 60 minutes; this launcher is not a demonstrated fix for those stalls.
+
+## Browser control under local proxy-resolution stalls
+
+The [subsequent timing investigation](evidence/pr26-windows-direct-browser-20261115.md)
+found a two-second proxy-resolution wait even for loopback requests. A dedicated
+Edge process using `--no-proxy-server` removed that observed wait without
+changing system proxy or VPN settings. It did not establish 60-minute control
+acceptance: separate main-thread and pre-callback delivery gaps remain. Roaming
+was changed only in explicitly authorized temporary trials and restored.
+
+To reproduce the dedicated browser mode, start the managed backend with no
+automatic browser opening, keeping that launcher open:
+
+```powershell
+.\run-high-performance.ps1 -Target control -ClientArguments @('--no-open-browser','--port','8080')
+```
+
+In a second PowerShell window, open the local control page with its own profile:
+
+```powershell
+$edge = Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe'
+$profile = Join-Path $env:LOCALAPPDATA 'MineTeleop\ControlEdge'
+Start-Process $edge -ArgumentList @('--no-proxy-server', ('--user-data-dir="' + $profile + '"'), '--new-window', 'http://127.0.0.1:8080/')
+```
+
+Use this profile for the local control page. Existing browser profiles and system
+policy remain separate. [Managed Edge proxy policy](https://learn.microsoft.com/en-us/deployedge/microsoft-edge-policies/proxysettings)
+can override command-line switches; verify the actual request timing. This
+manual browser mode is separate from the power launcher's default behavior.
