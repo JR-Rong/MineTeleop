@@ -2,6 +2,7 @@
 #include "mine_teleop/bench/native_receiver_core.hpp"
 #include "mine_teleop/bench/native_video_health.hpp"
 #include "mine_teleop/detail/isolated_mock_bench.hpp"
+#include "mine_teleop/platform.hpp"
 #include "mine_teleop/bench/native_mock_media_gate.hpp"
 #include "mine_teleop/bench/native_mock_input_sequence.hpp"
 #include "mine_teleop/bench/native_mock_profile_retry.hpp"
@@ -938,6 +939,7 @@ struct Window {
       // Only the explicitly enabled isolated mock trace may write control
       // diagnostics; ordinary receive-only viewing remains log-free.
       if (!mock_control || !config.control_trace_commands) config.browser_event_log_path.clear();
+      const ScopedWifiStreaming wifi_streaming;
       DriverConsoleRuntime driver(config, vehicle.vehicle_id, secret);
       // Wake a pending mobile-approval request and retire control immediately
       // when the operator disconnects or closes the window.
