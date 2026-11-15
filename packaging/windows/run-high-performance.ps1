@@ -20,7 +20,7 @@ function Encode-Command([string]$Value){return [Convert]::ToBase64String([Text.E
 if($Inspect){Get-PowerInspection|ConvertTo-Json -Depth 6;exit 0}
 if(-not (Test-PowerAdministrator)){
   $command=New-PowerElevationCommand $PSCommandPath $PSBoundParameters
-  try{$p=Start-Process -FilePath $powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','RemoteSigned','-EncodedCommand',(Encode-Command $command)) -Wait -PassThru;exit $p.ExitCode}
+  try{$p=Start-Process -FilePath $powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',(Encode-Command $command)) -Wait -PassThru;exit $p.ExitCode}
   catch{Write-Error ('Administrator approval was cancelled or failed: '+$_.Exception.Message);exit 1}
 }
 
@@ -77,7 +77,7 @@ try{
   $watch="& '$script' -WatchSession '$($state.Session)' -WatchProcess $PID -WatchStarted '$($state.ParentStarted)'"
   $journalDirectory=Split-Path (Get-PowerStatePath)
   # The watcher must not share a caller's redirected pipes or console lifetime.
-  Start-Process -FilePath $powershell -WindowStyle Hidden -RedirectStandardOutput (Join-Path $journalDirectory 'watcher.out.log') -RedirectStandardError (Join-Path $journalDirectory 'watcher.err.log') -ArgumentList @('-NoProfile','-ExecutionPolicy','RemoteSigned','-EncodedCommand',(Encode-Command $watch))|Out-Null
+  Start-Process -FilePath $powershell -WindowStyle Hidden -RedirectStandardOutput (Join-Path $journalDirectory 'watcher.out.log') -RedirectStandardError (Join-Path $journalDirectory 'watcher.err.log') -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',(Encode-Command $watch))|Out-Null
   $ready=$false
   for($i=0;$i -lt 100;$i++){$s=Get-Content -LiteralPath (Get-PowerStatePath) -Raw|ConvertFrom-Json;if($s.Session -eq $state.Session -and $s.WatcherReady){$state=$s;$ready=$true;break};Start-Sleep -Milliseconds 100}
   if(-not $ready){throw 'Independent restoration watcher did not start; power settings were not changed'}

@@ -22,18 +22,24 @@ fails and restores settings; switch it off in Windows Settings and retry. The
 launcher also requests that Windows keep the system and display awake while
 the client runs; it does not override manual sleep or a critical battery.
 
-Keep the launcher window open. Closing it stops the managed control process;
+Keep the administrator PowerShell window created after UAC open. Closing that
+window stops the managed control process;
 its independent watcher restores the saved power settings. Closing only the
 browser tab does not exit the local control process: close the launcher when
 finished. Normal process exit also restores settings. Only one managed client
 is allowed at a time. After power loss/reboot or a reported restoration error,
 run the following before starting another managed client:
 
-  powershell -ExecutionPolicy RemoteSigned -File .\run-high-performance.ps1 -Restore
+  powershell -ExecutionPolicy Bypass -File .\run-high-performance.ps1 -Restore
 
 Read-only inspection (no elevation or setting change):
 
-  powershell -ExecutionPolicy RemoteSigned -File .\run-high-performance.ps1 -Inspect
+  powershell -ExecutionPolicy Bypass -File .\run-high-performance.ps1 -Inspect
+
+The trusted package launcher uses process-only ExecutionPolicy Bypass so that
+unsigned scripts extracted from a downloaded ZIP can run. It does not change
+machine/user execution policy or override Group Policy. UAC consent is still
+required before changing power settings.
 
 OEM/Modern Standby machines may reject the High Performance plan; the launcher
 then restores settings and fails explicitly. The launcher does not override

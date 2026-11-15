@@ -34,6 +34,14 @@ template; startup then fails and restores the saved settings.
 Use 64-bit Windows PowerShell 5.1. The CMD entry prompts for UAC automatically;
 PowerShell also offers explicit targets and application arguments:
 
+For a downloaded, trusted bundle, the CMD entry scopes `ExecutionPolicy Bypass`
+to its own PowerShell processes, including elevation and the recovery watcher.
+This handles unsigned scripts with Mark of the Web without changing user or
+machine policy or removing file provenance. Group Policy remains authoritative.
+See Microsoft's [execution-policy scope and precedence](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_execution_policies?view=powershell-5.1).
+The direct script examples below assume that the current shell permits it;
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File` can prefix them instead.
+
 ```powershell
 .\run-high-performance.ps1 -Target control
 .\run-high-performance.ps1 -Target desktop
@@ -43,7 +51,8 @@ PowerShell also offers explicit targets and application arguments:
 .\run-high-performance.ps1 -Restore # UAC, recover an inactive saved session
 ```
 
-Keep the launcher window open during use. Closing the client normally restores
+Keep the elevated PowerShell launcher window created after UAC open during use.
+Closing the client normally restores
 settings. If the launcher is terminated, an independent elevated watcher stops
 its recorded client PID and restores settings; PID creation times protect
 against PID reuse. A browser tab is not the local control server: closing the
@@ -89,3 +98,5 @@ failed startup. A VM or argument test cannot prove WLAN device behavior.
 The [Windows hardware validation record](evidence/pr26-windows-performance-launcher-20261115.md)
 records the actual adapter settings and recovery checks. It is separate from
 the 60-minute directional control test.
+The [subsequent control attempts](evidence/pr26-windows-performance-control-20261115.md)
+failed before 60 minutes; this launcher is not a demonstrated fix for those stalls.

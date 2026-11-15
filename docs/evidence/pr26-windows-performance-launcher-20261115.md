@@ -87,3 +87,11 @@ The user requested a new continuous 60-minute Windows browser / Orin
 eight-direction-plus-brake mock run under this profile. Its control acceptance
 and network measurements are recorded separately; startup checks alone cannot
 make the previous failed Windows soaks pass.
+
+The [control attempts](pr26-windows-performance-control-20261115.md) failed before
+60 minutes. A separate read-only package test then marked the actual launcher
+and module files as downloaded (ZoneId 3): explicit RemoteSigned startup failed
+as expected, while the trusted CMD entry inspected them successfully using
+process-only execution policy. Argument/elevation tests also executed a marked
+script. Original power settings and all persistent execution-policy scopes were
+unchanged. No file was unblocked and no Group Policy was overridden.

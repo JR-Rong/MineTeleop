@@ -37,17 +37,20 @@ param([string]$Target,[string[]]$ClientArguments,[switch]$Restore)
 @{Target=$Target;ClientArguments=$ClientArguments;Restore=[bool]$Restore}|ConvertTo-Json -Depth 4|Set-Content -LiteralPath $env:MINE_POWER_TEST_OUTPUT -Encoding UTF8
 exit 7
 '@|Set-Content -LiteralPath $script -Encoding UTF8
+  # Downloaded ZIPs can propagate Mark of the Web. The trusted bundle entry
+  # scopes execution policy to its own processes instead of changing policy.
+  Set-Content -LiteralPath ($script+':Zone.Identifier') -Value "[ZoneTransfer]`r`nZoneId=3"
   $command=New-PowerElevationCommand $script @{Target='control';ClientArguments=$values;Restore=[Management.Automation.SwitchParameter]::new($true)}
   $info.FileName=Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
   $info.EnvironmentVariables['MINE_POWER_TEST_OUTPUT']=$output
-  $info.Arguments='-NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -EncodedCommand '+[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+  $info.Arguments='-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand '+[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
   $p=[Diagnostics.Process]::Start($info);$null=$p.StandardOutput.ReadToEnd();$p.WaitForExit()
   if($p.ExitCode -ne 7){throw 'Elevation command did not propagate child exit code'}
   $actual=Get-Content -LiteralPath $output -Raw|ConvertFrom-Json
   if($actual.Target -ne 'control' -or !$actual.Restore -or $actual.ClientArguments.Count -ne $values.Count){throw 'Elevation parameter shape mismatch'}
   for($i=0;$i -lt $values.Count;$i++){if($actual.ClientArguments[$i] -cne $values[$i]){throw "Elevation argument mismatch at $i"}}
   $command=New-PowerElevationCommand $script @{}
-  $info.Arguments='-NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -EncodedCommand '+[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+  $info.Arguments='-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand '+[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
   $p=[Diagnostics.Process]::Start($info);$null=$p.StandardOutput.ReadToEnd();$p.WaitForExit()
   $actual=Get-Content -LiteralPath $output -Raw|ConvertFrom-Json
   if($p.ExitCode -ne 7 -or $actual.Restore -or $actual.Target -or $null -ne $actual.ClientArguments){throw 'Default double-click elevation payload mismatch'}
