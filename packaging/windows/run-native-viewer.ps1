@@ -2,7 +2,8 @@
 param(
   [Parameter(Mandatory = $true)][string]$GStreamerRoot,
   [string]$ViewerPath = (Join-Path $PSScriptRoot 'mine-teleop-windows-viewer.exe'),
-  [switch]$CheckOnly
+  [switch]$CheckOnly,
+  [switch]$PrepareOnly
 )
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path -LiteralPath $GStreamerRoot).Path
@@ -18,6 +19,7 @@ foreach ($element in @('webrtcbin', 'nicesrc', 'rtph264depay', 'h264parse', 'avd
   & $inspector $element *> $null
   if ($LASTEXITCODE -ne 0) { throw "Required GStreamer element unavailable: $element" }
 }
+if ($PrepareOnly) { return }
 if ($CheckOnly) { Write-Output 'Native viewer and required GStreamer elements are available'; exit 0 }
 $process = Start-Process -FilePath $viewer -PassThru -Wait
 exit $process.ExitCode

@@ -158,6 +158,13 @@ camera capture freshness, monitor scan-out, or control safety.
 
 ## Building and starting
 
+For administrator-managed Windows power settings, use
+`./run-high-performance.ps1 -Target native -GStreamerRoot <runtime-directory>`
+instead. The artifact also includes a double-click `Start-High-Performance.cmd`
+entry, which uses `GSTREAMER_1_0_ROOT_MSVC_X86_64` when available. See
+[performance startup and restoration](windows-performance-launcher.md).
+This changes local power management only; all mock restrictions below remain.
+
 The Windows CI workflow builds `mine-teleop-windows-viewer` alongside the
 existing probe with the pinned GStreamer SDK. The workflow artifact contains
 the two executables, not a self-contained installer. Install the matching

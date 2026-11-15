@@ -33,6 +33,17 @@ jobs:
         run: |
           $lock = Get-Content packaging/windows/dependencies.lock.json -Raw | ConvertFrom-Json
           "commit=$($lock.vcpkg_commit)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: Check Windows performance launcher without changing power settings
+        shell: powershell
+        run: |
+          foreach ($file in @('packaging/windows/run-high-performance.ps1','packaging/windows/performance-profile.psm1')) {
+            $tokens=$null; $errors=$null
+            [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD $file),[ref]$tokens,[ref]$errors) | Out-Null
+            if ($errors.Count) { throw ($errors | Out-String) }
+          }
+          & ./packaging/windows/run-high-performance.ps1 -Inspect
+          if ($LASTEXITCODE -ne 0) { throw 'power inspection failed' }
+          & ./scripts/test/windows_performance_launcher_tests.ps1
       - uses: actions/checkout@v7
         with:
           repository: microsoft/vcpkg
@@ -123,6 +134,7 @@ jobs:
           Copy-Item $viewer receiver-artifact/
           Copy-Item (Join-Path $PWD 'build/windows-control-x64/Release/mine-teleop-windows-viewer.map') receiver-artifact/
           Copy-Item packaging/windows/run-native-viewer.ps1 receiver-artifact/
+          foreach ($file in @('performance-profile.psm1','run-high-performance.ps1','Start-High-Performance.cmd')) { Copy-Item (Join-Path packaging/windows $file) receiver-artifact/ }
           Copy-Item docs/windows-native-viewer.md receiver-artifact/
           Get-FileHash $exe,$viewer -Algorithm SHA256 | Format-List | Out-File receiver-artifact/sha256.txt
           git rev-parse HEAD | Out-File receiver-artifact/source-commit.txt -Encoding ascii

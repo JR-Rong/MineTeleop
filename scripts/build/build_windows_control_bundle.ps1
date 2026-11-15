@@ -339,6 +339,9 @@ Copy-Item -Path (Join-Path $RepoRoot "protocol\v1\*") `
   -Destination (Join-Path $PackageRoot "protocol\v1") -Recurse
 Copy-Item -LiteralPath (Join-Path $RepoRoot "packaging\windows\run-control.ps1") `
   -Destination (Join-Path $PackageRoot "run-control.ps1")
+foreach ($PowerFile in @('performance-profile.psm1', 'run-high-performance.ps1', 'Start-High-Performance.cmd')) {
+  Copy-Item -LiteralPath (Join-Path $RepoRoot "packaging\windows\$PowerFile") -Destination (Join-Path $PackageRoot $PowerFile)
+}
 Copy-Item -LiteralPath (Join-Path $RepoRoot "packaging\windows\README.txt") `
   -Destination (Join-Path $PackageRoot "README.txt")
 Copy-Item -LiteralPath $DependencyLockPath `
