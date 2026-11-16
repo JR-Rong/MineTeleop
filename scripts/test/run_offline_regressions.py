@@ -30,6 +30,7 @@ PURE_TESTS = (
     ("control logic", ("node", "cpp/tests/control_logic.test.cjs")),
     ("control transport courier", ("node", "cpp/tests/control_transport.test.cjs")),
     ("control worker isolation", ("node", "cpp/tests/control_transport_worker.test.cjs")),
+    ("shipped ICE page methods", ("node", "cpp/tests/ice_page.test.cjs")),
     ("camera presentation", ("node", "cpp/tests/camera_view.test.cjs")),
     ("session log presentation", ("node", "cpp/tests/session_logs.test.cjs")),
     ("scene state", ("node", "cpp/tests/scene_state.test.mjs")),

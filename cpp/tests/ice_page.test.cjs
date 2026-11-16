@@ -36,6 +36,7 @@ function fixture() {
     async getStats() { if (gates.stats) { gates.stats.entered=true; await gates.stats.promise; } return this.stats || new Map(); }
   }
   const context = vm.createContext({
+    MineTeleopControlWorker:require('../web/control_transport_worker.js'),URLSearchParams,location:{search:'?control_courier=page'},
     MineTeleopControlTransport:require('../web/control_transport.js'),setInterval(){},
     peer:null,controlChannel:null,pendingIce:[],mediaPeerEpoch:0,mediaOfferScope:null,mediaHasOffer:false,
     retiredMediaScopes:new Set(),mediaScopeIssue:'',nativeControlSessionId:'session-fixture',nativeControlSessionGeneration:7,
