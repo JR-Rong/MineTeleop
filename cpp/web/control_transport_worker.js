@@ -10,7 +10,7 @@
   // existing native input lease and the original bridge/vehicle expiry remain
   // authoritative even while the page is busy rendering.
   function workerMain(transport) {
-    let channel = null, snapshot = null, owner = 0, origin = '', tracePending = false;
+    let channel = null, snapshot = null, owner = 0, origin = '', tracePending = false, viewPending = false;
     let traceSequence = 0, droppedTraces = 0;
     const traces = [];
     const epochNow = () => performance.timeOrigin + performance.now();
@@ -106,6 +106,8 @@
       } else if (message?.type === 'trace_ack' && message.owner === owner &&
                  message.sequence === traceSequence) {
         tracePending = false;
+      } else if (message?.type === 'view_ack' && message.owner === owner) {
+        viewPending = false;
       } else if (message?.type === 'threshold' && message.owner === owner && channel) {
         channel.bufferedAmountLowThreshold = message.value;
       } else if (message?.type === 'close' && message.owner === owner) channel?.close();
@@ -113,9 +115,12 @@
     setInterval(() => { controlScheduler.tick(); emergencyScheduler.tick(); },25);
     setInterval(() => {
       if (!channel) return;
-      emit({type:'view',scope:key(scope('control')),negotiated:control.negotiated(),
-        path:control.activePath(),epoch:control.epoch(),feedback:control.feedback(),
-        buffered:Number(channel.bufferedAmount)});
+      if (!viewPending) {
+        viewPending = true;
+        emit({type:'view',scope:key(scope('control')),negotiated:control.negotiated(),
+          path:control.activePath(),epoch:control.epoch(),feedback:control.feedback(),
+          buffered:Number(channel.bufferedAmount)});
+      }
       flushTrace();
     },100);
   }
@@ -218,9 +223,12 @@
               if (message.dropped) reportMode({context:'worker',trace_records_dropped:message.dropped});
             } finally { worker.postMessage({type:'trace_ack',owner,sequence:message.sequence}); }
           } else if (message.type === 'error') reportError({lane:message.lane,message:message.message});
-          else if (message.type === 'view' && message.scope === scopeKey(controlOptions?.scope())) {
-            view = {negotiated:message.negotiated,path:message.path,epoch:message.epoch,feedback:message.feedback};
-            facade.bufferedAmount = message.buffered;
+          else if (message.type === 'view') {
+            if (message.scope === scopeKey(controlOptions?.scope())) {
+              view = {negotiated:message.negotiated,path:message.path,epoch:message.epoch,feedback:message.feedback};
+              facade.bufferedAmount = message.buffered;
+            }
+            worker.postMessage({type:'view_ack',owner});
           } else if (message.type === 'boundary' && message.scope === scopeKey(controlOptions?.scope())) controlOptions?.onBoundary();
           else if (message.type === 'status' && message.scope === scopeKey(controlOptions?.scope())) controlOptions?.onStatus?.(message.value);
           else if (message.type === 'confirmation' && message.scope === scopeKey(emergencyOptions?.scope())) emergencyOptions?.onConfirmation?.(message.seq);

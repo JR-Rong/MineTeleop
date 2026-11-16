@@ -60,6 +60,9 @@ test('trace consumer stalls cannot build an unbounded message queue or stop send
   await f.tick();f.view();
   for(let i=0;i<100;i++){await f.tick();f.view()}
   assert.equal(f.sent.length,101);assert.equal(f.messages.filter(m=>m.type==='trace').length,1);
+  assert.equal(f.messages.filter(m=>m.type==='view').length,1,'blocked page accumulated status views');
+  f.self.onmessage({data:{type:'view_ack',owner:1}});f.view();
+  assert.equal(f.messages.filter(m=>m.type==='view').length,2);
   const first=f.messages.find(m=>m.type==='trace');f.self.onmessage({data:{type:'trace_ack',owner:1,sequence:first.sequence}});f.view();
   const batch=f.messages.filter(m=>m.type==='trace').at(-1);assert.equal(batch.records.length,64);assert.equal(batch.dropped,36);
 });
