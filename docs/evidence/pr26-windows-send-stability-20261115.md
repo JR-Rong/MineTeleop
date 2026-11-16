@@ -231,3 +231,14 @@ A16 passed preparation and completed 24 nine-scenario cycles, then failed at
 event. Its miniport/kernel vehicle RX gaps again included about491ms. All
 original adapter/power settings were restored. See the same follow-up report
 for full RTT cohorts, trace coverage, input feedback and acceptance limits.
+
+
+## Authorized 1441 follow-up (A17)
+
+The user subsequently approved the generic 1441 trial. Windows crashed during
+the binding-change window before scoring (`0x7e`, WER bucket
+`AV_ACPI!ACPIIrpDispatchDeviceControl`). A17 has zero scored control cycles;
+this is not a latency result or60minpass. Original1336/all14properties/power
+were restored and the candidate package removed via noninteractive SYSTEM
+recovery. No VPN or safety changes. See
+[crash identity, attribution limits and recovery](pr26-windows-1441-20261116.md).
