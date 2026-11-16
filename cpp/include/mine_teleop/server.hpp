@@ -650,6 +650,7 @@ class DriverConsoleRuntime {
   std::int64_t control_transport_bridge_seen_ms_{0};
   Json control_transport_pending_status_ = Json::object();
   Json control_transport_latest_dc_;
+  NativeControlIntentSample control_transport_latest_dc_sample_;
   std::int64_t control_transport_latest_dc_at_ms_{0};
   detail::NativeControlAcknowledgementWindow control_dc_ack_window_;
   detail::NativeControlAckRecovery control_dc_ack_recovery_;

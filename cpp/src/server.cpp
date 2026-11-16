@@ -1400,7 +1400,7 @@ function resetControlAuthorityInput(reason='control_authority_reset'){vcuEverRea
 function updateVcuHandshakeState(value){const locked=vcuHandshake.issue_code==='control_recovery_timeout'||vcuHandshake.issue_code==='critical_camera_failed';if(locked)value={...value,issue_code:vcuHandshake.issue_code,control_recovery:vcuHandshake.control_recovery,ready:false,state:'fault'};gearChangeStationaryEvidence=controlLogic.updateGearChangeStationaryEvidence(gearChangeStationaryEvidence,value,lastControlStatusSeq,performance.now());value={...value,gear_change_stationary_confirmed:gearChangeStationaryEvidence.confirmed};const transition=controlLogic.transitionVcuState(vcuEverReady,value);vcuHandshake=value;vcuEverReady=transition.everReady;if(transition.resetInput)resetControlAuthorityInput('vcu_state_'+String(value.state||'unavailable'))}
 function applyVehicleSafetyState(value,timing){const next=String(value||'');if(next==='DEGRADED'&&controlLogic.degradedInputRearmRequired(timing,lastNativeAcceptedControlSeq)){clearControlInput(false,'vehicle_degraded',true);if(lastVehicleSafetyState!=='DEGRADED'){lastKeyboardEvent.textContent='控制命令短暂中断，输入已清除 · 请释放后重新按下';statusPanel.textContent='车端进入可恢复降级：牵引已清零；请释放控制键后重新按下';clientLog('driver_input_cleared_on_degraded',{previous_safety_state:lastVehicleSafetyState||null})}}const transientHoldActive=timing?.transient_hold?.active===true;if(transientHoldActive!==lastTransientHoldActive){clientLog('driver_transient_hold_observed',{active:transientHoldActive,causes:timing?.transient_hold?.causes||[],last:timing?.transient_hold?.last||null});lastTransientHoldActive=transientHoldActive}lastVehicleSafetyState=next}
 function suspendSignalingPoll(){const generation=++signalingGeneration;polling=false;if(signalingPollAbort){signalingPollAbort.abort();signalingPollAbort=null}return generation}
-function closeRealtimeSession(){++mediaPeerEpoch;mediaOfferScope=null;mediaHasOffer=false;mediaScopeIssue='';retiredMediaScopes.clear();controlWriteQueue.reset();flushControlTrace('session_close');controlTraceScope={session_id:'',vehicle_id:''};lastHeartbeatTraceAt=null;nativeControlSessionId='';nativeControlSessionGeneration=0;lastNativeIntentSnapshot='';nativeControlUiEpoch=0;nativeControlTakeoverPending=false;nativeControlPageRetired=false;lastNativeAcceptedControlSeq=0;const generation=suspendSignalingPoll();gearRejectionInhibited=false;resetControlAuthorityInput();resetControlProfileSession();lastControlStatusSeq=0;gearChangeStationaryEvidence=controlLogic.createGearChangeStationaryEvidence();resetControlOutcomeSession();if(controlChannel)controlChannel.close();if(peer)peer.close();controlChannel=null;peer=null;vehicleTelemetry=null;vehicleTelemetryReceivedAt=null;lastFeedbackHealthLogAt=null;lastFeedbackHealthKey='';lastVehicleSafetyState='';lastTransientHoldActive=false;mediaStatus={lanes:[]};vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};pendingIce=[];remoteCameraIds=[];offeredCameraByMid.clear();cameraByMid.clear();assignedCameraIds.clear();previousStats.clear();lastMediaMetricsLogAt=null;cameraView.reset();cameraGrid.replaceChildren(emptyStage);renderMonitoring();return generation}
+function closeRealtimeSession(){++mediaPeerEpoch;mediaOfferScope=null;mediaHasOffer=false;mediaScopeIssue='';retiredMediaScopes.clear();controlWriteQueue.reset();flushControlTrace('session_close');controlTraceScope={session_id:'',vehicle_id:''};lastHeartbeatTraceAt=null;nativeControlSessionId='';nativeControlSessionGeneration=0;lastNativeIntentSnapshot='';nativeControlUiEpoch=0;nativeControlTakeoverPending=false;nativeControlPageRetired=false;lastNativeAcceptedControlSeq=0;const generation=suspendSignalingPoll();gearRejectionInhibited=false;resetControlAuthorityInput();resetControlProfileSession();lastControlStatusSeq=0;gearChangeStationaryEvidence=controlLogic.createGearChangeStationaryEvidence();resetControlOutcomeSession();if(controlChannel)controlChannel.close();controlTransportActor.retire();if(peer)peer.close();controlChannel=null;peer=null;vehicleTelemetry=null;vehicleTelemetryReceivedAt=null;lastFeedbackHealthLogAt=null;lastFeedbackHealthKey='';lastVehicleSafetyState='';lastTransientHoldActive=false;mediaStatus={lanes:[]};vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};pendingIce=[];remoteCameraIds=[];offeredCameraByMid.clear();cameraByMid.clear();assignedCameraIds.clear();previousStats.clear();lastMediaMetricsLogAt=null;cameraView.reset();cameraGrid.replaceChildren(emptyStage);renderMonitoring();return generation}
 function renderEstopRequest(presentation=controlLogic.deriveControlStopPresentation(estopLatched,Boolean(vehicleTelemetry&&vehicleTelemetry.estop===true),(vehicleTelemetry?vehicleTelemetry.stop_source:undefined),(vehicleTelemetry?vehicleTelemetry.stop_reason:undefined),vcuHandshake)){estopStatus.hidden=!presentation.visible;estopStatus.textContent=presentation.banner}
 function renderControlRecovery(hardStopVisible){const sync=latestRuntimeStatus.time_sync||{},trusted=sync.synchronized===true&&Number(sync.uncertainty_ms)<=consoleConfig.max_time_sync_uncertainty_ms,freshness=controlLogic.telemetryFreshness(vehicleTelemetry,vehicleTelemetryReceivedAt,performance.now(),trusted?Date.now()+Number(sync.offset_ms||0):null),fresh=freshness.received_age_ms!==null&&freshness.received_age_ms<=500&&(freshness.source_age_ms===null||freshness.source_age_ms<=500),presentation=controlLogic.deriveControlRecoveryPresentation(polling&&!controlAuthorityLost,vehicleTelemetry,fresh,hardStopVisible);controlRecoveryStatus.hidden=!presentation.visible;controlRecoveryStatus.textContent=presentation.banner;return presentation}
 function latchEstop(source){if(estopLatched)return false;estopLatched=true;clientLog('control_estop_request_latched',{source});renderEstopRequest();renderMonitoring();return true}
@@ -1785,6 +1785,7 @@ async function startFromOffer(offer){
   if(nextScope.id)retiredMediaScopes.delete(`id:${nextScope.id}`);
   peer=null;const epoch=++mediaPeerEpoch;
   mediaOfferScope=nextScope;mediaHasOffer=true;mediaScopeIssue='';delete mediaStatus.local_scope_issue;
+  controlTransportActor.retire();
   if(previousPeer)previousPeer.close();
   controlChannel=null;
   resetControlProfileSession();
@@ -1841,7 +1842,7 @@ async function startFromOffer(offer){
   };
   nextPeer.onicecandidateerror=e=>{if(current())clientLog('webrtc_ice_candidate_error',{endpoint:safeIceEndpoint(e.url),error_code:Number(e.errorCode||0),...controlLogic.iceServerError(e)})};
   nextPeer.ondatachannel=e=>{
-    const channel=e.channel;
+    let channel=e.channel;
     if(!current()){channel.close();return}
     if(channel.label!=='control'||channel.protocol!=='mine-teleop-control-v1'||channel.ordered||channel.maxRetransmits!==0){
       channel.close();
@@ -1849,6 +1850,7 @@ async function startFromOffer(offer){
       clientLog('control_datachannel_rejected',{label:channel.label,protocol:channel.protocol,ordered:channel.ordered,max_retransmits:channel.maxRetransmits});
       return;
     }
+    channel=controlTransportActor.adopt(channel);
     lastControlStatusSeq=0;
     controlChannel=channel;
     channel.bufferedAmountLowThreshold=1024;
@@ -1911,7 +1913,13 @@ async function startFromOffer(offer){
     await post('/api/webrtc/answer',{type:'answer',sdp:nextPeer.localDescription.sdp,media_negotiation_id:nextScope.id,source_session_id:sourceSession,source_control_session_generation:sourceGeneration});
   }catch(error){if(current())throw error}
 }
-const controlTransportCourier=MineTeleopControlTransport.createCourier({
+const controlTransportActor=MineTeleopControlWorker.create({
+  transport:MineTeleopControlTransport,
+  enabled:new URLSearchParams(location.search).get('control_courier')!=='page',
+  onMode:details=>clientLog('control_courier_context',details),
+  onError:error=>clientLog('control_courier_worker_error',error),
+});
+const controlTransportCourier=controlTransportActor.createCourier({
   scope:()=>latestRuntimeStatus.native_control?.control_transport?.enabled===true&&polling&&!controlAuthorityLost&&nativeControlSessionId&&mediaOfferScope?.id?{
     session:nativeControlSessionId,generation:nativeControlSessionGeneration,ui:uiInstanceId,uiEpoch:nativeControlUiEpoch,
     attempt:mediaOfferScope.id,...MineTeleopControlTransport.dataChannelRoute(peer,controlChannel,latestRuntimeStatus.native_control.control_transport.mode,latestRuntimeStatus.native_control.control_transport.experimental_enabled===true)}:null,
@@ -1926,7 +1934,7 @@ const controlTransportScheduler=MineTeleopControlTransport.createTickScheduler({
   onError:error=>clientLog('control_transport_bridge_error',{error:error.message}),
 });
 setInterval(()=>controlTransportScheduler.tick(),25);
-const emergencyStopCourier=MineTeleopControlTransport.createEmergencyCourier({
+const emergencyStopCourier=controlTransportActor.createEmergencyCourier({
   onPending:isCurrent=>emergencyStopScheduler.request(isCurrent),
   scope:()=>latestRuntimeStatus.native_control?.emergency_stop_capability===MineTeleopControlTransport.emergencyProtocol&&polling&&nativeControlSessionId&&mediaOfferScope?.id?{
     session:nativeControlSessionId,generation:nativeControlSessionGeneration,ui:uiInstanceId,uiEpoch:nativeControlUiEpoch,
@@ -5621,6 +5629,7 @@ void DriverConsoleRuntime::note_native_control_failure(
 // retire atomically with the route, before the browser can fetch another frame.
 void DriverConsoleRuntime::retire_control_dc_locked() {
   control_transport_latest_dc_ = Json();
+  control_transport_latest_dc_sample_ = {};
   control_transport_latest_dc_at_ms_ = 0;
   control_dc_ack_window_.reset();
   control_dc_ack_recovery_.reset();
@@ -5984,7 +5993,10 @@ Json DriverConsoleRuntime::control_transport_bridge(const Json& input, const Htt
   // failure detection; it never extends the vehicle's timestamp limit.
   const auto age = now - control_transport_latest_dc_at_ms_;
   const auto allowance = detail::kNativeBridgePublicationMaxAgeMs;
-  if (control_transport_dc_ready_ && control_transport_sender_.owns_dc_publication(control_transport_latest_dc_) && age >= 0 && age < allowance &&
+  const auto current_input = native_control_intent_.sample(now);
+  const auto valid_for_ms = detail::native_control_publication_valid_for_ms(
+      control_transport_latest_dc_sample_, current_input, age, allowance, native_control_intent_.lease_ms());
+  if (control_transport_dc_ready_ && control_transport_sender_.owns_dc_publication(control_transport_latest_dc_) && valid_for_ms > 0 &&
       control_transport_latest_dc_.value("seq", std::uint64_t{0}) > last_seen &&
       control_transport_latest_dc_.value("bridge_owner", "") == owner &&
       control_transport_latest_dc_.value("bridge_ui_epoch", std::uint64_t{0}) == ui_epoch) {
@@ -5999,7 +6011,7 @@ Json DriverConsoleRuntime::control_transport_bridge(const Json& input, const Htt
     return left.at("control_status_seq").get<std::uint64_t>() < right.at("control_status_seq").get<std::uint64_t>(); });
   return {{"protocol", detail::kControlTransportCapability}, {"enabled", capable && control_transport_cloud_capable_},
       {"transport", control_transport_sender_.status()}, {"feedback_transport", feedback_transport_sender_.status()}, {"statuses", std::move(statuses)}, {"frame_json", frame.is_object() ? Json(frame.dump()) : Json(nullptr)}, {"frame", std::move(frame)},
-      {"valid_for_ms", age >= 0 && age < allowance ? allowance - age : 0}};
+      {"valid_for_ms", valid_for_ms}};
 }
 
 bool DriverConsoleRuntime::drain_native_control_acknowledgements_locked(
@@ -6695,6 +6707,7 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
         // One latest slot: a blocked page cannot accumulate or retimestamp
         // commands. The scoped local endpoint and vehicle both expire them.
         control_transport_latest_dc_ = envelope.at("payload");
+        control_transport_latest_dc_sample_ = dispatch_sample;
         control_transport_latest_dc_["bridge_owner"] = sample.owner_ui_instance_id;
         control_transport_latest_dc_["bridge_ui_epoch"] = sample.ui_control_epoch;
         control_transport_latest_dc_at_ms_ = send_started_monotonic_ms;

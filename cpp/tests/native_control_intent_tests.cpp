@@ -619,10 +619,46 @@ void test_dispatch_revalidates_input_after_preparation() {
       "latched ESTOP lost priority due to ordinary input expiry");
 }
 
+void test_publication_deadline_keeps_original_input_lease() {
+  using mine_teleop::detail::native_control_publication_valid_for_ms;
+  mine_teleop::NativeControlIntentStore store(200);
+  auto neutral = neutral_intent(1);
+  expect(store.update(neutral, 100).accepted, "neutral setup rejected");
+  auto motion = neutral; motion.intent_seq = 2; motion.throttle = 0.5;
+  expect(store.update(motion, 110).accepted, "motion setup rejected");
+  const auto published = store.sample(260);  // Only 50ms of real input lease remains.
+  expect(native_control_publication_valid_for_ms(published, store.sample(280), 20, 100, 200) == 30,
+      "bridge did not cap publication to the original input lease");
+  expect(store.update(motion, 290).accepted, "ordinary renewal rejected");
+  expect(native_control_publication_valid_for_ms(published, store.sample(300), 40, 100, 200) == 10,
+      "newer input refresh extended an old wire publication");
+  expect(native_control_publication_valid_for_ms(published, store.sample(310), 50, 100, 200) == 0,
+      "worker received an expired motion publication after newer UI renewal");
+  expect(native_control_publication_valid_for_ms(published, store.sample(300), -1, 100, 200) == 0,
+      "negative publication age accepted");
+  expect(native_control_publication_valid_for_ms(published, store.sample(300), 100, 100, 200) == 0,
+      "bridge allowance was extended");
+  neutral.intent_seq = 3;
+  expect(store.update(neutral, 301).accepted, "release rejected");
+  expect(native_control_publication_valid_for_ms(published, store.sample(302), 42, 100, 200) == 0,
+      "worker could forward cached motion after release");
+  const auto expired = store.sample(600);
+  expect(!expired.fresh && expired.intent.throttle == 0, "expired input did not fail closed");
+  expect(native_control_publication_valid_for_ms(expired, store.sample(610), 10, 100, 200) == 90,
+      "current protective neutral publication was blocked");
+  auto retired = expired; retired.ui_control_epoch++;
+  expect(native_control_publication_valid_for_ms(expired, retired, 10, 100, 200) == 0,
+      "old UI epoch publication accepted");
+  retired = expired; retired.refresh_brake_revision++;
+  expect(native_control_publication_valid_for_ms(expired, retired, 10, 100, 200) == 0,
+      "old recovery revision publication accepted");
+}
+
 }  // namespace
 
 int main() {
   const TestCase tests[] = {
+      {"publication_deadline_keeps_original_input_lease", test_publication_deadline_keeps_original_input_lease},
       {"dispatch_revalidates_input_after_preparation", test_dispatch_revalidates_input_after_preparation},
       {"session016_recorded_ack_drain",test_session016_recorded_ack_drain_preserves_brake_and_fresh_neutral},
       {"raw_video_sample_is_preserved_separately_from_input_and_qualified_video", test_raw_video_sample_is_preserved_separately_from_input_and_qualified_video},

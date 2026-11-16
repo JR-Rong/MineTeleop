@@ -275,5 +275,8 @@
     }
     return Object.freeze({tick, receive, cancelStaleRequest, negotiated: () => negotiated, activePath: () => path, epoch: () => epoch, feedback: () => feedback});
   }
-  return Object.freeze({protocol, feedbackProtocol, emergencyProtocol, emergencyBackpressure, dataChannelRoute, createTickScheduler, createCourier, createEmergencyCourier});
+  // The worker uses this same implementation and its bounded queues/fences.
+  // Only fixed source is serialized; no session state or credentials enter it.
+  const factorySource = () => '(' + createTransport.toString() + ')()';
+  return Object.freeze({protocol, feedbackProtocol, emergencyProtocol, emergencyBackpressure, dataChannelRoute, createTickScheduler, createCourier, createEmergencyCourier, factorySource});
 });
