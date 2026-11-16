@@ -16,6 +16,8 @@ bases on PR25. No VPN or safety thresholds were changed.
 | A8 | Worker courier, 1336 ax, roaming 0 | 1146.259 | 46 | Failed, physical wireless-path loss |
 | A9 | Worker courier, 1336 actual ac/VHT, roaming 0 | 192.352 | 7 | Failed, physical wireless-path loss |
 | A10 | Worker courier, 1336 ac; continuous WLAN queries removed | 534.242 | 21 | Failed, time-probe TCP connection timeout and fresh-neutral interlock |
+| A11 | Same 1336 ac/Worker; bounded time-probe connections enabled | 656.480 | 26 | Failed, physical-path loss; clock remained within limit |
+| A12 | Fresh 717a348 Windows package, authorized temporary 1338 ac; same Worker/time-probe fix/UI | 523.045 | 21 | Failed, physical-path loss and WSS fallback |
 
 A3 was preparation only. The temporary 1338 driver was restored to 1336;
 performance/radio/roaming settings were restored between trials. A newer 1441
@@ -138,3 +140,75 @@ exposure to isolated handshake loss and does not fix a common wireless outage.
 Runtime regression checks cover actual TCP reuse, the 32-request bound, explicit
 close, HTTP/1.0 close, route/upgrade isolation, and the first-WebSocket timeout.
 A fresh 60-minute hardware run is still required.
+
+A11 proves the time-connection repair runs on the actual Windows/Orin path:
+consecutive cohorts 16/17 used new-connection counts `[1,0,0,0,0,0,0]`, with
+seven fresh request boundaries each; total durations were 35/43 ms and
+uncertainty 9 ms. The scored clock uncertainty p50/p95/p99/max was 9/10/10/10 ms.
+Nevertheless the trial failed at 656.480 seconds: five probe sequences were
+absent at both fixed Mac addresses, the primary receive gap reached 554.842 ms,
+and the physical gateway timed out (822.073 ms observed wait). The passive
+AutoConfig scan/RPC whitelist recorded zero events. Thus this repair does not
+resolve the wireless common-path failure. The actual Worker sent 12,712 unique
+scored commands; vehicle callbacks accepted 12,699, rejected one as expired and
+four for required neutral, with eight callback sequences unobserved.
+
+A11 retained the raw vehicle stdout. One line concatenated two complete JSON
+objects; strict offline JSON decoding separated the objects without changing
+bytes or inventing events, retaining original and normalized SHA256 receipts.
+There were zero malformed JSON objects. A parser silently discarding that line
+would omit valid control evidence. All failed trials and restoration receipts
+remain separate; no prefixes are combined for acceptance.
+
+A12 used the fresh, clean `717a348` Windows artifact (27 controller files
+verified, all 11 UI assets equal to A11). The original 1336 driver and all
+14 saved public advanced properties were restored and read back afterward.
+The scored clock remained at 9/10/10/10 ms (p50/p95/p99/max). The primary
+probe lost five sequences and its receive gap reached 618.465 ms; four of
+those sequences were also missing at the secondary address. A gateway probe
+timed out with a 674.584 ms observed wait. Native dispatch included 50 WSS
+commands. Of 10,080 actual Worker DC sends, vehicle callbacks accepted
+10,072, rejected one as expired, and did not record seven sequences.
+The authenticated result RTT p50/p95/p99/max across the scored native cohort
+was 18/31/35/351 ms; these are not physical one-way measurements. There were
+no passive WLAN scan/RPC events. All 21 full direction/brake cycles had
+consistent mock gear, steering and brake feedback; no physical actuation is
+claimed. A zero sampled stop counter cannot qualify this failed direct arm.
+
+The `717a348` build/release run 43818116259, offline regression run
+43817502049 and Windows native receiver run 43817502011 all passed. An
+earlier build run 43817502042 was cancelled when PR metadata triggered
+a replacement run; it was not a test failure.
+
+A13 was preparation/calibration only, not a control soak. Three bounded NDIS
+manifest-whitelist calibrations around known adapter restarts did not capture
+the target provider. The final two ETLs contained 58 WPR/system metadata
+records each, with no read errors and no NDIS provider GUID. Name-based and
+GUID-based inspection agree. Thus this diagnostic is **not validated**; no
+claim is made that NDIS power transitions, firmware sleep or resets were
+absent during the real fault. Prepared radio/roaming settings were restored
+to 0/4, the original driver was 1336, and there was no managed power journal.
+No additional identical control soak was started on this invalid instrument.
+
+The supported optional `BWSelection5G=1` (20 MHz only; original Auto=0) trial
+has a concrete rollback script and plan, but is awaiting explicit user
+approval because it reduces peak bandwidth and briefly reconnects Wi-Fi.
+The newer 1441 driver likewise remains unapproved and uninstalled. Neither
+option has been silently applied. A real uninterrupted 60-minute acceptance
+remains unmet; A11/A12 are failures, not partial success or concatenated time.
+
+Final cleanup readback confirmed original power plan, WLAN AC/DC 0/2,
+energy-saver thresholds 0/30, device auto-off Enabled, original 1336 driver,
+all 14 public advanced properties, no managed power journal, no test route
+or owned control/browser process, and stopped WPR/PacketMon with no filters.
+Forty closed-case scheduled tasks and dedicated temporary auth/profile data
+were removed; original driver backups and permanent user SSH keys were kept.
+Orin had no owned service, CAN remained down and both cameras were released.
+
+Private evidence archive: `pr26-windows-send-stability-20261116.tar.gz`,
+181 files, 104714681 compressed bytes. SHA256
+`20d51808011be06b35010ed5f2cab6a9742b558234801a5e9fd1c9a84dd02d4d`.
+Every archived member hash and the copied archive hash were checked. Credentials,
+private keys, dedicated browser profiles/CLI history and broad raw system
+captures are excluded. Raw system captures stay on the private Windows bench.
+No uninterrupted 60-minute acceptance has been achieved.
