@@ -2052,6 +2052,8 @@ void test_control_page_contract() {
   const auto data_channel_status_reset = response.body.find(
       "lastControlStatusSeq=0;",
       data_channel_parameters_gate);
+  const auto data_channel_worker_adopt = response.body.find(
+      "channel=controlTransportActor.adopt(channel);", data_channel_parameters_gate);
   const auto data_channel_publish = response.body.find(
       "controlChannel=channel;",
       data_channel_status_reset);
@@ -2068,11 +2070,12 @@ void test_control_page_contract() {
   const auto channel_error_end = response.body.find("};", channel_error_gate);
   expect(
       data_channel_handler != std::string::npos && data_channel_peer_gate != std::string::npos &&
-          data_channel_parameters_gate != std::string::npos &&
+          data_channel_parameters_gate != std::string::npos && data_channel_worker_adopt != std::string::npos &&
           data_channel_status_reset != std::string::npos && data_channel_publish != std::string::npos &&
-          response.body.find("nextPeer.ondatachannel=e=>{\n    const channel=e.channel;\n    if(!current()){channel.close();return}", data_channel_handler) == data_channel_handler &&
+          response.body.find("nextPeer.ondatachannel=e=>{\n    let channel=e.channel;\n    if(!current()){channel.close();return}", data_channel_handler) == data_channel_handler &&
           data_channel_peer_gate < data_channel_parameters_gate &&
-          data_channel_parameters_gate < data_channel_status_reset &&
+          data_channel_parameters_gate < data_channel_worker_adopt &&
+          data_channel_worker_adopt < data_channel_status_reset &&
           data_channel_status_reset < data_channel_publish,
       "a stale peer can publish a control DataChannel or a new channel can inherit an old status sequence");
   expect(

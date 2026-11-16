@@ -22,7 +22,7 @@ function deferred() {
   return {promise, resolve, reject};
 }
 function fixture() {
-  const posts = [], peers = [], logs = [], gates = {}, resets = [];
+  const posts = [], peers = [], logs = [], gates = {}, resets = [], adopts = [];
   const presentation = {sampled_at_monotonic_ms:123, timestamp_scope:'browser_monotonic',
     frame_age_scope:'since_last_observed_valid_presented_frame_not_capture_latency',
     cameras:[{camera_id:'fixture-camera',frame_age_ms:7,presented_frames:12}]};
@@ -36,7 +36,10 @@ function fixture() {
     async getStats() { if (gates.stats) { gates.stats.entered=true; await gates.stats.promise; } return this.stats || new Map(); }
   }
   const context = vm.createContext({
-    MineTeleopControlWorker:require('../web/control_transport_worker.js'),URLSearchParams,location:{search:'?control_courier=page'},
+    MineTeleopControlWorker:{create(options) {
+      const actor=require('../web/control_transport_worker.js').create(options);
+      return {...actor,adopt(channel){adopts.push(channel);return actor.adopt(channel)}};
+    }},URLSearchParams,location:{search:'?control_courier=page'},
     MineTeleopControlTransport:require('../web/control_transport.js'),setInterval(){},
     peer:null,controlChannel:null,pendingIce:[],mediaPeerEpoch:0,mediaOfferScope:null,mediaHasOffer:false,
     retiredMediaScopes:new Set(),mediaScopeIssue:'',nativeControlSessionId:'session-fixture',nativeControlSessionGeneration:7,
@@ -58,7 +61,7 @@ function fixture() {
     controlOutcomeSession:{metrics:controlLogic.createControlOutcomeMetrics()},statusPanel:{},formatMetric(){return 'fixture'},
   });
   vm.runInContext(methods, context, {filename:'actual-shipped-ice-methods'});
-  return {context, peers, posts, logs, gates, resets, presentation};
+  return {context, peers, posts, logs, gates, resets, presentation, adopts};
 }
 const offer = (id, ufrag=id) => ({media_negotiation_id:id,sdp:`v=0\r\na=ice-ufrag:${ufrag}\r\n`,media_tracks:[]});
 const candidate = (id, ufrag=id, type='host') => ({media_negotiation_id:id,usernameFragment:ufrag,
@@ -66,6 +69,16 @@ const candidate = (id, ufrag=id, type='host') => ({media_negotiation_id:id,usern
 const icePosts = f => f.posts.filter(p=>p.route==='/api/webrtc/ice-candidate');
 const tests = [];
 function test(id, fn) { tests.push({id,fn}); }
+test('ICE-WORKER-ADOPTION-001', async()=>{
+  const f=fixture();await f.context.startFromOffer(offer('a'));
+  const old=f.peers[0];await f.context.startFromOffer(offer('b'));
+  const channel=()=>({label:'control',protocol:'mine-teleop-control-v1',ordered:false,maxRetransmits:0,close(){this.closed=true}});
+  const retired=channel();old.ondatachannel({channel:retired});assert.equal(retired.closed,true);assert.equal(f.adopts.length,0);
+  const invalid=channel();invalid.ordered=true;f.peers[1].ondatachannel({channel:invalid});
+  assert.equal(invalid.closed,true);assert.equal(f.adopts.length,0);
+  f.context.lastControlStatusSeq=99;const current=channel();f.peers[1].ondatachannel({channel:current});
+  assert.deepEqual(f.adopts,[current]);assert.equal(f.context.controlChannel,current);assert.equal(f.context.lastControlStatusSeq,0);
+});
 test('ICE-DIRECT-FALLBACK-001', async()=>{
   const f=fixture();
   await f.context.startFromOffer({...offer('direct-1'),ice_route_mode:'direct'});
