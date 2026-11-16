@@ -212,3 +212,22 @@ Every archived member hash and the copied archive hash were checked. Credentials
 private keys, dedicated browser profiles/CLI history and broad raw system
 captures are excluded. Raw system captures stay on the private Windows bench.
 No uninterrupted 60-minute acceptance has been achieved.
+
+## Authorized 20 MHz follow-up (A14–A16)
+
+After the user approved the temporary bandwidth trial, A14 failed the short
+load test at38.719 seconds. No60-minute arm completed. Auto and all original
+settings were restored. The miniport vehicle RX gap was1864.163ms and the
+independent kernel RX gap1864.190ms; the fixed-peer probe RX indication also
+paused1895.606ms while probe Tx continued. The boundary is earlier than a
+browser-only receive queue, but driver/firmware/RF/AP remain unresolved.
+See [full A14 configuration, timestamps, coverage and restoration](pr26-windows-20mhz-20261116.md).
+The earlier A13 approval-pending statement and private archive are historical
+snapshots, not the current status of the20MHz trial.1441 remains uninstalled.
+
+The original-AX follow-up A15 failed preparation with zero scored cycles.
+A16 passed preparation and completed 24 nine-scenario cycles, then failed at
+611.863 seconds with DC -> WSS/input clearing and a control-link braking-wait
+event. Its miniport/kernel vehicle RX gaps again included about491ms. All
+original adapter/power settings were restored. See the same follow-up report
+for full RTT cohorts, trace coverage, input feedback and acceptance limits.
