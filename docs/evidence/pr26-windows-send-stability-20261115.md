@@ -13,6 +13,9 @@ bases on PR25. No VPN or safety thresholds were changed.
 | A4 | Original 1336 driver, ax, roaming 0 | 739.656 | 29 | Failed |
 | A5 | Original 1336 driver, ax, kernel timestamps | 627.402 | 25 | Failed |
 | A6 | Original 1336 driver, ax, complete miniport metadata and gateway probe | 433.515 | 17 | Failed |
+| A8 | Worker courier, 1336 ax, roaming 0 | 1146.259 | 46 | Failed, physical wireless-path loss |
+| A9 | Worker courier, 1336 actual ac/VHT, roaming 0 | 192.352 | 7 | Failed, physical wireless-path loss |
+| A10 | Worker courier, 1336 ac; continuous WLAN queries removed | 534.242 | 21 | Failed, time-probe TCP connection timeout and fresh-neutral interlock |
 
 A3 was preparation only. The temporary 1338 driver was restored to 1336;
 performance/radio/roaming settings were restored between trials. A newer 1441
@@ -78,3 +81,60 @@ native publication expiry, actual channel pressure, and bounded diagnostics.
 The A5 physical-path burst remains unresolved by this software change. A full
 strict 60-minute, two-video, eight-direction-plus-Space mock run must still pass
 on the built repair before acceptance can be claimed.
+
+## Follow-up hardware-path and control evidence
+
+A7 passed three complete two-camera mock direction/brake cycles and explicit
+page-pause injections. With the actual Worker courier, commands continued during
+a 120 ms page pause. A 350 ms pause stopped fresh input at the existing 200 ms
+lease and required neutral input; held motion was not revived. This short run is
+not a 60-minute acceptance.
+
+A8 independently sent 11,131 primary UDP probes; the Mac received 11,125. All
+six absent sequences reached the physical MT7921 miniport Tx hook within
+1.449–2.758 ms of their send-call starts. Gateway probes timed out concurrently.
+Vehicle receive gaps at the same miniport were 417.753 and 487.214 ms. DPC
+coverage spans the fault on all sixteen CPUs; maximum DPC duration was 0.3068 ms.
+There was no page long task, and the Worker continued its sends during the
+ACK gap. The fault is beyond the recorded miniport Tx entry, with a common
+wireless path affected in both directions. A Tx hook is **not** radio transmission
+or send-completion proof: driver, firmware, RF and AP are not yet separated.
+
+A9 reproduced loss using actual ac/VHT (PHY type 8), not merely a configured
+registry value: eight probes were absent, receive gap 618.699 ms, and gateway
+probes timed out. Merely selecting Wi-Fi 5 and high performance did not fix it.
+
+A10 sent/received all 5,577 primary probes (maximum receive gap 140.094 ms).
+There were no UI long tasks. However, time candidate 19 completed two good
+four-timestamp exchanges, then its third TCP connection timed out after
+501.232 ms before any HTTP request was sent. The native time-refresh catch
+invalidated held input; `fresh_neutral_required` cleared W+D. The native clock
+trace records the failure before that clear and a healthy replacement cohort
+afterward. This evidence does not support changing input-store sampling or
+waiving the 25 ms clock requirement. The passive WLAN whitelist trace recorded
+zero scan/RPC events; an independent known-scan calibration proved the event
+filters and caller-PID projection. It does not identify scanning as the cause.
+
+Native `send_completed` for DC is a bridge publication, not a wire send. Use
+Worker `dc_command_sent` records when counting actual transmissions; legitimately
+superseded publications are not packet-loss evidence. Raw clocks from signaling,
+Windows and Mac must be aligned with measured anchors before comparing gaps.
+
+## Bounded time-probe connection repair
+
+The signaling listener now permits sequential GET `/time` probes on one
+connection, bounded to 32 requests and a three-second receive idle timeout.
+It reuses the existing persistent framing and anti-pipelining checks. A reused
+time-only connection cannot invoke an input/auth route or become a WebSocket;
+a first-request WebSocket keeps its previous socket timeout and handling. Other
+signaling HTTP requests retain connection-close behavior. Both signaling entry
+points explicitly select this policy.
+
+This removes seven TCP/TLS handshakes per normal seven-sample cohort in favor
+of one, while retaining fresh request/response timestamps for every exchange.
+It does not change sample count, four-timestamp validation, clock uncertainty,
+input expiry, accepted-anchor rules, or any failure/rearm action. It reduces
+exposure to isolated handshake loss and does not fix a common wireless outage.
+Runtime regression checks cover actual TCP reuse, the 32-request bound, explicit
+close, HTTP/1.0 close, route/upgrade isolation, and the first-WebSocket timeout.
+A fresh 60-minute hardware run is still required.

@@ -510,6 +510,58 @@ void test_bounded_persistent_http_framing() {
   server.stop();
 }
 
+void test_time_probe_persistence_isolated_from_input_and_websocket() {
+  std::atomic<int> non_time_dispatches{0}, websocket_dispatches{0};
+  mine_teleop::SimpleHttpServer server("127.0.0.1", 0,
+      [&](const mine_teleop::HttpRequest& request) {
+        if (request.path != "/time") ++non_time_dispatches;
+        return mine_teleop::ServerResponse::json(200, {{"path", request.path}});
+      }, 1024,
+      [&](int socket, const mine_teleop::HttpRequest& request) {
+        if (!request.headers.contains("upgrade")) return false;
+        timeval timeout{}; socklen_t size = sizeof(timeout);
+        expect(::getsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, &size) == 0 &&
+                   timeout.tv_sec == 0 && timeout.tv_usec == 0,
+               "first-request websocket inherited the time-probe idle timeout");
+        ++websocket_dispatches;
+        return false;
+      }, mine_teleop::HttpConnectionPolicy::BoundedTimeProbes);
+  server.start();
+  const auto base = "http://127.0.0.1:" + std::to_string(server.port());
+  mine_teleop::HttpClient http;
+  for (int i = 0; i < 7; ++i) {
+    if (i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const auto result = http.get(base + "/time?client_send_ms=" + std::to_string(i));
+    expect(result.status == 200 && result.timing.at("new_connections") == (i == 0 ? 1 : 0),
+           "time cohort did not reuse one TCP connection");
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  expect(http.post_json(base + "/input", {{"throttle", 1}}).status == 400 && non_time_dispatches == 0,
+         "time-only connection dispatched a later input request");
+  static_cast<void>(http.get(base + "/time?client_send_ms=8"));
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  expect(http.get(base + "/ws", {{"Upgrade", "websocket"}}).status == 400 && websocket_dispatches == 0,
+         "time-only connection reached the websocket handler");
+  const auto fresh = raw_http_exchange(server.port(),
+      "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
+  expect(fresh.starts_with("HTTP/1.1 200 ") && fresh.find("Connection: close") != std::string::npos &&
+             websocket_dispatches == 1,
+         "first-request websocket handling changed");
+  const auto close = raw_http_exchange(server.port(),
+      "GET /time?client_send_ms=9 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+  expect(close.find("Connection: close") != std::string::npos, "time probe ignored explicit close");
+  const auto legacy = raw_http_exchange(server.port(), "GET /time HTTP/1.0\r\nHost: localhost\r\n\r\n");
+  expect(legacy.find("Connection: close") != std::string::npos, "legacy time probe stayed open");
+  mine_teleop::HttpClient bounded;
+  for (int i = 0; i < 33; ++i) {
+    if (i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const auto result = bounded.get(base + "/time?client_send_ms=" + std::to_string(i));
+    expect(result.timing.at("new_connections") == (i == 0 || i == 32 ? 1 : 0),
+           "time-only connection request bound was not enforced");
+  }
+  server.stop();
+}
+
 void test_signaling_time_sync_applies_backward_utc_correction() {
   std::atomic<std::int64_t> server_offset_ms{80};
   mine_teleop::SimpleHttpServer server(
@@ -8594,7 +8646,11 @@ void test_source_aware_api_and_websocket_rate_limit() {
 
 int main(int argc, char** argv) {
   if (argc == 2 && std::string_view(argv[1]) == "--http-framing-only") {
-    try { test_bounded_persistent_http_framing(); return 0; }
+    try {
+      test_bounded_persistent_http_framing();
+      test_time_probe_persistence_isolated_from_input_and_websocket();
+      return 0;
+    }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
   }
   bool runtime_only = false;
@@ -8615,6 +8671,7 @@ int main(int argc, char** argv) {
       {"shared_control_protocol_vector", test_shared_control_protocol_vector},
       {"loopback_http_server_and_port_conflict", test_loopback_http_server_and_port_conflict},
       {"bounded_persistent_http_framing", test_bounded_persistent_http_framing},
+      {"time_probe_persistence_isolated_from_input_and_websocket", test_time_probe_persistence_isolated_from_input_and_websocket},
       {"signaling_time_sync_applies_backward_utc_correction",
        test_signaling_time_sync_applies_backward_utc_correction},
       {"driver_time_sync_uncertainty_fails_closed_at_production_default",

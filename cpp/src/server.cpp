@@ -2209,27 +2209,37 @@ void SimpleHttpServer::open_listener() {
 
 void SimpleHttpServer::serve_client(SocketHandle client_fd) const {
   bool persistence = connection_policy_ == HttpConnectionPolicy::BoundedKeepAlive;
-  if (persistence) {
+  const bool time_probes = connection_policy_ == HttpConnectionPolicy::BoundedTimeProbes;
+  const auto enable_idle_timeout = [&] {
 #if defined(_WIN32)
     const DWORD timeout = 3000;
-    persistence = ::setsockopt(native_socket(client_fd), SOL_SOCKET, SO_RCVTIMEO,
-                               reinterpret_cast<const char*>(&timeout), sizeof(timeout)) == 0;
+    return ::setsockopt(native_socket(client_fd), SOL_SOCKET, SO_RCVTIMEO,
+                       reinterpret_cast<const char*>(&timeout), sizeof(timeout)) == 0;
 #else
     const timeval timeout{3, 0};
-    persistence = ::setsockopt(native_socket(client_fd), SOL_SOCKET, SO_RCVTIMEO,
-                               &timeout, sizeof(timeout)) == 0;
+    return ::setsockopt(native_socket(client_fd), SOL_SOCKET, SO_RCVTIMEO,
+                       &timeout, sizeof(timeout)) == 0;
 #endif
-  }
+  };
+  if (persistence) persistence = enable_idle_timeout();
   std::string wire;
-  constexpr std::size_t max_requests = 512;
+  const std::size_t max_requests = time_probes ? 32 : 512;
   for (std::size_t count = 0; count < max_requests && !stopping_; ++count) {
     ServerResponse response;
     bool keep_alive = false;
     bool request_parsed = false;
     try {
-      auto request = parse_request(client_fd, max_body_bytes_, wire, persistence);
+      auto request = parse_request(client_fd, max_body_bytes_, wire, persistence || time_probes);
       request_parsed = true;
       request.peer_address = socket_peer_address(client_fd);
+      if (time_probes) {
+        const bool time_request = request.method == "GET" && request.path == "/time" &&
+            request.body.empty() && !request.headers.contains("upgrade");
+        // A time-only connection cannot later dispatch input or upgrade to a
+        // websocket. First-request websocket sockets retain their old timeout.
+        if (count && !time_request) throw std::invalid_argument("persistent connection is reserved for time probes");
+        if (!count && time_request) persistence = enable_idle_timeout();
+      }
       if (websocket_handler_ && websocket_handler_(client_fd, request)) return;
       const auto connection = request.headers.find("connection");
       const auto connection_value = connection == request.headers.end() ? std::string{} : lower(connection->second);

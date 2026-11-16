@@ -62,7 +62,7 @@ struct ServerResponse {
   static ServerResponse text(int status, std::string body, std::string content_type = "text/plain; charset=utf-8");
 };
 
-enum class HttpConnectionPolicy { Close, BoundedKeepAlive };
+enum class HttpConnectionPolicy { Close, BoundedKeepAlive, BoundedTimeProbes };
 
 class SimpleHttpServer {
  public:
