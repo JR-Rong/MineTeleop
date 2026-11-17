@@ -1,9 +1,10 @@
 # Orin NX hardware encoder and mock control, 2026-11-17
 
-Status: Jetson hardware encoding is operational. A18 failed; A19 is still in
-progress and has no acceptance result yet. Windows GUI testing is unavailable
-because the user cannot log into its desktop. These are Mac headless Chrome
-and NX same-LAN tests, not Windows, physical display, WAN/5G or vehicle acceptance.
+Status: Jetson hardware encoding is operational. A18 and A19 failed. Windows
+GUI testing is unavailable because the user cannot log into its desktop. A20
+used Windows headless Edge over SSH and also failed. All three use the
+authorized shared LAN; none establishes physical display, WAN/5G or vehicle
+acceptance.
 
 ## Target and minimal adaptation
 
@@ -109,13 +110,90 @@ uniquely identify the Wi-Fi/AP/WebRTC queue component.
 
 ## A19: temporary NX interface power-saving Off
 
-The designated NX Wi-Fi interface was originally On. A19 switches only this
+The designated NX Wi-Fi interface was originally On. A19 switched only this
 interface to Off without restarting it; all other test settings and runtime
 binaries are retained. An independent root systemd timer restores the original
-On state at 11:51:10 UTC, and explicit restoration/readback is required after
-the test. No persistent NetworkManager, VPN, router or Windows changes were made.
+On state at 11:51:10 UTC. Explicit restoration completed earlier at 10:49:57.473
+UTC; readback confirmed On and the timer inactive. No persistent NetworkManager,
+VPN, router or Windows changes were made.
 
-A19 result and final restoration are pending; no 60-minute pass is claimed.
-An eventual pass under this condition would not, by itself, prove the cause of
-A18 or establish WAN/5G or Windows reliability. Full raw transport, safety and
-input-feedback logs must be audited beyond the periodic UI samples.
+A19 failed after 1384.043 wall /1384.0411 monotonic seconds, with 56 complete
+nine-input cycles. During cycle57 Space brake the path changed from DC to WSS;
+the final sample had no matching accepted DC intent. Video age was261.8ms,
+clock uncertainty7ms and sampled stop sequence0. Raw logs contained control-link
+and critical-video braking-wait events. Native publication counts were
+DC26624/WSS5; accepted result RTT p50/p95/p99/max was17/35/39/220ms.
+Disabling interface power saving did not meet the acceptance requirement and
+does not establish the root cause. Failed prefixes are retained separately.
+
+## A20: Windows headless Edge, original NX power-saving On
+
+Headless Edge157 can execute the real UI and keyboard handlers through the
+authorized Windows SSH account without an interactive desktop login. Its
+1600x1000 viewport reports focused and visible; no product focus, input lease or
+video freshness gate is bypassed. Browser creation and the bounded test run
+share one persistent SSH session. A prior preparation attempt exited before
+any scored input and is retained separately.
+
+Windows retains original MediaTek driver3.0.1.1336. No manual NIC, power-plan,
+VPN or driver change is made; the client's normal scoped Wi-Fi streaming API
+still runs through its ordinary lifecycle. The immutable Windows controller
+SHA256 is `90b3fcd8b9029ed9214effe6852bb7fee376bd49462a956f35a6f968f8a766b3`.
+Both actual endpoint addresses are checked against physical-interface
+allowlists. This is a control-path test, not visible GUI/render acceptance or
+a controlled native-versus-web performance comparison.
+
+A20 failed after462.647 wall /462.6527 monotonic seconds, after18 complete
+nine-input cycles. Cycle19 failed during back-right: camera0 age537.1ms,
+camera1 age386.9ms, driver state DEGRADED, clock uncertainty9ms, focused page
+and sampled stop sequence0. All678 periodic samples still reported direct DC;
+the actual selected pair was physical-endpoint IPv6/UDP host-to-host.
+The complete raw scored window contained one control-link braking-wait event,
+9048 DC /9 WSS native publications and one vehicle callback received through
+the native signaling WebSocket. Zero sampled stop sequence is not a pass.
+
+There were8974 unique recorded Worker DC sends, five without matched vehicle
+callbacks and seven without correlated results; missing records are not
+declared packet loss. Accepted-result RTT p50/p95/p99/max was21/34/60/112ms,
+but vehicle callback command age reached535ms including rejected commands.
+Sender wakeup lag max3ms, native send-call max1ms and vehicle mutex wait max1ms
+do not establish the downstream queue/radio component responsible for the gap.
+
+At the in-window braking-wait event, each lane had14000 encoded frames,
+zero encoder backpressure/failure counts, last encoded ages8/14ms and maximum
+RTP-output gap43ms. Each had discarded one stale AU and completed a requested
+fresh-IDR recovery in32ms, with no outstanding IDR wait. This confirms the
+adapter was working during real input traffic; RTP output is not physical NIC
+transmission or receiver delivery evidence. It does not prove that hardware
+encoding solves the control/network tail problem.
+
+The harness sent real W/S/A/D combinations and Space; it did not merely observe
+video. Its input-feedback audit confirmed18 complete nine-scenario groups and
+the completed prefix of cycle19. Raw runtime safety intervention makes the
+60-minute result FAILED. The owned client/browser and NX fixture stopped;
+CAN remained down, both cameras were released, NX power saving remained its
+original On, and Windows retained driver3.0.1.1336. No VPN or safety changes.
+
+## Retained evidence and review
+
+The adapter commit is `744518bbabbd2e0feb2343873b72a5d84ba57591` on PR26,
+targeting PR25 (`rjr/cx/orin-isx031-cpu`). Its Build, Offline and Windows native
+receiver CI workflows all passed. Reuse/quality/efficiency review retained the
+existing backend and selection order, isolated vendor parameter differences
+in the existing stage builder, and added no per-frame work or new queues.
+
+Failed attempts are archived separately with member SHA256 verification and
+credential/private-key scans. A18 archive SHA256:
+`1e66df5e9a5da40ae3059c396fdad96784c05395551f993434cb185d5969cc9a`;
+A19: `a7ae818e1a31e0cea33642ec3ee6a385fa355d4943e81dabea35c76b24cc306c`.
+Original failed probe/setup receipts are retained. A20 Windows collection was
+verified against its17-member hash manifest; full scored traces, rotated-log
+support, original vehicle output and normalization receipt are retained.
+A20 final archive SHA256:
+`fe4bbf547309b9f306c776c0a16ffdd1efb0e2dc90f57d33ade0549ff7e6c5b1`.
+All three archives were copied to project artifact storage and verified again.
+Expired fixture credentials/private keys and credential-bearing CLI captures
+were removed; user SSH keys were retained. Windows final readback confirmed its
+original power plan, all14 saved NIC properties, driver1336 and no owned
+remaining client process or power journal. Task-owned idle build containers
+were stopped. No failure prefixes are concatenated to claim duration.
