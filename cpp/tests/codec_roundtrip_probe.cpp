@@ -10,10 +10,12 @@
 #include <gst/video/video.h>
 #include <charconv>
 #include <chrono>
+#include <cstdio>
 #include <iostream>
 #include <memory>
 #include <map>
 #include <mutex>
+#include <unistd.h>
 
 namespace {
 using namespace mine_teleop;
@@ -94,7 +96,9 @@ Json properties(GstElement* element) {
   // means unsupported, never a guessed equivalent from another backend.
   for(const char* name:{"bframes","b-frames","rc-lookahead","sync-lookahead","zerolatency","tune","preset",
       "speed-preset","rc-mode","rate-control","bitrate","key-int-max","keyframe-period",
-      "vbv-buf-capacity","vbv-buffer-size","async-depth","num-extra-surfaces","max-threads","disable-dpb"}) {
+      "vbv-buf-capacity","vbv-buffer-size","async-depth","num-extra-surfaces","max-threads","disable-dpb",
+      "num-B-Frames","control-rate","iframeinterval","idrinterval","insert-sps-pps","copy-timestamp",
+      "preset-level","vbv-size"}) {
     const auto* spec=g_object_class_find_property(G_OBJECT_GET_CLASS(element),name);
     result[name]=nullptr;
     if(!spec || !(spec->flags&G_PARAM_READABLE))continue;
@@ -206,6 +210,19 @@ Json probe(int argc,char** argv) {
 }
 }
 int main(int argc,char** argv) {
-  try {const auto result=probe(argc,argv);std::cout<<result.dump()<<'\n';return result.at("passed").get<bool>()?0:1;}
-  catch(const std::exception& error){std::cout<<nlohmann::json({{"schema","codec-roundtrip-v1"},{"passed",false},{"stage","arguments"},{"error",error.what()}}).dump()<<'\n';return 1;}
+  // Vendor libraries can print to stdout during encoder/decoder teardown.
+  // Keep that diagnostic output on stderr without weakening the JSON protocol.
+  const int report_fd=dup(STDOUT_FILENO);
+  if(report_fd<0)return 2;
+  if(dup2(STDERR_FILENO,STDOUT_FILENO)<0){close(report_fd);return 2;}
+  auto* report=fdopen(report_fd,"w");
+  if(!report){close(report_fd);return 2;}
+  Json result;
+  try {result=probe(argc,argv);}
+  catch(const std::exception& error){result={{"schema","codec-roundtrip-v1"},{"passed",false},{"stage","arguments"},{"error",error.what()}};}
+  const auto text=result.dump();
+  const bool written=std::fprintf(report,"%s\n",text.c_str())>=0;
+  const bool closed=std::fclose(report)==0;
+  if(!written||!closed)return 2;
+  return result.at("passed").get<bool>()?0:1;
 }

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -48,8 +49,8 @@ class NvencVideoEncoder final : public VideoEncoder {
   [[nodiscard]] EncoderBackend backend() const override { return EncoderBackend::Nvenc; }
   [[nodiscard]] VideoCodec codec() const override { return codec_; }
   [[nodiscard]] std::string factory_name() const override {
-    return codec_ == VideoCodec::H265 ? first_available({"nvh265enc", "nvautogpuh265enc"})
-                                      : first_available({"nvh264enc", "nvautogpuh264enc"});
+    return codec_ == VideoCodec::H265 ? first_available({"nvh265enc", "nvautogpuh265enc", "nvv4l2h265enc"})
+                                      : first_available({"nvh264enc", "nvautogpuh264enc", "nvv4l2h264enc"});
   }
   [[nodiscard]] std::string pipeline_stage(
       const VideoEncoderSettings& settings,
@@ -147,6 +148,22 @@ std::string build_nvenc_pipeline_stage(
     unsigned int gstreamer_major,
     unsigned int gstreamer_minor) {
   std::ostringstream value;
+  if (factory_name == "nvv4l2h264enc" || factory_name == "nvv4l2h265enc") {
+    if (settings.bitrate_kbps <= 0 ||
+        static_cast<std::uint64_t>(settings.bitrate_kbps) > std::numeric_limits<unsigned int>::max() / 1000U ||
+        settings.keyframe_interval_frames <= 0) {
+      throw std::invalid_argument("Jetson encoder bitrate or keyframe interval is outside hardware bounds");
+    }
+    // Jetson accepts NVMM surfaces and bits/s; the desktop NVENC plugin uses
+    // system-memory input and kbit/s with a different set of properties.
+    value << "nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! "
+          << factory_name << " name=" << element_name
+          << " bitrate=" << static_cast<std::uint64_t>(settings.bitrate_kbps) * 1000U
+          << " control-rate=1 iframeinterval=" << settings.keyframe_interval_frames
+          << " idrinterval=" << settings.keyframe_interval_frames
+          << " num-B-Frames=0 insert-sps-pps=true copy-timestamp=true preset-level=1";
+    return value.str();
+  }
   value << factory_name << " name=" << element_name
         << " bitrate=" << settings.bitrate_kbps
         << " gop-size=" << settings.keyframe_interval_frames

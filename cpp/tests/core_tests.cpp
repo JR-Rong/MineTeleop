@@ -4884,6 +4884,31 @@ void test_nvenc_pipeline_stage_tracks_gstreamer_property_compatibility() {
       "GStreamer 1.24 NVENC stage did not apply preset and ultra-low-latency tune");
 }
 
+void test_jetson_encoder_uses_nvmm_and_hardware_units() {
+  const auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.orin-nx-isx031-bench.yaml");
+  const auto candidates = mine_teleop::encoder_candidate_order(config.hardware, mine_teleop::VideoCodec::H264);
+  expect(config.vehicle_adapter.type == "mock" && config.hardware.require_hardware_encoder,
+         "Jetson bench must keep mock isolation and require actual hardware");
+  expect(candidates.size() == 1 && candidates.front().backend == mine_teleop::EncoderBackend::Nvenc,
+         "Jetson hardware-only configuration admitted a CPU fallback");
+  for (const auto* factory : {"nvv4l2h264enc", "nvv4l2h265enc"}) {
+    const auto stage = mine_teleop::build_nvenc_pipeline_stage(factory, {1500, 7}, "encoder_front", 1, 20);
+    expect(stage.starts_with("nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! "),
+           "Jetson encoder did not receive converted NVMM surfaces");
+    expect(stage.find(std::string(factory) + " name=encoder_front bitrate=1500000 ") != std::string::npos,
+           "Jetson bitrate was not converted from kbit/s to bit/s");
+    for (const auto* property : {"control-rate=1", "iframeinterval=7", "idrinterval=7",
+                                 "num-B-Frames=0", "copy-timestamp=true", "insert-sps-pps=true"}) {
+      expect(stage.find(property) != std::string::npos, "Jetson recovery/timestamp contract missing");
+    }
+    expect(stage.find("zerolatency=") == std::string::npos && stage.find("gop-size=") == std::string::npos,
+           "Jetson stage inherited incompatible desktop NVENC properties");
+  }
+  expect_throws([] {
+    static_cast<void>(mine_teleop::build_nvenc_pipeline_stage("nvv4l2h264enc", {std::numeric_limits<int>::max(), 7}, "enc", 1, 20));
+  }, "Jetson bitrate overflow was accepted");
+}
+
 void test_cpu_encoder_requires_opt_in_and_preserves_codec_fallback() {
   const auto path = "configs/vehicle-agent.orin-cpu-bench.yaml";
   const auto config = mine_teleop::load_vehicle_config(path);
@@ -5402,6 +5427,7 @@ int main() {
       {"cpu_encoder_requires_opt_in_and_preserves_codec_fallback", test_cpu_encoder_requires_opt_in_and_preserves_codec_fallback},
       {"cpu_h264_encoder_produces_parsed_baseline_buffers", test_cpu_h264_encoder_produces_parsed_baseline_buffers},
       {"nvenc_pipeline_stage_tracks_gstreamer_property_compatibility", test_nvenc_pipeline_stage_tracks_gstreamer_property_compatibility},
+      {"jetson_encoder_uses_nvmm_and_hardware_units", test_jetson_encoder_uses_nvmm_and_hardware_units},
       {"native_testsrc_acquisition_does_not_spawn_ffmpeg", test_native_testsrc_acquisition_does_not_spawn_ffmpeg},
       {"basler_camera_uses_minimal_aravis_bridge", test_basler_camera_uses_minimal_aravis_bridge},
       {"native_driver_to_vehicle_signaling_control_payload", test_native_driver_to_vehicle_signaling_control_payload},

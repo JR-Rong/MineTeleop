@@ -402,6 +402,15 @@ CAN netdev 置为 DOWN：部署阶段仍需先用 `ip link` 按配置设置波�
 GStreamer factory，`max_end_to_end_latency_ms` 与 `min_realtime_fps` 用于车端和浏览器
 验收汇总。DRI 节点变化只修改本节配置，不依赖宿主机 FFmpeg。
 
+Jetson Orin NX 也使用 `nvenc` 后端：桌面 `nvh264enc`/`nvautogpuh264enc`
+不可用时，检查 `nvv4l2h264enc`（H.265 对应 `nvv4l2h265enc`）。Jetson 分支用
+`nvvidconv` 将输入转为 NVMM/NV12，将 kbit/s 换算为 bit/s，使用其自己的 CBR、
+I/IDR 间隔、无 B 帧和时间戳复制参数；不向它传入桌面 NVENC 的 `preset=p1`
+或 `tune` 参数。参见 `configs/vehicle-agent.orin-nx-isx031-bench.yaml`：它保持 mock、
+零速、关闭录像和上传，并强制硬件编码，不会静默回退 CPU。插件可创建不等于
+硬件可用，仍需真实帧编码、IDR/PTS 和接收端验证。当前采集、色彩转换和缩放仍有
+CPU 处理，不宣称全链路 zero-copy，也不改变原有队列或安全门槛。
+
 `hardware.network.interface` 会进入弱网矩阵和目标主机验收脚本。`field_safety` 用来记录现场
 安全链路的最低门禁：调试阶段、目标车速、牵引转矩满量程、是否必须先收到 CAN feedback、
 是否必须本地确认急停复位、是否强制时间同步。这些软件门禁不替代现场安全员和物理急停，
