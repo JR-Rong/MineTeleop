@@ -992,6 +992,9 @@ void actual_feedback_selection_is_independent_and_rejects_retired_statuses() {
   expect(fallback.at("epoch") == before.at("epoch") && fallback.at("path") == "dc",
       "return-only fault changed healthy command axis: " + Json{
           {"before", before}, {"after", fallback}, {"last_reason", fixture.last_result_reason},
+          {"longest_pump_gap_ms", fixture.longest_pump_gap_ms},
+          {"last_input_age_ms", steady() - fixture.last_input},
+          {"last_command_age_ms", fixture.last_command_age_ms},
           {"first_vehicle_rejection", fixture.first_vehicle_rejection}}.dump());
   fixture.received_statuses.clear();
   fixture.vehicle_socket.send_json(fixture.feedback_status(++fixture.feedback_status_sequence, fixture.feedback_fence.state()));
