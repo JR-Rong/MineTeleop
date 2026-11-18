@@ -43,6 +43,9 @@ class ControlTransportSender {
   [[nodiscard]] bool negotiated() const { return stamp_.epoch != 0; }
   [[nodiscard]] bool selecting() const { return selecting_; }
   [[nodiscard]] bool holding_motion() const { return selecting_ || qualifying_; }
+  [[nodiscard]] std::optional<std::string> recovery_gear() const {
+    return holding_motion() || awaiting_neutral_ ? last_accepted_gear_ : std::nullopt;
+  }
   [[nodiscard]] const std::string& attempt() const { return stamp_.media_attempt; }
   [[nodiscard]] std::uint64_t revision() const { return revision_; }
 
@@ -56,6 +59,7 @@ class ControlTransportSender {
     if (previous == std::numeric_limits<std::uint64_t>::max())
       throw std::runtime_error("control transport epoch exhausted");
     stamp_ = {previous + 1, previous, 0, path, std::move(attempt), true};
+    awaiting_neutral_ = last_accepted_gear_.has_value();
     selecting_ = true; qualifying_ = path == ControlPath::DataChannel;
     deadline_ = now + recovery_timeout_ms;
     if (qualifying_) { baseline_wss_ms_ = wss_.mean(); dc_.reset(); last_dc_result_ms_ = now; }
@@ -140,7 +144,8 @@ class ControlTransportSender {
     sent_.push_back({payload.at("seq").get<std::uint64_t>(), payload.at("intent_seq").get<std::uint64_t>(),
         actual_path, payload.value("control_transport", Json(nullptr)), started_ms,
         payload.at("throttle").get<double>() == 0.0 && payload.at("steering").get<double>() == 0.0,
-        payload.at("estop").get<bool>()});
+        payload.at("estop").get<bool>(), payload.value("intent_fresh", false),
+        payload.at("gear").get<std::string>()});
   }
 
   Receipt note_result(const Json& result, std::int64_t now, int timeout_ms) {
@@ -170,12 +175,22 @@ class ControlTransportSender {
         (!sent.stamp.is_null() && sent.stamp.at("epoch") == stamp_.epoch &&
          sent.stamp.at("path").get_ref<const std::string&>() == control_path_name(stamp_.path) && sent.stamp.at("media_attempt") == stamp_.media_attempt);
     receipt.current = current;
+    const bool admitted = result.at("transport_admitted").get<bool>();
+    const bool rearm = result.at("rearm_required").get<bool>();
+    if (current && admitted && !sent.estop) {
+      if (rearm && last_accepted_gear_) awaiting_neutral_ = true;
+      if (sent.fresh && result.at("accepted").get<bool>() &&
+          (!awaiting_neutral_ || (sent.neutral && sent.gear == last_accepted_gear_ &&
+              age <= NativeControlAckRecovery::kFreshAckMs))) {
+        last_accepted_gear_ = sent.gear;
+        awaiting_neutral_ = false;
+      }
+    }
     if (current && sent.path == ControlPath::Wss) { last_wss_result_ms_ = now; last_wss_result_age_ms_ = age; }
     // The vehicle can admit a frame on this epoch while refusing to apply it
     // until neutral is seen. That result still requests re-arm, but must not
     // restart either of the direct route's stall clocks.
-    receipt.dc_ack_progress = current && sent.path == ControlPath::DataChannel &&
-        result.at("transport_admitted").get<bool>() && !result.at("rearm_required").get<bool>();
+    receipt.dc_ack_progress = current && sent.path == ControlPath::DataChannel && admitted && !rearm;
     if (receipt.dc_ack_progress) last_dc_result_ms_ = now;
     // A DC trial can happen before the operator has confirmed the required
     // session profile. If that is the reason it was rejected, one later
@@ -238,7 +253,14 @@ class ControlTransportSender {
     }
     bool healthy(std::int64_t now) const { return mean().has_value() && now >= progress && now - progress <= NativeControlAckRecovery::kFreshAckMs; }
   };
-  struct Sent { std::uint64_t seq, intent; ControlPath path; Json stamp; std::int64_t started; bool neutral, estop; };
+  struct Sent {
+    std::uint64_t seq, intent;
+    ControlPath path;
+    Json stamp;
+    std::int64_t started;
+    bool neutral, estop, fresh;
+    std::string gear;
+  };
   ControlTransportStamp stamp_;
   bool selecting_{false}, qualifying_{false}, dc_is_p2p_{false};
   std::uint64_t remote_epoch_{0}, revision_{0}, last_result_seq_{0};
@@ -247,6 +269,8 @@ class ControlTransportSender {
   std::deque<Sent> sent_;
   Health wss_, dc_;
   std::optional<double> baseline_wss_ms_;
+  std::optional<std::string> last_accepted_gear_;
+  bool awaiting_neutral_{false};
 };
 
 }  // namespace mine_teleop::detail

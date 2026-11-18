@@ -6549,14 +6549,6 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
           select_control_wss_locked(monotonic_ms, recovery_timeout_ms);
       }
       if (control_transport_sender_.revision() != previous_transport_revision) native_control_intent_.invalidate(true);
-      const bool transport_hold = control_transport_sender_.holding_motion() ||
-          control_transport_sender_.revision() != previous_transport_revision;
-      if (!command.estop && transport_hold) {
-        command.throttle = command.steering = 0.0;
-        command.operator_active = sample.fresh && command.brake > 0.0;
-        payload["intent_fresh"] = sample.fresh;
-        payload["intent_requires_fresh_input"] = true;
-      }
       ack_stall_age_ms = control_signaling_ack_window_.stall_age_ms(monotonic_ms);
       unacknowledged_age_ms =
           control_signaling_ack_window_.oldest_age_ms(monotonic_ms);
@@ -6599,6 +6591,17 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
         // V7 compatibility: old relays may strip the new cause field, but
         // input-not-ready still requests the same independent safety brake.
         if (control_signaling_ack_recovery_.waiting()) command.operator_input_ready = false;
+        payload["intent_fresh"] = sample.fresh;
+        payload["intent_requires_fresh_input"] = true;
+      }
+      const auto recovery_gear = control_transport_sender_.recovery_gear();
+      if (!command.estop && (control_transport_sender_.holding_motion() ||
+          control_transport_sender_.revision() != previous_transport_revision || recovery_gear)) {
+        // A transport boundary withdraws movement and preserves the last
+        // vehicle-confirmed gear until a fresh neutral command is accepted.
+        command.throttle = command.steering = 0.0;
+        if (recovery_gear) command.gear = *recovery_gear;
+        command.operator_active = sample.fresh && command.brake > 0.0;
         payload["intent_fresh"] = sample.fresh;
         payload["intent_requires_fresh_input"] = true;
       }

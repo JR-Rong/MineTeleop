@@ -198,6 +198,47 @@ void neutral_required_does_not_postpone_direct_fallback() {
       sender.selecting() && !sender.owns_dc_publication(moving),
       "neutral-required rejection postponed the fenced WSS fallback");
 }
+void rearm_preserves_the_last_accepted_gear_across_routes() {
+  ControlTransportSender sender;
+  auto reverse = payload(1, 100);
+  reverse["gear"] = "R";
+  sender.note_sent(reverse, ControlPath::Wss, 100);
+  expect(sender.note_result(response(reverse), 110, 5000).matched, "reverse acceptance lost");
+  expect(!sender.recovery_gear(), "stable WSS blocked gear changes");
+  sender.set_data_channel_is_p2p(true);
+  expect(sender.consider_dc("media-a", 120, 5000) && sender.recovery_gear() == "R",
+      "direct upgrade lost the accepted reverse gear");
+
+  auto reject_selection = [&](std::uint64_t seq, ControlPath path, std::int64_t now) {
+    auto forward = payload(seq, now);
+    sender.decorate(forward);
+    sender.note_sent(forward, path, now);
+    auto rejected = response(forward, false, true);
+    rejected["reason"] = "degraded_neutral_required";
+    rejected["rearm_required"] = true;
+    rejected["control_status_seq"] = seq;
+    expect(sender.note_result(rejected, now + 10, 5000).matched,
+        "transport selection rejection lost");
+    expect(sender.recovery_gear() == "R", "rejected forward gear replaced reverse");
+  };
+  reject_selection(2, ControlPath::DataChannel, 140);
+  sender.begin(ControlPath::Wss, {}, 170, 5000);
+  reject_selection(3, ControlPath::Wss, 180);
+  expect(!sender.selecting() && sender.recovery_gear() == "R",
+      "transport-only acknowledgement cleared the neutral gear guard");
+
+  for (std::uint64_t seq = 4; seq <= 5; ++seq) {
+    auto neutral = payload(seq, seq * 50);
+    neutral["gear"] = "R";
+    neutral["intent_fresh"] = seq == 5;
+    sender.decorate(neutral);
+    sender.note_sent(neutral, ControlPath::Wss, seq * 50);
+    expect(sender.note_result(response(neutral), seq * 50 + 10, 5000).matched,
+        "neutral result lost");
+    expect(sender.recovery_gear().has_value() == (seq == 4),
+        "only a fresh accepted neutral command should release the gear guard");
+  }
+}
 void slower_dc_and_lost_selection() {
   ControlTransportSender sender; baseline(sender); expect(sender.consider_dc("media-a", 200, 5000), "trial missing");
   for (std::uint64_t seq = 4; seq <= 6; ++seq) {
@@ -499,12 +540,13 @@ int main() {
     driver_negotiates_transient_hold_from_offer();
     late_dc_results_withdraw_publication_in_result_handler();
     neutral_required_does_not_postpone_direct_fallback();
+    rearm_preserves_the_last_accepted_gear_across_routes();
     failed_direct_trials_back_off_and_exhaust_per_attempt();
     mock_idle_reprobe_is_fenced_fresh_and_once_per_attempt();
     mock_idle_reprobe_requires_all_fresh_neutral_guards();
     confirmed_profile_permits_only_one_new_bounded_dc_budget();
     version_scope_and_expiry(); single_receiver_epoch_replay_and_emergency(); exact_result_and_neutral_qualification();
     slower_dc_and_lost_selection(); cloud_ingress_without_vehicle_result_can_only_start_a_neutral_trial(); healthy_proven_p2p_is_preferred_to_a_faster_cloud_backup(); signatures_bind_native_bytes_and_vehicle_results(); private_signing_material_is_not_public_session_state(); bounded_status_rejects_unsupported_kinds_and_scope_mismatch(); real_service_switch_does_not_disable_watchdog();
-    std::cout << "18 control transport cases passed; real common safety service, no sockets\n";
+    std::cout << "19 control transport cases passed; real common safety service, no sockets\n";
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
