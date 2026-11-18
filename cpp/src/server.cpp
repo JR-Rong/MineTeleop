@@ -5725,8 +5725,7 @@ bool DriverConsoleRuntime::consume_vehicle_control_result_locked(const Json& inp
       rearm = true;
     }
   }
-  if (receipt.current && result.contains("control_transport") && result.at("control_transport").at("path") == "dc" &&
-      result.at("transport_admitted").get<bool>() && seq > control_dc_last_ack_seq_) {
+  if (receipt.dc_ack_progress && seq > control_dc_last_ack_seq_) {
     if (control_dc_ack_window_.acknowledge_through(seq, now)) {
       control_dc_last_ack_seq_ = seq;
       const auto transition = control_dc_ack_recovery_.note_ack_progress(now, seq, receipt.round_trip_ms, timeout_ms);

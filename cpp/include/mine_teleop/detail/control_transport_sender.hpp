@@ -21,7 +21,13 @@ inline bool mock_idle_reprobe_eligible(bool enabled, bool dc_ready, bool ack_wai
 // every command sequence; the browser is a bounded byte courier, never a source.
 class ControlTransportSender {
  public:
-  struct Receipt { bool matched{false}; bool boundary{false}; std::int64_t round_trip_ms{0}; bool current{false}; };
+  struct Receipt {
+    bool matched{false};
+    bool boundary{false};
+    std::int64_t round_trip_ms{0};
+    bool current{false};
+    bool dc_ack_progress{false};
+  };
   void reset() { *this = {}; }
   void reset_feedback_comparison() { wss_.reset(); dc_.reset(); baseline_wss_ms_.reset(); }
   void set_data_channel_is_p2p(bool value) { dc_is_p2p_ = value; }
@@ -165,8 +171,12 @@ class ControlTransportSender {
          sent.stamp.at("path").get_ref<const std::string&>() == control_path_name(stamp_.path) && sent.stamp.at("media_attempt") == stamp_.media_attempt);
     receipt.current = current;
     if (current && sent.path == ControlPath::Wss) { last_wss_result_ms_ = now; last_wss_result_age_ms_ = age; }
-    if (current && sent.path == ControlPath::DataChannel && result.at("transport_admitted").get<bool>())
-      last_dc_result_ms_ = now;
+    // The vehicle can admit a frame on this epoch while refusing to apply it
+    // until neutral is seen. That result still requests re-arm, but must not
+    // restart either of the direct route's stall clocks.
+    receipt.dc_ack_progress = current && sent.path == ControlPath::DataChannel &&
+        result.at("transport_admitted").get<bool>() && !result.at("rearm_required").get<bool>();
+    if (receipt.dc_ack_progress) last_dc_result_ms_ = now;
     // A DC trial can happen before the operator has confirmed the required
     // session profile. If that is the reason it was rejected, one later
     // authenticated, fresh neutral WSS acceptance permits one new bounded

@@ -170,6 +170,34 @@ void exact_result_and_neutral_qualification() {
   expect(sender.path() == ControlPath::DataChannel && !sender.holding_motion(), "faster qualified DC not retained");
   expect(sender.observe(false, "media-a", 400, 5000) && sender.path() == ControlPath::Wss && sender.selecting(), "DC loss did not fence WSS fallback");
 }
+void neutral_required_does_not_postpone_direct_fallback() {
+  ControlTransportSender sender;
+  sender.set_data_channel_is_p2p(true);
+  expect(sender.consider_dc("media-a", 0, 5000), "direct trial missing");
+  for (std::uint64_t seq = 1; seq <= 3; ++seq) {
+    auto frame = payload(seq, seq * 50);
+    sender.decorate(frame);
+    sender.note_sent(frame, ControlPath::DataChannel, seq * 50);
+    expect(sender.note_result(response(frame, true, seq == 1), seq * 50 + 20, 5000).matched,
+        "healthy direct result lost");
+  }
+  expect(!sender.holding_motion(), "direct trial did not qualify");
+  auto moving = payload(4, 620);
+  moving["steering"] = 0.25;
+  sender.decorate(moving);
+  sender.note_sent(moving, ControlPath::DataChannel, 620);
+  auto rejected = response(moving, false);
+  rejected["reason"] = "degraded_neutral_required";
+  rejected["rearm_required"] = true;
+  rejected["control_status_seq"] = 1;
+  const auto receipt = sender.note_result(rejected, 650, 5000);
+  expect(receipt.matched && receipt.current && !receipt.dc_ack_progress,
+      "authenticated rejection counted as direct ACK progress");
+  expect(!sender.observe(true, "media-a", 670, 5000), "direct fallback fired before its existing deadline");
+  expect(sender.observe(true, "media-a", 671, 5000) && sender.path() == ControlPath::Wss &&
+      sender.selecting() && !sender.owns_dc_publication(moving),
+      "neutral-required rejection postponed the fenced WSS fallback");
+}
 void slower_dc_and_lost_selection() {
   ControlTransportSender sender; baseline(sender); expect(sender.consider_dc("media-a", 200, 5000), "trial missing");
   for (std::uint64_t seq = 4; seq <= 6; ++seq) {
@@ -470,12 +498,13 @@ int main() {
     publication_is_owned_only_by_its_current_dc_epoch();
     driver_negotiates_transient_hold_from_offer();
     late_dc_results_withdraw_publication_in_result_handler();
+    neutral_required_does_not_postpone_direct_fallback();
     failed_direct_trials_back_off_and_exhaust_per_attempt();
     mock_idle_reprobe_is_fenced_fresh_and_once_per_attempt();
     mock_idle_reprobe_requires_all_fresh_neutral_guards();
     confirmed_profile_permits_only_one_new_bounded_dc_budget();
     version_scope_and_expiry(); single_receiver_epoch_replay_and_emergency(); exact_result_and_neutral_qualification();
     slower_dc_and_lost_selection(); cloud_ingress_without_vehicle_result_can_only_start_a_neutral_trial(); healthy_proven_p2p_is_preferred_to_a_faster_cloud_backup(); signatures_bind_native_bytes_and_vehicle_results(); private_signing_material_is_not_public_session_state(); bounded_status_rejects_unsupported_kinds_and_scope_mismatch(); real_service_switch_does_not_disable_watchdog();
-    std::cout << "17 control transport cases passed; real common safety service, no sockets\n";
+    std::cout << "18 control transport cases passed; real common safety service, no sockets\n";
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
