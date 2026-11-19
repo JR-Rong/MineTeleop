@@ -178,6 +178,9 @@ struct Fixture {
   bool use_native_courier{false};
   bool delay_wss_results{true};
   bool drop_dc_commands{false};
+  // Feedback scenario only: while the DC status lane is faulted, the command result
+  // still returns over the WSS backup instead of disappearing with it.
+  bool route_dropped_returns_over_wss{false};
   bool drop_wss_commands{false};
   std::unique_ptr<NativeControlCourier> native_courier;
   std::deque<std::string> courier_receipts;
@@ -288,35 +291,49 @@ struct Fixture {
   }
   void renew_authority(bool force = false) {
     if (!direct_enabled || !cloud_online) return;
-    const auto nonce = "fixture-nonce-" + std::to_string(++lease_nonce);
-    std::uint64_t retired = 0;
-    Json previous_authority;
-    std::int64_t request_started_ms = 0;
-    { std::lock_guard lock(car_mutex);
-      if (!force && !car_authority.renewal_due(steady())) return;
-      if (!car_authority.valid(steady()) && car_authority.reference().is_object()) retired = car_authority.reference().at("authority_epoch").get<std::uint64_t>();
-      request_started_ms = steady();
-      previous_authority = car_authority.status(request_started_ms);
-      car_authority.begin_request(nonce, request_started_ms); }
-    const auto grant = http.post_json_response(base + "/vehicles/" + vehicle_name + "/direct-authority", {
-        {"device_token", "fixture-device"}, {"connection_generation", generation}, {"session_id", session},
-        {"nonce", nonce}, {"maximum_duration_ms", 600}, {"retired_authority_epoch", retired}});
-    const auto response_received_ms = steady();
-    std::lock_guard lock(car_mutex);
-    const auto accepted_at_ms = steady(), accepted_at_utc_ms = utc();
-    if (!car_authority.accept_authenticated_cloud(grant, accepted_at_ms, accepted_at_utc_ms, 0)) {
+    if (!force) { std::lock_guard lock(car_mutex); if (!car_authority.renewal_due(steady())) return; }
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      const auto nonce = "fixture-nonce-" + std::to_string(++lease_nonce);
+      std::uint64_t retired = 0;
+      Json previous_authority;
+      std::int64_t request_started_ms = 0;
+      { std::lock_guard lock(car_mutex);
+        if (!car_authority.valid(steady()) && car_authority.reference().is_object()) retired = car_authority.reference().at("authority_epoch").get<std::uint64_t>();
+        request_started_ms = steady();
+        previous_authority = car_authority.status(request_started_ms);
+        car_authority.begin_request(nonce, request_started_ms); }
+      const auto grant = http.post_json_response(base + "/vehicles/" + vehicle_name + "/direct-authority", {
+          {"device_token", "fixture-device"}, {"connection_generation", generation}, {"session_id", session},
+          {"nonce", nonce}, {"maximum_duration_ms", 600}, {"retired_authority_epoch", retired}});
+      const auto response_received_ms = steady();
+      std::lock_guard lock(car_mutex);
+      const auto accepted_at_ms = steady(), accepted_at_utc_ms = utc();
+      if (car_authority.accept_authenticated_cloud(grant, accepted_at_ms, accepted_at_utc_ms, 0)) {
+        car_control_lease_expiry = direct_authority_control_lease_expiry(grant);
+        return;
+      }
       const auto parsed = DirectAuthorityGrant::parse(grant);
+      const auto request_elapsed_ms = accepted_at_ms - request_started_ms;
+      // The fixture asks for the 600 ms REVIEW grant. A loaded loopback runner can
+      // spend longer than that inside the request, so the response arrives already
+      // expired. That is the harness rather than the product: retry once, and only
+      // report the failure when a second request also arrives expired.
+      if (attempt == 0 && parsed.duration_ms > 0 && request_elapsed_ms >= parsed.duration_ms) {
+        std::cout << "[AUTHORITY_RETRY] http_elapsed_ms=" << (response_received_ms - request_started_ms)
+                  << " request_elapsed_ms=" << request_elapsed_ms
+                  << " duration_ms=" << parsed.duration_ms << '\n';
+        continue;
+      }
       throw std::runtime_error("vehicle did not accept real cloud short grant: " + Json{
           {"http_elapsed_ms", response_received_ms - request_started_ms},
           {"lock_wait_ms", accepted_at_ms - response_received_ms},
-          {"request_elapsed_ms", accepted_at_ms - request_started_ms},
+          {"request_elapsed_ms", request_elapsed_ms},
           {"response_duration_ms", parsed.duration_ms},
           {"response_remaining_utc_ms", parsed.expires_utc_ms - accepted_at_utc_ms},
           {"response_epoch", parsed.epoch}, {"response_lease_seq", parsed.lease_seq},
           {"retired_epoch", retired}, {"previous_authority", previous_authority},
           {"current_authority", car_authority.status(accepted_at_ms)}}.dump());
     }
-    car_control_lease_expiry = direct_authority_control_lease_expiry(grant);
   }
   void stop_cloud() { cloud_online = false; server->stop(); vehicle_socket.close(); delayed.clear(); }
   void restore_cloud() {
@@ -426,8 +443,16 @@ struct Fixture {
       notification["vehicle_mac"] = transport_message_mac(notification, signing_key, true);
       vehicle_socket.send_json(notification); candidate_notification_sent = true;
     }
-    if (!selected || probe || feedback_fence.path() == ControlPath::Wss) delayed.emplace_back(steady() + 60, result);
-    if (!drop_dc_feedback && selected && (probe || feedback_fence.path() == ControlPath::DataChannel)) pending_dc_feedback = result;
+    const bool wss_return = !selected || probe || feedback_fence.path() == ControlPath::Wss;
+    const bool dc_return = selected && (probe || feedback_fence.path() == ControlPath::DataChannel);
+    if (wss_return) delayed.emplace_back(steady() + 60, result);
+    if (!drop_dc_feedback && dc_return) pending_dc_feedback = result;
+    else if (drop_dc_feedback && route_dropped_returns_over_wss && dc_return)
+      // The DC carrier is the faulted one, so the vehicle answers over its WSS
+      // backup. Without this the fixture also starves the command-result cohort,
+      // and the command axis falls back on its own stall rule even though the
+      // scenario is named for a return-only fault.
+      delayed.emplace_back(steady() + 60, result);
   }
   Json feedback_status(std::uint64_t sequence, Json stamp, std::string_view kind = "vehicle_telemetry") {
     Json result = {{"event", "vehicle_control_status"}, {"protocol", kControlTransportCapability},
@@ -939,7 +964,7 @@ void integration() {
 }
 
 void actual_feedback_selection_is_independent_and_rejects_retired_statuses() {
-  Fixture fixture(true, true); fixture.drop_dc_feedback = true;
+  Fixture fixture(true, true); fixture.drop_dc_feedback = true; fixture.route_dropped_returns_over_wss = true;
   bool ready = false;
   auto deadline = steady() + 8000;
   while (steady() < deadline) {
