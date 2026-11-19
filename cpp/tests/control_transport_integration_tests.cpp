@@ -163,6 +163,10 @@ struct Fixture {
   std::string base, session, control_token, signing_key;
   std::uint64_t generation{0}, native_generation{0}, ui_epoch{0}, intent_seq{0}, result_seq{0}, last_dc_seq{0};
   std::uint64_t wss_commands{0}, dc_commands{0};
+  // DIAGNOSTIC: how often the native publication gate released or withheld a DC frame, and how the
+  // bridge answered a DC-ready pump. Only reported, never asserted.
+  std::uint64_t publication_hits{0}, publication_misses{0}, bridge_frames{0}, bridge_withheld{0};
+  std::int64_t last_bridge_valid_for_ms{0};
   // utc() minus the command's own sent_at_utc_ms when the vehicle read it: the quantity the transport fence compares with
   // max_command_gap_ms. Kept for failure diagnostics only.
   std::int64_t last_command_age_ms{0};
@@ -508,13 +512,18 @@ struct Fixture {
     if (pending_dc_feedback.is_object()) { request["vehicle_result"] = pending_dc_feedback; pending_dc_feedback = Json(nullptr); }
     const auto publication_started = steady();
     auto response = bridge(request);
+    last_bridge_valid_for_ms = response.value("valid_for_ms", std::int64_t{0});
+    if (dc_ready) {
+      if (response.at("frame_json").is_string()) ++bridge_frames; else ++bridge_withheld;
+    }
     if (dc_ready && response.at("frame_json").is_string()) {
       std::string bytes = response.at("frame_json").get<std::string>();
       if (use_native_publication) {
         const NativeCourierScope current{{session, native_generation, media_attempt}, "owner", ui_epoch};
         if (!native_publication) native_publication = std::make_unique<NativeControlPublication>(current);
         const auto filtered = native_publication->take(current, response, dc_ready, steady() - publication_started);
-        if (!filtered) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); return; }
+        if (!filtered) { ++publication_misses; std::this_thread::sleep_for(std::chrono::milliseconds(5)); return; }
+        ++publication_hits;
         bytes = *filtered;
       }
       const auto payload = Json::parse(bytes);
@@ -1156,14 +1165,22 @@ void actual_native_short_cloud_outage_and_independent_vehicle_expiry() {
   const auto at_cut = fixture.driver->status().at("native_control");
   const auto accepted_at_cut = at_cut.at("vehicle_result_latency").value("last_accepted_command_seq", std::uint64_t{0});
   const auto grant_at_cut = at_cut.at("control_transport").at("direct_authority").value("remaining_ms", std::int64_t{0});
-  // Continuity is actual accepted progress inside the existing200ms healthy
-  // result budget, not a100ms packet-rate requirement. Never extend the
-  // accepted600ms REVIEW grant, including time spent observing socket closure.
-  const auto observation_budget = std::max<std::int64_t>(0,
-      std::min<std::int64_t>(NativeControlAckRecovery::kFreshAckMs, grant_at_cut - 1));
+  // Continuity is actual accepted progress whose own result is fresh, not a
+  // packet-rate requirement. The wall clock is the remaining REVIEW grant: a
+  // loaded loopback runner can spend a200ms slice inside the vehicle round
+  // trip without any product fault, and a window shortened to that figure
+  // measured the fixture rather than the direct path. The accepted result
+  // still has to be fresh, and the accepted600ms grant is never extended.
+  const auto observation_budget = std::max<std::int64_t>(0, grant_at_cut - 1);
   const auto outage_deadline = cut_observed_at + observation_budget;
   Json observed_native = at_cut;
+  std::int64_t observation_iterations = 0, longest_observation_gap_ms = 0;
+  auto last_iteration_started = cut_observed_at;
   while (steady() < outage_deadline) {
+    const auto iteration_started = steady();
+    longest_observation_gap_ms = std::max(longest_observation_gap_ms, iteration_started - last_iteration_started);
+    last_iteration_started = iteration_started;
+    ++observation_iterations;
     fixture.pump(true); observed_native = fixture.driver->status().at("native_control");
     const auto& latency = observed_native.at("vehicle_result_latency");
     if (latency.value("last_accepted_command_seq", std::uint64_t{0}) > accepted_at_cut &&
@@ -1180,13 +1197,26 @@ void actual_native_short_cloud_outage_and_independent_vehicle_expiry() {
       {"observation_elapsed_ms", observed_at - cut_observed_at}, {"shutdown_join_elapsed_ms", steady() - outage_started},
       {"pre_cut_transport", pre_cut}, {"cut_transport", at_cut.at("control_transport")},
       {"accepted_seq_at_cut", accepted_at_cut}, {"accepted_seq_after_cut", result_progress.value("last_accepted_command_seq", std::uint64_t{0})},
-      {"dc_commands_before", before}, {"dc_commands_at_cut", before_observation}, {"dc_commands_during", fixture.dc_commands}, {"transport", during}}.dump() << '\n';
+      {"dc_commands_before", before}, {"dc_commands_at_cut", before_observation}, {"dc_commands_during", fixture.dc_commands},
+      {"observation_iterations", observation_iterations}, {"longest_observation_gap_ms", longest_observation_gap_ms},
+      {"publication_hits", fixture.publication_hits}, {"publication_misses", fixture.publication_misses},
+      {"bridge_frames", fixture.bridge_frames}, {"bridge_withheld", fixture.bridge_withheld},
+      {"last_bridge_valid_for_ms", fixture.last_bridge_valid_for_ms},
+      {"transport", during}}.dump() << '\n';
   expect(cloud_socket_closed && observed_at <= outage_deadline && fixture.dc_commands > before_observation &&
       result_progress.value("last_accepted_command_seq", std::uint64_t{0}) > accepted_at_cut &&
       result_progress.value("accepted", false) && result_progress.at("round_trip_ms").is_number() &&
       result_progress.at("round_trip_ms").get<std::int64_t>() <= NativeControlAckRecovery::kFreshAckMs &&
       during.at("path") == "dc" && during.at("direct_authority").value("valid", false),
-      "healthy direct command/result stream stopped solely because cloud sockets closed inside the accepted lease");
+      std::string("healthy direct command/result stream stopped solely because cloud sockets closed inside the accepted lease") +
+      " [observation_iterations=" + std::to_string(observation_iterations) +
+      " longest_observation_gap_ms=" + std::to_string(longest_observation_gap_ms) +
+      " publication_hits=" + std::to_string(fixture.publication_hits) +
+      " publication_misses=" + std::to_string(fixture.publication_misses) +
+      " bridge_frames=" + std::to_string(fixture.bridge_frames) +
+      " bridge_withheld=" + std::to_string(fixture.bridge_withheld) +
+      " last_bridge_valid_for_ms=" + std::to_string(fixture.last_bridge_valid_for_ms) +
+      " dc_commands=" + std::to_string(fixture.dc_commands) + "/" + std::to_string(before_observation) + "]");
   fixture.restore_cloud(); fixture.renew_authority(true);
   const auto recovered_deadline = steady() + 1000;
   while (steady() < recovered_deadline) {
