@@ -16,9 +16,18 @@
     const epochNow = () => performance.timeOrigin + performance.now();
     const key = value => value ? JSON.stringify([value.session,value.generation,value.ui,value.uiEpoch,value.attempt]) : '';
     const emit = message => self.postMessage({owner,...message});
+    let probeScopeCalls = 0, probeScopeStale = 0, probeMaxAge = 0, probeNoSnapshot = 0;
     function scope(kind) {
-      if (!snapshot || !Number.isFinite(snapshot.published) ||
-          epochNow() < snapshot.published || epochNow() - snapshot.published >= 200) return null;
+      ++probeScopeCalls;
+      if (probeScopeCalls % 400 === 0)
+        trace({stage:'worker_scope_probe',calls:probeScopeCalls,stale:probeScopeStale,no_snapshot:probeNoSnapshot,max_age_ms:probeMaxAge});
+      if (!snapshot) { ++probeNoSnapshot; ++probeScopeStale; return null; }
+      const age = epochNow() - snapshot.published;
+      if (!Number.isFinite(snapshot.published) || age < 0 || age >= 200) {
+        ++probeScopeStale;
+        if (age >= 0) probeMaxAge = Math.max(probeMaxAge, age);
+        return null;
+      }
       const value = snapshot[kind];
       return value ? {...value,ready:value.ready === true && channel?.readyState === 'open'} : null;
     }
@@ -135,13 +144,24 @@
     function scopes() {
       return {published:epochNow(),control:controlOptions?.scope() || null,emergency:emergencyOptions?.scope() || null};
     }
+    let probePublishes = 0, probePosts = 0, probePublishFailures = 0;
     function publish(force = false) {
       if (!actor) return;
-      const snapshot = scopes();
-      const fingerprint = JSON.stringify([snapshot.control,snapshot.emergency]);
-      if (force || actor.fingerprint !== fingerprint) {
-        actor.fingerprint = fingerprint;
-        actor.worker.postMessage({type:'scope',owner:actor.owner,snapshot});
+      try {
+        const snapshot = scopes();
+        const fingerprint = JSON.stringify([snapshot.control,snapshot.emergency]);
+        if (force || actor.fingerprint !== fingerprint) {
+          actor.fingerprint = fingerprint;
+          actor.worker.postMessage({type:'scope',owner:actor.owner,snapshot});
+          ++probePosts;
+        }
+        ++probePublishes;
+        if (probePublishes % 100 === 0 && controlOptions?.onTrace)
+          controlOptions.onTrace({stage:'page_scope_probe',publishes:probePublishes,posted:probePosts,failures:probePublishFailures});
+      } catch (error) {
+        ++probePublishFailures;
+        try { controlOptions?.onTrace?.({stage:'page_scope_publish_failed',
+          message:String((error && error.message) || error).slice(0,160)}); } catch (_) {}
       }
     }
     function retire() {
