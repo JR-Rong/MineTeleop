@@ -12,7 +12,7 @@ namespace mine_teleop::detail {
 inline bool fresh_neutral_control_input(const NativeControlIntentSample& sample) {
   return sample.active && sample.fresh && !sample.requires_fresh_input &&
       sample.ui_control_epoch != 0 && sample.refresh_sample_healthy &&
-      sample.intent.is_neutral() && sample.intent.critical_video_ready &&
+      !sample.intent.operator_input_held && sample.intent.is_neutral() && sample.intent.critical_video_ready &&
       sample.intent.critical_video_sample_healthy;
 }
 

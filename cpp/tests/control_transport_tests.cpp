@@ -318,6 +318,12 @@ void healthy_wss_waits_for_idle_before_returning_to_direct() {
     expect(!sender.consider_dc("media-a", now, 5000) &&
         !sender.consider_dc("media-b", now, 5000), "healthy WSS interrupted held brake");
   }
+  input.intent.operator_input_held = true;
+  for (int i = 0; i < 8; ++i, now += 50) {
+    tick(0);
+    expect(!sender.consider_dc("media-a", now, 5000), "capped axes disguised held input as neutral");
+  }
+  input.intent.operator_input_held = false;
   for (int i = 0; i < 6; ++i, now += 50) {
     tick(0);
     expect(!sender.consider_dc("media-a", now, 5000), "brief neutral input enabled a direct retry");

@@ -1473,6 +1473,8 @@ function driverControlTimeSyncReady(){
 function nativeIntentEnvelope(outgoing){
   const viewHealth=driverCriticalVideoHealth();
   const normalized={gear:String(outgoing.gear||'N'),steering:Number(outgoing.steering||0),throttle:Number(outgoing.throttle||0),brake:Number(outgoing.brake||0),estop:Boolean(outgoing.estop),critical_video_ready:viewHealth.ready===true,critical_video_sample_healthy:viewHealth.sample_healthy===true,critical_video_bad_sample_revision:Number.isSafeInteger(viewHealth.bad_sample_revision)?viewHealth.bad_sample_revision:0,critical_video_brake_revision:Number.isSafeInteger(viewHealth.brake_sample_revision)?viewHealth.brake_sample_revision:0,critical_video_transient:viewHealth.ready!==true&&viewHealth.transient===true};
+  normalized.operator_input_held=pressedControlKeys.size>0||blockedControlKeys.size>0||
+    Boolean(gamepadState.connected&&(gamepadRequiresNeutral||gamepadState.steering||gamepadState.throttle||gamepadState.brake));
   if(nativeControlTakeoverPending&&!normalized.estop)normalized.steering=normalized.throttle=normalized.brake=0;
   const snapshot=JSON.stringify(normalized);
   if(!nativeIntentSeq||snapshot!==lastNativeIntentSnapshot){nativeIntentSeq++;lastNativeIntentSnapshot=snapshot}
@@ -6312,6 +6314,7 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
           {"intent_seq", sample.intent.intent_seq},
           {"intent_fresh", wire_intent_fresh},
           {"intent_requires_fresh_input", sample.requires_fresh_input},
+          {"operator_input_held", sample.intent.operator_input_held},
           {"intent_age_ms", sample.age_ms},
           {"intent_lease_ms", native_control_intent_.lease_ms()},
           {"effective_gear", sample.intent.gear},
@@ -8443,6 +8446,7 @@ Json DriverConsoleRuntime::update_control_intent(const Json& input, const HttpRe
     intent.throttle = input.at("throttle").get<double>();
     intent.brake = input.at("brake").get<double>();
     intent.estop = input.value("estop", false);
+    intent.operator_input_held = input.value("operator_input_held", false);
     intent.critical_video_ready = input.value("critical_video_ready", true);
     if (!intent.estop && !input.contains("critical_video_sample_healthy")) {
       throw std::invalid_argument("critical_video_sample_healthy is required; refresh the control page");

@@ -118,6 +118,9 @@ struct NativeControlIntent {
   // Every blocked critical view is only stale, recovering or muted. Meaningful only
   // with critical_video_ready=false, and only forwarded when a hold is negotiated.
   bool critical_video_transient{false};
+  // Physical input may be held while a limit or gear transition zeros axes.
+  // This can veto a voluntary route upgrade; command readiness uses the axes.
+  bool operator_input_held{false};
 
   void validate() const;
   [[nodiscard]] bool is_neutral() const;

@@ -97,6 +97,10 @@ function intentPageFixture(codes = ['ArrowUp', 'ArrowLeft']) {
   let elapsed = 1000;
   const context = {
     controlLogic: logic,
+    pressedControlKeys: pressed,
+    blockedControlKeys: blocked,
+    gamepadState: {connected: false, steering: 0, throttle: 0, brake: 0},
+    gamepadRequiresNeutral: false,
     peer: {connectionState: 'connected'},
     controlChannel: {readyState: 'open'},
     controlAuthorityLost: false,
@@ -1471,6 +1475,20 @@ function useProductionIntentEnvelope(fixture) {
   assert.ok(start >= 0 && end > start);
   vm.runInContext(controlPageSource.slice(start, end), fixture.context);
 }
+
+test('the shipped intent reports held keys even when limits zero the axes', () => {
+  const fixture = intentPageFixture(['ArrowDown']);
+  useProductionIntentEnvelope(fixture);
+  const neutral = {gear: 'R', throttle: 0, steering: 0, brake: 0};
+  const first = fixture.context.nativeIntentEnvelope(neutral);
+  assert.equal(first.operator_input_held, true);
+  logic.blockAndClearKeys(fixture.pressed, fixture.blocked);
+  assert.equal(fixture.context.nativeIntentEnvelope(neutral).operator_input_held, true);
+  logic.releaseKey(fixture.pressed, fixture.blocked, 'ArrowDown');
+  const released = fixture.context.nativeIntentEnvelope(neutral);
+  assert.equal(released.operator_input_held, false);
+  assert.equal(released.intent_seq, first.intent_seq + 1);
+});
 
 test('a two-second page pause is distinct from slow HTTP responses and does not replay a catch-up queue', async () => {
   const fixture=intentPageFixture(['ArrowUp']);await fixture.advanceTo(0);
