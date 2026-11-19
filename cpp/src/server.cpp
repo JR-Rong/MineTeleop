@@ -6533,6 +6533,10 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
         select_control_wss_locked(monotonic_ms, recovery_timeout_ms);
       if (control_transport_sender_.observe(dc_ready, current_media_attempt, monotonic_ms, recovery_timeout_ms))
         retire_control_dc_locked();
+      control_transport_sender_.observe_wss_upgrade_idle(sample,
+          dc_ready && !control_signaling_ack_recovery_.waiting() && command.control_time_sync_ready &&
+              command.recovery_sample_healthy,
+          monotonic_ms);
       control_transport_sender_.observe_mock_idle_reprobe(
           detail::mock_idle_reprobe_eligible(config_.mock_idle_direct_reprobe, dc_ready,
               control_signaling_ack_recovery_.waiting(), sample, command.control_time_sync_ready),

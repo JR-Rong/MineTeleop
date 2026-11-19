@@ -9,12 +9,17 @@
 
 namespace mine_teleop::detail {
 
+inline bool fresh_neutral_control_input(const NativeControlIntentSample& sample) {
+  return sample.active && sample.fresh && !sample.requires_fresh_input &&
+      sample.ui_control_epoch != 0 && sample.refresh_sample_healthy &&
+      sample.intent.is_neutral() && sample.intent.critical_video_ready &&
+      sample.intent.critical_video_sample_healthy;
+}
+
 inline bool mock_idle_reprobe_eligible(bool enabled, bool dc_ready, bool ack_waiting,
                                        const NativeControlIntentSample& sample, bool clock_ready) {
-  return enabled && dc_ready && !ack_waiting && clock_ready && sample.active && sample.fresh &&
-      !sample.requires_fresh_input && sample.ui_control_epoch != 0 && sample.refresh_sample_healthy &&
-      sample.intent.gear == "N" && sample.intent.is_neutral() && sample.intent.critical_video_ready &&
-      sample.intent.critical_video_sample_healthy;
+  return enabled && dc_ready && !ack_waiting && clock_ready &&
+      sample.intent.gear == "N" && fresh_neutral_control_input(sample);
 }
 
 // Serialized by DriverConsoleRuntime's control socket mutex. Native assigns
@@ -59,6 +64,7 @@ class ControlTransportSender {
     if (previous == std::numeric_limits<std::uint64_t>::max())
       throw std::runtime_error("control transport epoch exhausted");
     stamp_ = {previous + 1, previous, 0, path, std::move(attempt), true};
+    wss_upgrade_idle_ = {};
     awaiting_neutral_ = last_accepted_gear_.has_value();
     selecting_ = true; qualifying_ = path == ControlPath::DataChannel;
     deadline_ = now + recovery_timeout_ms;
@@ -78,16 +84,15 @@ class ControlTransportSender {
   // attempt permits new evidence; a ready/unknown UI flap does not reset it.
   // The explicit isolated-mock option may permit one additional trial only
   // after a sustained fresh neutral owner and healthy WSS evidence.
+  void observe_wss_upgrade_idle(const NativeControlIntentSample& sample, bool ready, std::int64_t now) {
+    wss_upgrade_idle_.observe(ready && negotiated() && path() == ControlPath::Wss &&
+        !holding_motion() && !awaiting_neutral_ && wss_.healthy(now) &&
+        sample.intent.gear == last_accepted_gear_ && fresh_neutral_control_input(sample),
+        sample.ui_control_epoch, now);
+  }
   void observe_mock_idle_reprobe(bool eligible, std::uint64_t owner_epoch, std::int64_t now) {
-    if (!eligible || !owner_epoch || now < 0 || path() != ControlPath::Wss || holding_motion() ||
-        !dc_is_p2p_ || !wss_.healthy(now)) {
-      mock_idle_since_.reset(); mock_idle_epoch_ = 0; mock_idle_last_ms_ = -1; return;
-    }
-    if (!mock_idle_since_ || mock_idle_epoch_ != owner_epoch || now < mock_idle_last_ms_ ||
-        now - mock_idle_last_ms_ >= NativeControlAckRecovery::kFreshAckMs) {
-      mock_idle_since_ = now; mock_idle_epoch_ = owner_epoch;
-    }
-    mock_idle_last_ms_ = now;
+    mock_idle_.observe(eligible && path() == ControlPath::Wss && !holding_motion() &&
+        dc_is_p2p_ && wss_.healthy(now), owner_epoch, now);
   }
   bool consider_dc(std::string_view attempt, std::int64_t now, int timeout_ms) {
     const bool unhealthy_wss = first_wss_sent_ms_ >= 0 && now >= first_wss_sent_ms_ &&
@@ -96,14 +101,20 @@ class ControlTransportSender {
          last_wss_result_age_ms_ > NativeControlAckRecovery::kFreshAckMs);
     if (attempt.empty() || path() != ControlPath::Wss || holding_motion() ||
         (!dc_is_p2p_ && !wss_.healthy(now) && !unhealthy_wss)) return false;
+    // A voluntary upgrade retires the current input epoch. After any DC
+    // trial, wait for a sustained neutral input while WSS still works.
+    // The existing WSS failure trigger continues to admit a recovery trial.
+    const bool mock_retry = trial_attempt_ == attempt && failed_trials_ >= kMaxTrialsPerAttempt;
+    if (!trial_attempt_.empty() && !unhealthy_wss && !mock_retry &&
+        !wss_upgrade_idle_.ready(now, kDirectUpgradeIdleMs))
+      return false;
     if (trial_attempt_ == attempt) {
       if (now < next_trial_ms_ || (!dc_is_p2p_ && !unhealthy_wss)) return false;
-      if (failed_trials_ >= kMaxTrialsPerAttempt) {
-        if (mock_idle_reprobe_used_ || !mock_idle_since_ || now < *mock_idle_since_ ||
-            now - *mock_idle_since_ < kMockIdleReprobeMs || now < mock_idle_last_ms_ ||
-            now - mock_idle_last_ms_ >= NativeControlAckRecovery::kFreshAckMs || !wss_.healthy(now)) return false;
+      if (mock_retry) {
+        if (mock_idle_reprobe_used_ || !mock_idle_.ready(now, kMockIdleReprobeMs) ||
+            !wss_.healthy(now)) return false;
         mock_idle_reprobe_used_ = true;
-        mock_idle_since_.reset(); mock_idle_epoch_ = 0; mock_idle_last_ms_ = -1;
+        mock_idle_ = {};
       }
     }
     if (trial_attempt_ != attempt) {
@@ -111,7 +122,7 @@ class ControlTransportSender {
       profile_blocked_dc_ = false;
       profile_recovery_retry_used_ = false;
       mock_idle_reprobe_used_ = false;
-      mock_idle_since_.reset(); mock_idle_epoch_ = 0; mock_idle_last_ms_ = -1;
+      mock_idle_ = {};
     }
     trial_attempt_ = attempt;
     begin(ControlPath::DataChannel, std::string(attempt), now, timeout_ms);
@@ -235,12 +246,32 @@ class ControlTransportSender {
 
  private:
   static constexpr unsigned kMaxTrialsPerAttempt = 3;
+  static constexpr std::int64_t kDirectUpgradeIdleMs = 300;
   static constexpr std::int64_t kMockIdleReprobeMs = 60000;
+  struct IdleWindow {
+    std::optional<std::int64_t> since;
+    std::int64_t last{-1};
+    std::uint64_t owner{0};
+
+    void observe(bool eligible, std::uint64_t owner_epoch, std::int64_t now) {
+      if (!eligible || !owner_epoch || now < 0) {
+        *this = {};
+        return;
+      }
+      if (!since || owner != owner_epoch || now < last || now - last >= NativeControlAckRecovery::kFreshAckMs) {
+        since = now;
+        owner = owner_epoch;
+      }
+      last = now;
+    }
+    [[nodiscard]] bool ready(std::int64_t now, std::int64_t duration_ms) const {
+      return since && now >= last && now - last < NativeControlAckRecovery::kFreshAckMs &&
+          now - *since >= duration_ms;
+    }
+  };
   unsigned failed_trials_{0};
   bool mock_idle_reprobe_used_{false};
-  std::optional<std::int64_t> mock_idle_since_;
-  std::uint64_t mock_idle_epoch_{0};
-  std::int64_t mock_idle_last_ms_{-1};
+  IdleWindow wss_upgrade_idle_, mock_idle_;
   bool profile_blocked_dc_{false}, profile_recovery_retry_used_{false};
   struct Health {
     std::array<std::int64_t, NativeControlAckRecovery::kConsecutiveAnomalies> ages{};

@@ -120,6 +120,15 @@ Json payload(std::uint64_t seq, std::int64_t now) {
   auto value = command(seq, now).to_json(); value["intent_seq"] = seq + 100;
   value["intent_fresh"] = true; return value;
 }
+NativeControlIntentSample healthy_idle_input() {
+  NativeControlIntentSample sample;
+  sample.active = sample.fresh = sample.refresh_sample_healthy = true;
+  sample.requires_fresh_input = false;
+  sample.ui_control_epoch = 1;
+  sample.intent.gear = "D";
+  sample.intent.critical_video_ready = sample.intent.critical_video_sample_healthy = true;
+  return sample;
+}
 Json response(const Json& frame, bool accepted = true, bool selected = false) {
   return {{"event", "vehicle_control_result"}, {"protocol", kControlTransportCapability},
       {"session_id", "session-001"}, {"vehicle_id", "vehicle-001"}, {"driver_id", "driver-001"},
@@ -284,6 +293,45 @@ void healthy_proven_p2p_is_preferred_to_a_faster_cloud_backup() {
   expect(sender.consider_dc("media-a", 5451, 5000), "recovered direct candidate was never retried");
 }
 
+void healthy_wss_waits_for_idle_before_returning_to_direct() {
+  ControlTransportSender sender;
+  sender.set_data_channel_is_p2p(true);
+  expect(sender.consider_dc("media-a", 0, 5000), "initial direct trial missing");
+  expect(sender.observe(false, "media-a", 1, 5000), "direct fault did not fall back");
+
+  auto input = healthy_idle_input();
+  std::int64_t now = 5001;
+  std::uint64_t seq = 1;
+  auto tick = [&](double brake) {
+    input.intent.brake = brake;
+    auto frame = payload(seq, now - 10);
+    frame["brake"] = brake;
+    sender.decorate(frame);
+    sender.note_sent(frame, ControlPath::Wss, now - 10);
+    expect(sender.note_result(response(frame, true, seq == 1), now, 5000).matched,
+        "WSS result missing");
+    sender.observe_wss_upgrade_idle(input, true, now);
+    ++seq;
+  };
+  for (int i = 0; i < 10; ++i, now += 50) {
+    tick(0.5);
+    expect(!sender.consider_dc("media-a", now, 5000) &&
+        !sender.consider_dc("media-b", now, 5000), "healthy WSS interrupted held brake");
+  }
+  for (int i = 0; i < 6; ++i, now += 50) {
+    tick(0);
+    expect(!sender.consider_dc("media-a", now, 5000), "brief neutral input enabled a direct retry");
+  }
+  ++input.ui_control_epoch;
+  for (int i = 0; i < 6; ++i, now += 50) {
+    tick(0);
+    expect(!sender.consider_dc("media-a", now, 5000), "new page inherited neutral history");
+  }
+  tick(0);
+  expect(sender.consider_dc("media-a", now, 5000) && sender.holding_motion(),
+      "sustained neutral input did not permit a fenced direct trial");
+}
+
 void publication_is_owned_only_by_its_current_dc_epoch() {
   for (int cause = 0; cause < 6; ++cause) {
     ControlTransportSender sender; baseline(sender);
@@ -355,8 +403,18 @@ void confirmed_profile_permits_only_one_new_bounded_dc_budget() {
   expect(!sender.consider_dc("media-a", now + 1006, 5000), "stale acceptance reset the budget");
   auto neutral = payload(seq++, now + 1007); sender.decorate(neutral); sender.note_sent(neutral, ControlPath::Wss, now + 1007);
   expect(sender.note_result(response(neutral, true, false), now + 1008, 5000).matched, "fresh WSS acceptance missing");
-  expect(sender.consider_dc("media-a", now + 1009, 5000) && sender.holding_motion(), "confirmed profile did not permit a bounded retry");
   now += 1009;
+  const auto idle = healthy_idle_input();
+  for (int i = 0; i < 8; ++i) {
+    now += 50;
+    auto frame = payload(seq++, now - 10);
+    sender.decorate(frame);
+    sender.note_sent(frame, ControlPath::Wss, now - 10);
+    sender.note_result(response(frame), now, 5000);
+    sender.observe_wss_upgrade_idle(idle, true, now);
+  }
+  expect(sender.consider_dc("media-a", now, 5000) && sender.holding_motion(),
+      "confirmed profile and idle WSS did not permit a bounded retry");
   for (int failure = 1; failure <= 3; ++failure) {
     if (failure > 1) expect(sender.consider_dc("media-a", now, 5000), "second bounded budget ended early");
     auto frame = payload(seq++, now); sender.decorate(frame); sender.note_sent(frame, ControlPath::DataChannel, now);
@@ -382,10 +440,13 @@ void mock_idle_reprobe_is_fenced_fresh_and_once_per_attempt() {
   }
   // Fresh neutral WSS results are required for a continuous interval. A
   // stale loop, owner change, or active input must reset the interval.
+  auto input = healthy_idle_input();
   auto tick = [&](bool idle, std::uint64_t owner_epoch, std::int64_t step = 50) {
     now += step;
     auto frame = payload(seq++, now - 10); sender.decorate(frame); sender.note_sent(frame, ControlPath::Wss, now - 10);
     expect(sender.note_result(response(frame, true, false), now, 5000).matched, "fresh WSS result missing");
+    input.ui_control_epoch = owner_epoch;
+    sender.observe_wss_upgrade_idle(input, idle, now);
     sender.observe_mock_idle_reprobe(idle, owner_epoch, now);
   };
   for (int i = 0; i < 1205; ++i) { tick(false, 1); expect(!sender.consider_dc("media-a", now, 5000), "active input enabled reprobe"); }
@@ -547,6 +608,7 @@ int main() {
     confirmed_profile_permits_only_one_new_bounded_dc_budget();
     version_scope_and_expiry(); single_receiver_epoch_replay_and_emergency(); exact_result_and_neutral_qualification();
     slower_dc_and_lost_selection(); cloud_ingress_without_vehicle_result_can_only_start_a_neutral_trial(); healthy_proven_p2p_is_preferred_to_a_faster_cloud_backup(); signatures_bind_native_bytes_and_vehicle_results(); private_signing_material_is_not_public_session_state(); bounded_status_rejects_unsupported_kinds_and_scope_mismatch(); real_service_switch_does_not_disable_watchdog();
-    std::cout << "19 control transport cases passed; real common safety service, no sockets\n";
+    healthy_wss_waits_for_idle_before_returning_to_direct();
+    std::cout << "20 control transport cases passed; real common safety service, no sockets\n";
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
