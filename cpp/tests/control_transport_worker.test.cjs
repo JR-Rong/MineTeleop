@@ -37,11 +37,22 @@ test('worker reuses the production factory and forwards exact bytes without gene
   assert.ok(f.requests.every(r=>!r.url.includes('/intent')),'courier must never renew the input lease');
 });
 test('page publication expiry and delayed HTTP cannot send a cached motion frame',async()=>{
-  for(const age of [200,201,-1]) {
+  for(const age of [200,201,-1001]) {
     const f=fixture(),resolve=f.hold();await f.tick();f.setTime(age);resolve(f.frame(1));await settle();
     assert.equal(f.sent.length,0,'invalid page scope age '+age);
   }
   const f=fixture();f.setTime(200);await f.tick();assert.equal(f.requests.length,0);
+});
+test('a snapshot a few milliseconds ahead of the worker clock stays valid',async()=>{
+  // The page publishes from its own performance clock. Ordering jitter of a few
+  // milliseconds must not read as an expired page: in the A50 probe that false
+  // verdict cancelled 1.75% of all scope reads and every in-flight bridge request
+  // behind them.
+  for(const skew of [1,5,50]) {
+    const f=fixture();f.setTime(skew);f.publish();f.setTime(0);f.reply(()=>f.frame(1));await f.tick();
+    assert.deepEqual(f.sent,['UNCHANGED_SIGNED_1'],'future skew '+skew+' was treated as stale');
+    assert.equal(f.requests.length,1,'future skew '+skew+' stayed blocked');
+  }
 });
 test('retired session, UI epoch and media attempt discard late worker replies',async()=>{
   for(const patch of [{session:'new'},{uiEpoch:2},{attempt:'b'},{generation:2},{ui:'replacement'}]) {
