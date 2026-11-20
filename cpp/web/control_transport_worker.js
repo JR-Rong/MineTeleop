@@ -49,9 +49,15 @@
         worker_event_at_utc_ms:Date.now(),worker_time_origin_ms:performance.timeOrigin});
       else ++droppedTraces;
     }
-    let controlScheduler, emergencyScheduler;
+    let controlScheduler, emergencyScheduler, waitingForDrain = false;
     const control = transport.createCourier({
       scope:() => scope('control'),post,now:() => performance.now(),
+      canSend:() => {
+        if (channel?.readyState !== 'open') return false;
+        const empty = Number(channel.bufferedAmount) === 0;
+        waitingForDrain = !empty;
+        return empty;
+      },
       send:(_frame, bytes) => {
         if (channel?.readyState !== 'open') return {reason:'channel_not_open'};
         if (Number(channel.bufferedAmount) !== 0) return {reason:'channel_buffer_not_empty'};
@@ -103,6 +109,11 @@
         channel.onclose = () => emit({type:'channel',state:'closed'});
         channel.onerror = () => emit({type:'channel',state:'error'});
         channel.onmessage = event => receive(event.data);
+        channel.onbufferedamountlow = () => {
+          if (Number(channel?.bufferedAmount) === 0) waitingForDrain = false;
+          controlScheduler.request(() => Boolean(scope('control')));
+          emergencyScheduler.request(() => Boolean(scope('emergency')));
+        };
         channel.bufferedAmountLowThreshold = 1024;
         emit({type:'channel',state:channel.readyState});
         emit({type:'ready'});
@@ -119,6 +130,12 @@
         channel.bufferedAmountLowThreshold = message.value;
       } else if (message?.type === 'close' && message.owner === owner) channel?.close();
     };
+    setInterval(() => {
+      if (waitingForDrain && channel?.readyState === 'open' && Number(channel.bufferedAmount) === 0) {
+        waitingForDrain = false;
+        controlScheduler.request(() => Boolean(scope('control')));
+      }
+    },5);
     setInterval(() => { controlScheduler.tick(); emergencyScheduler.tick(); },25);
     setInterval(() => {
       if (!channel) return;

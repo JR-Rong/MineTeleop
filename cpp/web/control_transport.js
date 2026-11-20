@@ -139,7 +139,7 @@
     }
     return Object.freeze({tick,receive,cancelStaleRequest});
   }
-  function createCourier({scope, post, now, send, onBoundary, onStatus = () => {}, onTrace = () => {}, onPending = () => {}, requestTimeoutMs = 500}) {
+  function createCourier({scope, post, now, send, canSend = () => true, onBoundary, onStatus = () => {}, onTrace = () => {}, onPending = () => {}, requestTimeoutMs = 500}) {
     const request = scopedRequest(post, requestTimeoutMs);
     let busy = false, key = '', lastSeen = 0, revision = 0, negotiated = false, path = 'wss', epoch = 0, feedback = {};
     // Commands remain latest-only. Execution results are independent receipts:
@@ -215,6 +215,7 @@
           source_session_id: current.session, source_control_session_generation: current.generation,
           media_negotiation_id: current.attempt, ui_instance_id: current.ui, ui_control_epoch: current.uiEpoch,
           dc_ready: current.ready === true, dc_network_path: current.networkPath || "unknown", last_seen_seq: lastSeen,
+          ...(current.ready === true && !canSend() ? {dc_send_ready: false} : {}),
           ...(sentResult ? {vehicle_result: sentResult} : {}),
           ...(sentStatuses.length ? {vehicle_statuses: sentStatuses} : {}),
         }, capturedKey);

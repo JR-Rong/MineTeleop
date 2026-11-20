@@ -1856,6 +1856,7 @@ async function startFromOffer(offer){
     lastControlStatusSeq=0;
     controlChannel=channel;
     channel.bufferedAmountLowThreshold=1024;
+    channel.onbufferedamountlow=()=>{if(!current()||!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;controlTransportScheduler.request();emergencyStopScheduler.request()};
     channel.onopen=()=>{
       if(!current()||!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
       gearRejectionInhibited=false;
@@ -1928,6 +1929,7 @@ const controlTransportCourier=controlTransportActor.createCourier({
   post,now:()=>performance.now(),onStatus:message=>applyVehicleControlMessage(message,true),
   onPending:isCurrent=>controlTransportScheduler.request(isCurrent),
   onTrace:record=>{if(!controlTraceEnabled)return;const item={...record,browser_event_at_utc_ms:Date.now()};if(record.session_id!==controlTraceScope.session_id){emitControlTraceBatch('late_courier',{session_id:record.session_id},[item],createControlTraceSummary(),false);return}controlTraceBuffer.push(item);if(controlTraceBuffer.length>=48)flushControlTrace('capacity')},
+  canSend:()=>controlChannel?.readyState==='open'&&Number(controlChannel.bufferedAmount)===0,
   send:(frame,bytes)=>{const channel=controlChannel;if(channel?.readyState!=='open')return {reason:'channel_not_open'};if(Number(channel.bufferedAmount)!==0)return {reason:'channel_buffer_not_empty'};channel.send(bytes);return true},
   onBoundary:()=>{clearControlInput(false,'control_transport_boundary',true);lastNativeIntentSnapshot=''},
 });
@@ -5953,6 +5955,9 @@ Json DriverConsoleRuntime::control_transport_bridge(const Json& input, const Htt
     feedback_capable = config_.enable_experimental_direct_authority && feedback_transport_vehicle_capable_;
   }
   if (!input.at("dc_ready").is_boolean()) throw std::invalid_argument("dc_ready must be boolean");
+  if (input.contains("dc_send_ready") && !input.at("dc_send_ready").is_boolean())
+    throw std::invalid_argument("dc_send_ready must be boolean");
+  const bool dc_send_ready = !input.contains("dc_send_ready") || input.at("dc_send_ready").get<bool>();
   const auto transport_lock_started = monotonic_now_ms();
   std::lock_guard transport_lock(control_signaling_websocket_mutex_);
   const auto transport_lock_acquired = monotonic_now_ms();
@@ -6007,7 +6012,8 @@ Json DriverConsoleRuntime::control_transport_bridge(const Json& input, const Htt
   const auto current_input = native_control_intent_.sample(now);
   const auto valid_for_ms = detail::native_control_publication_valid_for_ms(
       control_transport_latest_dc_sample_, current_input, age, allowance, native_control_intent_.lease_ms());
-  if (control_transport_dc_ready_ && control_transport_sender_.owns_dc_publication(control_transport_latest_dc_) && valid_for_ms > 0 &&
+  if (control_transport_dc_ready_ && dc_send_ready &&
+      control_transport_sender_.owns_dc_publication(control_transport_latest_dc_) && valid_for_ms > 0 &&
       control_transport_latest_dc_.value("seq", std::uint64_t{0}) > last_seen &&
       control_transport_latest_dc_.value("bridge_owner", "") == owner &&
       control_transport_latest_dc_.value("bridge_ui_epoch", std::uint64_t{0}) == ui_epoch) {
@@ -6246,6 +6252,7 @@ bool DriverConsoleRuntime::poll_native_control_acknowledgements() {
 }
 
 bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
+  native_control_retired_no_io_.store(false, std::memory_order_relaxed);
   if (native_control_observation_state_) native_control_observation_state_->begin(ControlObservationPhase::Sample);
   struct FinishPhase {
     std::shared_ptr<ControlConnectionObservation> state;
@@ -6707,6 +6714,9 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
           sample, dispatch_sample, dispatch_checked_ms - sample_started_monotonic_ms,
           native_control_intent_.lease_ms());
       if (!dispatch_rejection.empty()) {
+        if (dispatch_rejection == "prepared_input_retired_no_io") {
+          native_control_retired_no_io_.store(true, std::memory_order_relaxed);
+        }
         if (native_control_trace_) {
           trace_record["stage"] = "send_skipped";
           trace_record["reason"] = dispatch_rejection;
@@ -6943,7 +6953,11 @@ void DriverConsoleRuntime::native_control_sender_loop(std::stop_token stop_token
             next_send.time_since_epoch())
             .count(),
         std::memory_order_relaxed);
-    static_cast<void>(send_native_control_sample(stop_token));
+    if (!send_native_control_sample(stop_token) &&
+        native_control_retired_no_io_.load(std::memory_order_relaxed) &&
+        !stop_token.stop_requested()) {
+      static_cast<void>(send_native_control_sample(stop_token));
+    }
     socket_wait_allowed = true;
     // Never replay missed periods or emit a catch-up burst after a scheduler or
     // network stall. The next vehicle packet is always one fresh sample.

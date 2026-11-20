@@ -26,6 +26,7 @@ function fixture() {
   publish();
   return {self,channel,requests,messages,sent,publish,frame,setTime:value=>time=value,
     reply:value=>reply=value,tick:async()=>{timers.find(t=>t.ms===25).action();await settle()},
+    drain:async()=>{timers.find(t=>t.ms===5).action();await settle()},
     view:()=>timers.find(t=>t.ms===100).action(),hold:()=>{reply=()=>new Promise(resolve=>pending=resolve);return value=>pending(value)}};
 }
 test('worker reuses the production factory and forwards exact bytes without generating input',async()=>{
@@ -65,6 +66,50 @@ test('worker keeps native deadline, actual channel readiness and backpressure ch
       if(kind==='buffered')f.channel.bufferedAmount=1;if(kind==='wrong-frame')r.frame.control_transport.media_attempt='other';return r});
     await f.tick();assert.equal(f.sent.length,0,kind);
   }
+});
+test('pre-existing SCTP buffer withholds frame consumption without dropping dc_ready and sends on drain',async()=>{
+  const f=fixture();
+  f.channel.bufferedAmount=1200;
+  let heldFrame=f.frame(7);
+  f.reply(()=>f.requests.at(-1).body.dc_send_ready===false?{protocol:transport.protocol,enabled:true,transport:{epoch:1,path:'dc',revision:0},frame:null}:heldFrame);
+  await f.tick();
+  assert.equal(f.requests.length,1);
+  assert.equal(f.requests[0].body.dc_ready,true);
+  assert.equal(f.requests[0].body.dc_send_ready,false);
+  assert.equal(f.sent.length,0);
+  // Drain SCTP buffer and fire onbufferedamountlow: courier wakes without waiting for 25ms timer and sends fresh frame 7.
+  f.channel.bufferedAmount=0;
+  f.channel.onbufferedamountlow();
+  await settle();
+  assert.equal(f.requests.length,2);
+  assert.equal(f.requests[1].body.dc_send_ready,undefined);
+  assert.equal(f.requests[1].body.last_seen_seq,0);
+  assert.deepEqual(f.sent,['UNCHANGED_SIGNED_7']);
+  // Sub-1024B buffer (single ~520B control frame): WebRTC onbufferedamountlow does not cross 1024B,
+  // so 5ms local drain check stays silent while buffered>0 and wakes once when buffered hits 0.
+  const subThreshold=fixture();
+  subThreshold.channel.bufferedAmount=520;
+  subThreshold.reply(()=>subThreshold.requests.at(-1).body.dc_send_ready===false?{protocol:transport.protocol,enabled:true,transport:{epoch:1,path:'dc',revision:0},frame:null}:subThreshold.frame(9));
+  await subThreshold.tick();
+  assert.equal(subThreshold.requests.length,1);
+  assert.equal(subThreshold.requests[0].body.dc_send_ready,false);
+  await subThreshold.drain();
+  assert.equal(subThreshold.requests.length,1,'drain check polled HTTP while buffer was still non-empty');
+  subThreshold.channel.bufferedAmount=0;
+  await subThreshold.drain();
+  assert.equal(subThreshold.requests.length,2);
+  assert.deepEqual(subThreshold.sent,['UNCHANGED_SIGNED_9']);
+  await subThreshold.drain();
+  assert.equal(subThreshold.requests.length,2,'drain check fired again after waitingForDrain cleared');
+  // Negative check: if the frame expired before drain, onbufferedamountlow still refuses to send it.
+  const expired=fixture();
+  expired.channel.bufferedAmount=1200;
+  expired.reply(()=>expired.requests.at(-1).body.dc_send_ready===false?{protocol:transport.protocol,enabled:true,transport:{epoch:1,path:'dc',revision:0},frame:null}:{...expired.frame(8),valid_for_ms:0});
+  await expired.tick();
+  expired.channel.bufferedAmount=0;
+  expired.channel.onbufferedamountlow();
+  await settle();
+  assert.equal(expired.sent.length,0,'expired frame sent after buffer drain');
 });
 test('trace consumer stalls cannot build an unbounded message queue or stop sends',async()=>{
   const f=fixture();let seq=0;f.reply(()=>f.frame(++seq));

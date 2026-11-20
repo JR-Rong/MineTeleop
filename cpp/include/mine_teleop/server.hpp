@@ -672,6 +672,7 @@ class DriverConsoleRuntime {
   Json authorized_vehicles_ = Json::array();
   NativeControlIntentStore native_control_intent_;
   std::atomic<bool> native_control_estop_wakeup_{false};
+  std::atomic<bool> native_control_retired_no_io_{false};
   std::atomic<std::uint64_t> native_control_commands_sent_{0};
   std::atomic<std::uint64_t> native_control_send_failures_{0};
   std::atomic<std::int64_t> native_control_last_sent_at_utc_ms_{0};

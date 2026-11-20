@@ -187,10 +187,11 @@ class ControlTransportSender {
          sent.stamp.at("path").get_ref<const std::string&>() == control_path_name(stamp_.path) && sent.stamp.at("media_attempt") == stamp_.media_attempt);
     receipt.current = current;
     const bool admitted = result.at("transport_admitted").get<bool>();
+    const bool accepted = result.at("accepted").get<bool>();
     const bool rearm = result.at("rearm_required").get<bool>();
     if (current && admitted && !sent.estop) {
       if (rearm && last_accepted_gear_) awaiting_neutral_ = true;
-      if (sent.fresh && result.at("accepted").get<bool>() &&
+      if (sent.fresh && accepted &&
           (!awaiting_neutral_ || (sent.neutral && sent.gear == last_accepted_gear_ &&
               age <= NativeControlAckRecovery::kFreshAckMs))) {
         last_accepted_gear_ = sent.gear;
@@ -198,11 +199,19 @@ class ControlTransportSender {
       }
     }
     if (current && sent.path == ControlPath::Wss) { last_wss_result_ms_ = now; last_wss_result_age_ms_ = age; }
-    // The vehicle can admit a frame on this epoch while refusing to apply it
-    // until neutral is seen. That result still requests re-arm, but must not
-    // restart either of the direct route's stall clocks.
-    receipt.dc_ack_progress = current && sent.path == ControlPath::DataChannel && admitted && !rearm;
-    if (receipt.dc_ack_progress) last_dc_result_ms_ = now;
+    // Rejected frames never refresh the vehicle watchdog, and a late straggler
+    // whose round trip exceeded kFreshAckMs was sent at sent.started rather than
+    // now: neither may postpone the direct route's 500ms stall fallback.
+    receipt.dc_ack_progress = current && sent.path == ControlPath::DataChannel && admitted && accepted && !rearm;
+    if (receipt.dc_ack_progress) {
+      last_dc_result_ms_ = std::max(last_dc_result_ms_,
+          age <= NativeControlAckRecovery::kFreshAckMs ? now : sent.started);
+      if (path() == ControlPath::DataChannel && !selecting_ &&
+          last_dc_result_ms_ >= 0 && now - last_dc_result_ms_ > NativeControlAckRecovery::kStallMs) {
+        begin(ControlPath::Wss, {}, now, timeout_ms);
+        receipt.boundary = true;
+      }
+    }
     // A DC trial can happen before the operator has confirmed the required
     // session profile. If that is the reason it was rejected, one later
     // authenticated, fresh neutral WSS acceptance permits one new bounded

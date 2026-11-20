@@ -40,6 +40,41 @@ struct DriverConsoleTransportTestAccess {
     return runtime.control_transport_sender_.path() == detail::ControlPath::Wss &&
         runtime.control_transport_latest_dc_.is_null() && runtime.control_dc_ack_window_.pending_count() == 0;
   }
+  static void prepare_bridge_scope(DriverConsoleRuntime& runtime, const std::string& key, std::int64_t now_ms) {
+    NativeControlIntent intent;
+    intent.ui_instance_id = "ui-1";
+    intent.intent_seq = 1;
+    intent.gear = "D";
+    intent.critical_video_ready = true;
+    intent.critical_video_sample_healthy = true;
+    {
+      std::lock_guard lock(runtime.mutex_);
+      runtime.session_id_ = "session-001";
+      runtime.control_session_generation_ = 1;
+      runtime.media_scope_id_ = "media-a";
+      runtime.media_scope_session_ = "session-001";
+      runtime.media_offer_count_ = 1;
+      runtime.control_transport_vehicle_capable_ = true;
+      runtime.control_transport_cloud_capable_ = true;
+      runtime.control_transport_mac_key_ = key;
+      static_cast<void>(runtime.native_control_intent_.update(intent, now_ms, std::nullopt, true, now_ms));
+    }
+    std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
+    runtime.control_transport_sender_.set_data_channel_is_p2p(true);
+    runtime.control_transport_sender_.begin(detail::ControlPath::DataChannel, "media-a", now_ms, 5000);
+  }
+  static void publish_bridge_frame(DriverConsoleRuntime& runtime, Json frame, std::int64_t sent_ms) {
+    const auto current = runtime.native_control_intent_.sample(sent_ms);
+    std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
+    runtime.control_transport_sender_.decorate(frame);
+    runtime.control_transport_sender_.note_sent(frame, detail::ControlPath::DataChannel, sent_ms);
+    runtime.control_dc_ack_window_.note_sent(frame.at("seq").get<std::uint64_t>(), sent_ms);
+    frame["bridge_owner"] = current.owner_ui_instance_id;
+    frame["bridge_ui_epoch"] = current.ui_control_epoch;
+    runtime.control_transport_latest_dc_ = std::move(frame);
+    runtime.control_transport_latest_dc_sample_ = current;
+    runtime.control_transport_latest_dc_at_ms_ = sent_ms;
+  }
 };
 }  // namespace mine_teleop
 
@@ -206,6 +241,60 @@ void neutral_required_does_not_postpone_direct_fallback() {
   expect(sender.observe(true, "media-a", 671, 5000) && sender.path() == ControlPath::Wss &&
       sender.selecting() && !sender.owns_dc_publication(moving),
       "neutral-required rejection postponed the fenced WSS fallback");
+}
+void stale_or_rejected_dc_results_do_not_postpone_direct_fallback() {
+  ControlTransportSender sender;
+  sender.set_data_channel_is_p2p(true);
+  expect(sender.consider_dc("media-a", 0, 5000), "direct trial missing");
+  for (std::uint64_t seq = 1; seq <= 3; ++seq) {
+    auto frame = payload(seq, seq * 50);
+    sender.decorate(frame);
+    sender.note_sent(frame, ControlPath::DataChannel, seq * 50);
+    expect(sender.note_result(response(frame, true, seq == 1), seq * 50 + 28, 5000).matched,
+        "healthy direct result lost");
+  }
+  expect(!sender.holding_motion(), "direct trial did not qualify");
+  // Last fresh accepted DC result was at t=178 (seq 3, age 28ms).
+  // 1) Non-rearm rejection (accepted=false, rearm_required=false) must not count as ACK progress.
+  auto non_rearm_rejected = payload(4, 220);
+  sender.decorate(non_rearm_rejected);
+  sender.note_sent(non_rearm_rejected, ControlPath::DataChannel, 220);
+  auto rej = response(non_rearm_rejected, false);
+  rej["reason"] = "stale_safe_heartbeat_gear_untrusted";
+  rej["rearm_required"] = false;
+  const auto rej_receipt = sender.note_result(rej, 240, 5000);
+  expect(rej_receipt.matched && rej_receipt.current && !rej_receipt.dc_ack_progress,
+      "non-rearm DC rejection counted as direct ACK progress");
+  // 2) Late accepted straggler (sent at t=175, arrives 484ms later at t=659 > kFreshAckMs)
+  // must not reset last_dc_result_ms_ to 659 and postpone the t=678+1 stall deadline.
+  auto straggler = payload(5, 175);
+  sender.decorate(straggler);
+  sender.note_sent(straggler, ControlPath::DataChannel, 175);
+  const auto late_receipt = sender.note_result(response(straggler, true), 659, 5000);
+  expect(late_receipt.matched && late_receipt.current && late_receipt.dc_ack_progress && !late_receipt.boundary,
+      "late accepted straggler before 500ms stall unexpectedly changed path");
+  expect(!sender.observe(true, "media-a", 678, 5000), "direct fallback fired before 500ms since last fresh result");
+  expect(sender.observe(true, "media-a", 679, 5000) && sender.path() == ControlPath::Wss && sender.selecting(),
+      "484ms straggler postponed the 500ms direct stall fallback");
+
+  // 3) If the straggler itself arrives after the 500ms stall window, note_result fences WSS synchronously.
+  ControlTransportSender sync_sender;
+  sync_sender.set_data_channel_is_p2p(true);
+  expect(sync_sender.consider_dc("media-b", 0, 5000), "second direct trial missing");
+  for (std::uint64_t seq = 1; seq <= 3; ++seq) {
+    auto frame = payload(seq, seq * 50);
+    sync_sender.decorate(frame);
+    sync_sender.note_sent(frame, ControlPath::DataChannel, seq * 50);
+    expect(sync_sender.note_result(response(frame, true, seq == 1), seq * 50 + 20, 5000).matched,
+        "healthy direct result lost");
+  }
+  auto very_late = payload(4, 180);
+  sync_sender.decorate(very_late);
+  sync_sender.note_sent(very_late, ControlPath::DataChannel, 180);
+  const auto sync_receipt = sync_sender.note_result(response(very_late, true), 685, 5000);
+  expect(sync_receipt.matched && sync_receipt.boundary && sync_sender.path() == ControlPath::Wss &&
+      sync_sender.selecting() && !sync_sender.owns_dc_publication(very_late),
+      "over-stall straggler did not synchronously fence WSS fallback");
 }
 void rearm_preserves_the_last_accepted_gear_across_routes() {
   ControlTransportSender sender;
@@ -600,6 +689,37 @@ void real_service_switch_does_not_disable_watchdog() {
       "transport feature suppressed existing hard timeout/profile clear");
   service.close();
 }
+
+void bridge_withholds_frame_while_dc_send_not_ready() {
+  DriverConfig config; config.driver_id = "driver-001"; config.signaling_url = "http://127.0.0.1:1";
+  config.browser_event_log_path.clear();
+  DriverConsoleRuntime runtime(config, "vehicle-001", "fixture");
+  const std::string key = "01234567890123456789012345678901";
+  const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  DriverConsoleTransportTestAccess::prepare_bridge_scope(runtime, key, now_ms);
+  DriverConsoleTransportTestAccess::publish_bridge_frame(runtime, payload(7, 1000), now_ms);
+  Json req = {{"source_session_id", "session-001"}, {"source_control_session_generation", 1ULL},
+      {"media_negotiation_id", "media-a"}, {"ui_instance_id", "ui-1"}, {"ui_control_epoch", 1ULL},
+      {"dc_ready", true}, {"dc_network_path", "p2p"}, {"last_seen_seq", 0ULL}};
+  auto invalid = req; invalid["dc_send_ready"] = "invalid";
+  throws([&] { static_cast<void>(runtime.control_transport_bridge(invalid)); });
+  auto blocked = req; blocked["dc_send_ready"] = false;
+  const auto held = runtime.control_transport_bridge(blocked);
+  expect(held.at("enabled") == true && held.at("transport").at("path") == "dc" &&
+      held.at("frame").is_null() && held.at("frame_json").is_null() &&
+      held.at("valid_for_ms").get<std::int64_t>() > 0,
+      "dc_send_ready=false either broke DC readiness or consumed the fresh frame");
+  const auto delivered = runtime.control_transport_bridge(req);
+  expect(delivered.at("frame").is_object() && delivered.at("frame").at("seq") == 7 &&
+      delivered.at("frame_json").is_string(),
+      "held fresh frame was not delivered once dc_send_ready became true");
+  DriverConsoleTransportTestAccess::publish_bridge_frame(
+      runtime, payload(8, 1050), now_ms - detail::kNativeBridgePublicationMaxAgeMs - 1);
+  const auto expired = runtime.control_transport_bridge(req);
+  expect(expired.at("frame").is_null() && expired.at("valid_for_ms") == 0,
+      "expired publication was delivered after drain");
+}
 }  // namespace
 int main() {
   try {
@@ -607,6 +727,8 @@ int main() {
     driver_negotiates_transient_hold_from_offer();
     late_dc_results_withdraw_publication_in_result_handler();
     neutral_required_does_not_postpone_direct_fallback();
+    stale_or_rejected_dc_results_do_not_postpone_direct_fallback();
+    bridge_withholds_frame_while_dc_send_not_ready();
     rearm_preserves_the_last_accepted_gear_across_routes();
     failed_direct_trials_back_off_and_exhaust_per_attempt();
     mock_idle_reprobe_is_fenced_fresh_and_once_per_attempt();
@@ -615,6 +737,6 @@ int main() {
     version_scope_and_expiry(); single_receiver_epoch_replay_and_emergency(); exact_result_and_neutral_qualification();
     slower_dc_and_lost_selection(); cloud_ingress_without_vehicle_result_can_only_start_a_neutral_trial(); healthy_proven_p2p_is_preferred_to_a_faster_cloud_backup(); signatures_bind_native_bytes_and_vehicle_results(); private_signing_material_is_not_public_session_state(); bounded_status_rejects_unsupported_kinds_and_scope_mismatch(); real_service_switch_does_not_disable_watchdog();
     healthy_wss_waits_for_idle_before_returning_to_direct();
-    std::cout << "20 control transport cases passed; real common safety service, no sockets\n";
+    std::cout << "22 control transport cases passed; real common safety service, no sockets\n";
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
