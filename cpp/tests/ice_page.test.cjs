@@ -14,7 +14,7 @@ function section(start, end) {
   return source.slice(begin, stop);
 }
 const methods = section('async function pollSignaling(', '\nfunction currentMediaPeer(') + '\n' + section('function applyMediaStatus(', '\nasync function pollSignaling(') + '\n' + section('function currentMediaPeer(', '\nfunction offeredVideoCameraIds(') + '\n' +
-  section('async function startFromOffer(', '\nsetInterval(()=>cameraView.refresh()') + '\n' +
+  section('async function fetchIceServers(', '\nsetInterval(()=>cameraView.refresh()') + '\n' +
   section('async function collectMetrics(){', '\nsetInterval(()=>collectMetrics()');
 function deferred() {
   let resolve, reject;
@@ -22,7 +22,7 @@ function deferred() {
   return {promise, resolve, reject};
 }
 function fixture() {
-  const posts = [], peers = [], logs = [], gates = {}, resets = [];
+  const posts = [], peers = [], logs = [], gates = {}, resets = [], adopts = [];
   const presentation = {sampled_at_monotonic_ms:123, timestamp_scope:'browser_monotonic',
     frame_age_scope:'since_last_observed_valid_presented_frame_not_capture_latency',
     cameras:[{camera_id:'fixture-camera',frame_age_ms:7,presented_frames:12}]};
@@ -36,6 +36,10 @@ function fixture() {
     async getStats() { if (gates.stats) { gates.stats.entered=true; await gates.stats.promise; } return this.stats || new Map(); }
   }
   const context = vm.createContext({
+    MineTeleopControlWorker:{create(options) {
+      const actor=require('../web/control_transport_worker.js').create(options);
+      return {...actor,adopt(channel){adopts.push(channel);return actor.adopt(channel)}};
+    }},URLSearchParams,location:{search:'?control_courier=page'},
     MineTeleopControlTransport:require('../web/control_transport.js'),setInterval(){},
     peer:null,controlChannel:null,pendingIce:[],mediaPeerEpoch:0,mediaOfferScope:null,mediaHasOffer:false,
     retiredMediaScopes:new Set(),mediaScopeIssue:'',nativeControlSessionId:'session-fixture',nativeControlSessionGeneration:7,
@@ -45,7 +49,7 @@ function fixture() {
     RTCPeerConnection:Peer,cameraView:{configure(){},setConnectionState(){},presentationSnapshot(){return presentation}},webrtcLabel:{},
     updateVcuHandshakeState(){},resetControlProfileSession(){resets.push('profile')},resetControlAuthorityInput(){resets.push('input')},
     offeredVideoCameraIds(){return new Map()},clientLog(event,details){logs.push({event,details})},renderMonitoring(){},
-    post:async(route,body)=>{posts.push({route,body}); if (gates.post) await gates.post.promise; return {}},
+    post:async(route,body)=>{posts.push({route,body}); if(route==='/api/webrtc/ice-servers'){const servers=context.nextIceServers||context.iceServers;if(gates.iceFetch){gates.iceFetch.entered=true;await gates.iceFetch.promise;}return {ice_servers:servers}} if (gates.post) await gates.post.promise; return {}},
     console,safeIceEndpoint(){return 'fixture'},controlLogic,performance,AbortController,setTimeout:callback=>callback(),
     polling:false,signalingGeneration:11,signalingPollAbort:null,controlAuthorityLost:false,
     pageReleaseScope(){return {}},safeLogoutReleaseBody(){return {}},closeRealtimeSession(){context.closed=(context.closed||0)+1;context.polling=false},
@@ -57,7 +61,7 @@ function fixture() {
     controlOutcomeSession:{metrics:controlLogic.createControlOutcomeMetrics()},statusPanel:{},formatMetric(){return 'fixture'},
   });
   vm.runInContext(methods, context, {filename:'actual-shipped-ice-methods'});
-  return {context, peers, posts, logs, gates, resets, presentation};
+  return {context, peers, posts, logs, gates, resets, presentation, adopts};
 }
 const offer = (id, ufrag=id) => ({media_negotiation_id:id,sdp:`v=0\r\na=ice-ufrag:${ufrag}\r\n`,media_tracks:[]});
 const candidate = (id, ufrag=id, type='host') => ({media_negotiation_id:id,usernameFragment:ufrag,
@@ -65,6 +69,54 @@ const candidate = (id, ufrag=id, type='host') => ({media_negotiation_id:id,usern
 const icePosts = f => f.posts.filter(p=>p.route==='/api/webrtc/ice-candidate');
 const tests = [];
 function test(id, fn) { tests.push({id,fn}); }
+test('ICE-WORKER-ADOPTION-001', async()=>{
+  const f=fixture();await f.context.startFromOffer(offer('a'));
+  const old=f.peers[0];await f.context.startFromOffer(offer('b'));
+  const channel=()=>({label:'control',protocol:'mine-teleop-control-v1',ordered:false,maxRetransmits:0,close(){this.closed=true}});
+  const retired=channel();old.ondatachannel({channel:retired});assert.equal(retired.closed,true);assert.equal(f.adopts.length,0);
+  const invalid=channel();invalid.ordered=true;f.peers[1].ondatachannel({channel:invalid});
+  assert.equal(invalid.closed,true);assert.equal(f.adopts.length,0);
+  f.context.lastControlStatusSeq=99;const current=channel();f.peers[1].ondatachannel({channel:current});
+  assert.deepEqual(f.adopts,[current]);assert.equal(f.context.controlChannel,current);assert.equal(f.context.lastControlStatusSeq,0);
+});
+test('ICE-DIRECT-FALLBACK-001', async()=>{
+  const f=fixture();
+  await f.context.startFromOffer({...offer('direct-1'),ice_route_mode:'direct'});
+  assert.equal(f.peers[0].config.iceServers.length,1);
+  assert.deepEqual(Array.from(f.peers[0].config.iceServers[0].urls),['stun:fixture.invalid']);
+  const old=f.peers[0];
+  f.context.nextIceServers=[{urls:['stun:fixture.invalid','turn:fixture.invalid'],username:'fresh-expiry:fixture',credential:'fresh-credential'}];
+  await f.context.startFromOffer({...offer('fallback-2'),ice_route_mode:'all'});
+  assert(old.closed,'fallback did not retire old peer');
+  assert.equal(f.peers[1].config.iceServers[0].credential,'fresh-credential','fallback reused expired TURN credentials');
+  assert(f.peers[1].config.iceServers[0].urls.includes('turn:fixture.invalid'),'fallback has no TURN');
+  const count=icePosts(f).length;
+  old.onicecandidate({candidate:{toJSON:()=>candidate('direct-1')}});await Promise.resolve();
+  assert.equal(icePosts(f).length,count,'retired direct candidate crossed fallback fence');
+  await assert.rejects(()=>f.context.startFromOffer({...offer('invalid'),ice_route_mode:'invalid'}),/unsupported/);
+  assert(!f.peers[1].closed,'invalid route mode closed active peer');
+});
+test('ICE-REFRESH-FENCE-001', async()=>{
+  for(const outcome of ['resolve','reject']){
+  const f=fixture();await f.context.startFromOffer(offer('first'));
+  const gate=f.gates.iceFetch=deferred();const pending=f.context.startFromOffer(offer('stale-refresh'));
+  assert(gate.entered);assert(f.peers[0].closed);
+  delete f.gates.iceFetch;
+  f.context.nextIceServers=[{urls:'turn:fixture.invalid',credential:'newer'}];
+  await f.context.startFromOffer({...offer('current'),ice_route_mode:'relay'});
+  if(outcome==='resolve')gate.resolve();else gate.reject(Error('retired fetch failed'));await pending;
+  assert.equal(f.peers.length,2,'stale credential fetch created a retired peer');
+  assert.equal(f.peers[1].config.iceTransportPolicy,'relay');
+  assert.equal(f.peers[1].config.iceServers[0].credential,'newer');
+  }
+});
+test('ICE-ADDRESS-CLASS-001', async()=>{
+  for (const [address,scope] of [['100.64.1.1','shared_cgnat'],['192.168.1.1','private'],['8.8.8.8','public'],
+    ['2001:4860::1','public'],['fe80::1','link_local'],['fd00::1','private'],['2001:db8::1','documentation']]) {
+    const value=controlLogic.iceCandidateSummary({candidate:'candidate:x 1 UDP 100 '+address+' 4567 typ host'});
+    assert.equal(value.address_class,scope);assert(!JSON.stringify(value).includes(address));
+  }
+});
 test('ICE-PAGE-001', async()=>{
   const f=fixture(); await f.context.addIce(candidate('attempt-a'));
   await f.context.startFromOffer(offer('attempt-a'));
@@ -148,8 +200,9 @@ test('ICE-PAGE-007', async()=>{
 });
 test('ICE-PAGE-008', async()=>{
   const f=fixture();await f.context.startFromOffer(offer('a'));const old=f.peers[0];
+  const logCount=f.logs.length;
   f.context.nativeControlSessionGeneration=8;old.onicecandidate({candidate:{toJSON:()=>candidate('a')}});
-  old.onicecandidateerror({url:'turn:fixture.invalid',errorCode:701});assert.equal(icePosts(f).length,0);assert.equal(f.logs.length,0);
+  old.onicecandidateerror({url:'turn:fixture.invalid',errorCode:701});assert.equal(icePosts(f).length,0);assert.equal(f.logs.length,logCount);
   for(let n=0;n<128;n++)await f.context.addIce(candidate(`future-${n}`));
   await assert.rejects(f.context.addIce(candidate('overflow')),/buffer exceeds limit/);assert.equal(f.context.pendingIce.length,128);
 });

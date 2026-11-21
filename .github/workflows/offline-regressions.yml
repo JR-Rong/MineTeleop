@@ -56,9 +56,9 @@ jobs:
             --no-install-recommends libunwind-dev || true
           sudo apt-get install -y --no-install-recommends libunwind-dev
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake pkg-config iproute2 \
+            build-essential cmake pkg-config iproute2 coturn openssl ca-certificates \
             libcurl4-openssl-dev libssl-dev libyaml-cpp-dev nlohmann-json3-dev libjpeg-dev \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev libnice-dev \
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
             gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-nice
       - name: Configure and build every native test target
@@ -75,7 +75,8 @@ jobs:
           cmake --build build-native-offline --parallel 3
       - name: Run all registered tests with loopback only
         run: |
-          # A fresh namespace cannot contact a vehicle, cloud, or TURN service.
+          # A fresh namespace cannot contact a vehicle, cloud, or external TURN service.
+          # The fallback integration test creates its own loopback coturn fixture.
           # Keep loopback up for the real in-process HTTP/WebSocket mocks.
           sudo unshare --net -- env PATH="$PATH" bash -euc '
             ip link set lo up
@@ -97,6 +98,7 @@ jobs:
           mkdir -p "$artifact_dir/bin" "$artifact_dir/ldd"
           for binary in \
             mine-teleop-bench-capture-probe \
+            mine-teleop-native-receiver-probe \
             mine-teleop-recorder \
             mine-teleop \
             mine-teleop-bench-containment-tests \
@@ -110,6 +112,11 @@ jobs:
             mine-teleop-control-recovery-tests \
             mine-teleop-control-tests \
             mine-teleop-native-control-intent-tests \
+            mine-teleop-native-control-mailbox-tests \
+            mine-teleop-native-control-publication-tests \
+            mine-teleop-native-control-channel-tests \
+            mine-teleop-native-receiver-mid-integration-tests \
+            mine-teleop-native-view-only-integration-tests \
             mine-teleop-session-logs-tests
           do
             test -f "build-native-offline/$binary"

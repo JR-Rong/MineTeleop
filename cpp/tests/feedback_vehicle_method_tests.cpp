@@ -79,6 +79,7 @@ struct EarlyResult : Startup {
   DirectAuthorityLease direct_authority;
   EmergencyStopReceiver emergency_stop_receiver;
   std::uint64_t control_result_seq{}, control_status_seq{}, rejected_control_commands{};
+  std::atomic<std::uint64_t> native_control_profile_not_ready_discards_total{0}, native_control_handshake_not_ready_discards_total{0};
   Json latest_control_result;
   unsigned wakeups{};
   void wake_native_control_feedback() { ++wakeups; }
@@ -101,6 +102,38 @@ struct EarlyResult : Startup {
     throw std::runtime_error("early rejection fixture unexpectedly passed its guard");
   }
 };
+
+void profile_rejection_publishes_precise_signed_result() {
+  for (const bool dc : {false, true}) {
+    EarlyResult value;
+    expect(value.start_control_service(), "profile fixture failed to start mock service");
+    value.config.control.max_command_gap_ms = 200;
+    FakeChannel channel;
+    value.control_channel = &channel;
+    value.control_link_open = true;
+    value.control_transport_fence.reset(value.config.vehicle_id, "d", "s", "t");
+    ControlCommand command;
+    command.vehicle_id = value.config.vehicle_id; command.driver_id = "d"; command.session_id = "s";
+    command.control_token = "t"; command.seq = 42; command.sent_at_utc_ms = 1000;
+    const ControlTransportStamp stamp{1, 0, 42, dc ? ControlPath::DataChannel : ControlPath::Wss,
+        dc ? "fixture-attempt" : "", true};
+    Json feedback;
+    value.deliver(command, dc ? EarlyResult::ControlMessageTransport::DataChannel : EarlyResult::ControlMessageTransport::NativeSignaling,
+        &channel, &feedback, {{"control_transport", stamp.to_json()}});
+    expect(feedback.at("reason") == "session_profile_not_ready" && !feedback.at("accepted").get<bool>() &&
+        feedback.at("transport_admitted").get<bool>(), "profile rejection lost its authenticated reason");
+    expect(verify_transport_message(feedback, value.signaling.transport_mac_key(), true), "profile result MAC is invalid");
+    const auto bounded = bounded_vehicle_control_result(feedback, "s", value.config.vehicle_id, "d");
+    expect(bounded.at("reason") == "session_profile_not_ready" &&
+        verify_transport_message(bounded, value.signaling.transport_mac_key(), true),
+        "wire normalization lost the signed profile rejection");
+    expect(channel.sent.size() == (dc ? 1U : 0U) && (!dc || channel.sent.front() == feedback),
+        "profile rejection was not published on the selected path");
+    expect(value.native_control_profile_not_ready_discards_total == 1 && !value.receive_apply_invoked &&
+        value.control_service->adapter_status().applied_command_count == 0,
+        "profile rejection changed fail-closed control semantics");
+  }
+}
 
 void transport_expiry_has_signed_reason_and_trace_without_apply() {
   for (const bool trace : {false, true}) for (const bool dc : {false, true}) for (const int offset : {-201, 201}) {
@@ -303,6 +336,6 @@ void raw_vcu_details_are_not_a_transport_wrapper() {
 }
 }
 int main() {
-  try { transport_expiry_has_signed_reason_and_trace_without_apply(); raw_vcu_details_are_not_a_transport_wrapper(); early_rejection_publishes_precise_signed_result(); cloud_only_startup_retains_all_safety_gates(); cloud_bootstrap_feedback_requires_live_authenticated_lease(); publish_all_four_independent_axes(); std::cout << "Actual vehicle feedback publisher: expiry rejection trace, raw/wrapped status ordering, early rejection reasons, four axes, real MAC and bounded snapshots passed; fake Gst send, no ABI/network proof\n"; }
+  try { profile_rejection_publishes_precise_signed_result(); transport_expiry_has_signed_reason_and_trace_without_apply(); raw_vcu_details_are_not_a_transport_wrapper(); early_rejection_publishes_precise_signed_result(); cloud_only_startup_retains_all_safety_gates(); cloud_bootstrap_feedback_requires_live_authenticated_lease(); publish_all_four_independent_axes(); std::cout << "Actual vehicle feedback publisher: duplicate suppression, expiry rejection trace, raw/wrapped status ordering, early rejection reasons, four axes, real MAC and bounded snapshots passed; fake Gst send, no ABI/network proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

@@ -3,6 +3,7 @@
 #include "mine_teleop/core.hpp"
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <utility>
 
@@ -18,6 +19,16 @@ class LogicalTimeControlService : public VehicleControlService {
       : LogicalTimeControlService(std::make_shared<std::atomic<std::int64_t>>(0),
             config, std::move(driver_id), std::move(session_id), std::move(token),
             std::move(adapter), telemetry_interval_ms) {}
+
+  // Same API, but every elapsed-time decision follows `monotonic_clock` instead of the logical `time` argument.
+  // For fixtures that feed wall-clock UTC: the wall clock can step backwards (the Colima VM does, by ~100 ms every
+  // ~12 s), which a real steady_clock never does. The `time` argument then only carries UTC.
+  LogicalTimeControlService(const VehicleConfig& config, std::string driver_id, std::string session_id,
+      std::string token, std::unique_ptr<VehicleAdapter> adapter, std::function<std::int64_t()> monotonic_clock,
+      int telemetry_interval_ms = 100)
+      : VehicleControlService(config, std::move(driver_id), std::move(session_id), std::move(token),
+            std::move(adapter), telemetry_interval_ms, std::move(monotonic_clock)),
+        clock_(std::make_shared<std::atomic<std::int64_t>>(0)) {}
 
   void start(std::int64_t time) { clock_->store(time); VehicleControlService::start(time); }
   void tick(std::int64_t time) { clock_->store(time); VehicleControlService::tick(time); }

@@ -371,7 +371,8 @@ int main(int argc, char** argv) {
         port(arguments),
         [service](const auto& request) { return service->handle(request); },
         8 * 1024 * 1024,
-        [service](int socket, const auto& request) { return service->handle_websocket(socket, request); });
+        [service](mine_teleop::SocketHandle socket, const auto& request) { return service->handle_websocket(socket, request); },
+        mine_teleop::HttpConnectionPolicy::BoundedTimeProbes);
     server.start();
     std::signal(SIGINT, stop_handler);
     std::signal(SIGTERM, stop_handler);

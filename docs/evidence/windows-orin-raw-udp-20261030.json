@@ -1,0 +1,22 @@
+{
+  "schema": "mine-teleop-bench-evidence-v1",
+  "observed_at_utc": "2026-10-30T07:57:03Z",
+  "source_revision_under_review": "380a131",
+  "scope": "Raw IPv6 UDP reachability only; not WebRTC, media, control, stability, or latency acceptance",
+  "window_seconds_per_endpoint": 20,
+  "endpoint_windows_synchronized": false,
+  "windows": {"route": "WLAN", "sent": 137, "received": 115, "invalid": 0},
+  "orin": {"route": "cellular", "sent": 142, "received": 113, "invalid": 0},
+  "guards": [
+    "The selected Windows source and Orin source were global IPv6 addresses.",
+    "The Orin UDP socket was bound to its cellular interface and its route to the Windows peer was checked.",
+    "Each received datagram was checked for the expected peer address, port and per-run nonce.",
+    "CAN was observed DOWN before and after the probe."
+  ],
+  "limitations": [
+    "The endpoints were started separately, so send and receive counts cannot establish packet loss.",
+    "FrameForge CPU work was observed on Orin before this test and was not paused; its load was not measured continuously.",
+    "No camera, WebRTC negotiation, DataChannel, input lease, mock vehicle control, clock threshold, latency or 30-minute behavior was tested."
+  ],
+  "local_evidence_sha256": "023019f8501e1d76ac996c6f73b83eab3c9fa64e772d9b062b9b23d59440c940"
+}

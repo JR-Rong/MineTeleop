@@ -74,6 +74,7 @@ docker buildx build \
   --platform "$platform" \
   --build-arg "MINE_TELEOP_BUILD_JOBS=$build_jobs" \
   --build-arg "MINE_TELEOP_BUILD_TESTS=$run_tests" \
+  --build-arg "MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS=${MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS:-OFF}" \
   --build-arg "MINE_TELEOP_REQUIRE_CHASSIS_RUNTIME=ON" \
   --build-arg "MINE_TELEOP_SOURCE_COMMIT=$source_commit" \
   --build-arg "MINE_TELEOP_BUILT_AT_UTC=$built_at_utc" \

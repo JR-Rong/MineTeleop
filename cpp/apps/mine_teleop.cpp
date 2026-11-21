@@ -479,7 +479,8 @@ int run_signaling_server(const Arguments& arguments) {
       port_option(arguments, "--port", 8765),
       [service](const auto& request) { return service->handle(request); },
       8 * 1024 * 1024,
-      [service](int socket, const auto& request) { return service->handle_websocket(socket, request); });
+      [service](int socket, const auto& request) { return service->handle_websocket(socket, request); },
+      mine_teleop::HttpConnectionPolicy::BoundedTimeProbes);
   std::cout << Json({
                    {"event", "signaling_server_started"},
                    {"runtime", "cpp"},
@@ -525,7 +526,8 @@ int run_driver_console(const Arguments& arguments) {
   mine_teleop::SimpleHttpServer server(
       host,
       port_option(arguments, "--port", 8080),
-      [app](const auto& request) { return app->handle(request); });
+      [app](const auto& request) { return app->handle(request); },
+      8 * 1024 * 1024, {}, mine_teleop::HttpConnectionPolicy::BoundedKeepAlive);
   std::cout << Json({
                    {"event", "driver_console_started"},
                    {"runtime", "cpp"},
