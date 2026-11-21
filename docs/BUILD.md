@@ -8,6 +8,7 @@
 | 端 | 目标平台 | 构建脚本 | 产物 |
 | --- | --- | --- | --- |
 | 云端 | Ubuntu 22.04 amd64 | `scripts/build/build_macos_cloud_bundle.sh` | `dist/mine-teleop-cloud-ubuntu22.04-x64-*.tar.gz` |
+| 云端（离线局域网） | Windows x64 | `scripts/build/build_windows_cloud_bundle.ps1` | `dist/mine-teleop-cloud-windows-x64-*.zip` |
 | 控制端 | macOS arm64/x64 | `scripts/build/build_macos_control_bundle.sh` | `dist/mine-teleop-control-macos-*.tar.gz` |
 | 控制端 | Windows x64/arm64 | `scripts/build/build_windows_control_bundle.ps1` | `dist/mine-teleop-control-windows-*.zip` |
 | 车端 | Ubuntu 22.04 amd64 | `scripts/build/build_cpp_ubuntu_bundle.sh linux/amd64` | `dist/mine-teleop-vehicle-ubuntu22.04-x64-*.tar.gz` |

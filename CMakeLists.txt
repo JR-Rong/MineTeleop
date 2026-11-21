@@ -199,10 +199,29 @@ mine_teleop_enable_warnings(mine_teleop_runtime)
 add_library(mine_teleop_bench INTERFACE)
 target_include_directories(mine_teleop_bench INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp/bench/include>)
 
+function(mine_teleop_copy_msvc_runtime target)
+  if(MSVC)
+    # Put the compiler's redistributable CRT next to the executable. Operators
+    # do not need a separate Visual C++ Redistributable installation.
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)
+    include(InstallRequiredSystemLibraries)
+    if(NOT CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
+      message(FATAL_ERROR "MSVC redistributable libraries are required for portable Windows target ${target}")
+    endif()
+    foreach(runtime_library IN LISTS CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
+      add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${runtime_library}" "$<TARGET_FILE_DIR:${target}>"
+        VERBATIM)
+    endforeach()
+  endif()
+endfunction()
+
 if(MINE_TELEOP_BUILD_SIGNALING_SERVER)
   add_executable(mine-teleop-signaling-server cpp/apps/mine_teleop_signaling.cpp)
   target_link_libraries(mine-teleop-signaling-server PRIVATE mine_teleop_runtime)
   mine_teleop_enable_warnings(mine-teleop-signaling-server)
+  mine_teleop_copy_msvc_runtime(mine-teleop-signaling-server)
   if(NOT APPLE)
     install(TARGETS mine-teleop-signaling-server RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
   endif()
@@ -216,21 +235,7 @@ if(MINE_TELEOP_BUILD_CONTROL_CLIENT)
     PRIVATE MINE_TELEOP_CURL_LINKAGE="${MINE_TELEOP_CURL_LINKAGE}"
   )
   mine_teleop_enable_warnings(mine-teleop-control)
-  if(MSVC)
-    # Put the compiler's redistributable CRT next to the executable. Operators
-    # do not need a separate Visual C++ Redistributable installation.
-    set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)
-    include(InstallRequiredSystemLibraries)
-    if(NOT CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
-      message(FATAL_ERROR "MSVC redistributable libraries are required for the portable controller")
-    endif()
-    foreach(runtime_library IN LISTS CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
-      add_custom_command(TARGET mine-teleop-control POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-          "${runtime_library}" "$<TARGET_FILE_DIR:mine-teleop-control>"
-        VERBATIM)
-    endforeach()
-  endif()
+  mine_teleop_copy_msvc_runtime(mine-teleop-control)
   set_target_properties(mine-teleop-control PROPERTIES
     BUILD_RPATH "$ORIGIN/../lib"
     INSTALL_RPATH "$ORIGIN/../lib"
