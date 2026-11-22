@@ -322,6 +322,28 @@ curl -fsS http://127.0.0.1:8080/health
   `full_scale_motor_torque_nm × max_throttle`，新语义中 `full_scale_motor_torque_nm` 本身就是唯一上限。
   例如旧 `41.25 × 0.10 ≈ 4.125 Nm/路`，不得原样保留 `41.25 Nm`。要从旧有效上限起步并
   重做隔离台架标定；缺少新版非 mock 必填安全字段时应保持启动失败，不得补默认值绕过。
+- 从车端 YAML 删除 `ice.stun_servers` / `ice.turn_servers`。这两个键从未被车端读取，现在
+  出现即拒绝启动，错误为 `vehicle ice.stun_servers/turn_servers are unsupported`，避免继续
+  静默忽略。STUN/TURN 地址改由信令服务 `--stun-urls` / `--turn-urls` 配置，车端和页面从认证
+  后的信令接口取得同一份 ICE 列表。使用仓库内打包配置部署的车辆不受影响；自维护配置请先运行
+  `./bin/mine-teleop-run config-check --config <你的配置>`，看到上述错误即按本条处理。
+- 瞬态链路保持（设计见 [64](64-transient-link-hold-design.md)）：临时的延迟尖峰先进入"保持"（撤销牵引、轻制动），
+  在上限内自动恢复，不再触发全制动加重按；超过上限、预算用尽或出现故障类原因仍立即进入原有制动等待。
+  - **开启：** 使用仓库内打包的现场配置（`vehicle-agent.three-machine.field.yaml`、`vehicle-agent.ccg2-8m.yaml`）
+    即已开启。自维护配置需要在 `control:` 下加入 `transient_hold:` 块（`enabled: true`，其余取默认值即可），并把
+    `control_timeout_ms` 设为 `1200`、`bridge_apply_timeout_ms` 设为 `800`。不满足
+    `degraded_timeout_ms + max_hold_ms + 100 ≤ control_timeout_ms`、字段越界或拼错块内键名的配置会启动失败，
+    先运行 `config-check` 确认。字段范围见 [配置](08-configuration.md)。
+  - **生效条件：** 车端开启且驾驶端声明能力才生效；驾驶端和车端同提交更新，云端不需要为此更新。Windows 原生 mock
+    客户端不参与协商，保持原有行为。
+  - **回退：** 车端 YAML 设 `transient_hold.enabled: false` 且 `control_timeout_ms: 800`（并去掉
+    `bridge_apply_timeout_ms` 或设为不大于 800），重启车端服务即可，不需要重新发包。
+  - **验收：** 导出车端 `vehicle-runtime.log`，运行
+    `python3 scripts/test/transient_hold_analyze.py <日志文件...>` 汇总保持/恢复/升级次数和时长分布。
+  - **中转链路的可选调优（现场实测后再采用，代码默认不变）：** 中转走云端 WSS（TCP），丢包后的重传退避会把
+    短暂丢包放大成数百毫秒的投递间隔。可在云端和驾驶端主机上评估缩短 TCP 最小重传超时（例如
+    `ip route change ... rto_min 50ms`）或调整拥塞控制；任何内核层改动都必须在真实中转链路上用保持/升级统计验证收益，
+    且不得作为放宽 `control_timeout_ms` 的理由。
 
 升级与回滚时还要遵守：
 

@@ -11,7 +11,7 @@
 namespace mine_teleop {
 
 enum class VideoCodec { H264, H265 };
-enum class EncoderBackend { Nvenc, Vaapi };
+enum class EncoderBackend { Nvenc, Vaapi, Cpu };
 
 std::string to_string(VideoCodec codec);
 std::string to_string(EncoderBackend backend);
@@ -27,6 +27,8 @@ struct VideoEncoderSettings {
   int bitrate_kbps{3000};
   int keyframe_interval_frames{30};
 };
+
+[[nodiscard]] int realtime_keyframe_interval_frames(int fps, int stale_brake_ms);
 
 [[nodiscard]] std::string build_nvenc_pipeline_stage(
     std::string_view factory_name,

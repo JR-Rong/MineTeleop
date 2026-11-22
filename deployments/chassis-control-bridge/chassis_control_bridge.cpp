@@ -1,5 +1,6 @@
 #include "global_variables.h"
 #include "mine_teleop/vcu.hpp"
+#include "mine_teleop/detail/traction_diagnostics.hpp"
 #include "mine_teleop_chassis_bridge.h"
 
 #include <algorithm>
@@ -40,6 +41,10 @@
 // needed for GetControlInfo(). Keep one type definition set and declare the
 // function here.
 bool Initialize(const VehicleParam& vehicle, const std::string& can_channel);
+
+#ifndef MINE_TELEOP_CHASSIS_SOURCE_SHA256
+#define MINE_TELEOP_CHASSIS_SOURCE_SHA256 "unavailable"
+#endif
 
 namespace {
 
@@ -102,6 +107,28 @@ struct ControlIntent {
   double normalized_longitudinal{0.0};
   std::array<double, mine_teleop::vcu::kSteeringAxisCount> steering{};
   std::uint64_t generation{0};
+};
+
+constexpr std::array<const char*, 15> kTractionGateReasons{
+    "no_traction_intent", "speed_control_disabled", "profile_not_active",
+    "physical_emergency", "hard_overspeed", "control_watchdog", "software_estop",
+    "parking_not_released_or_idle", "non_driving_gear", "vcu_not_ready",
+    "speed_feedback_stale", "gear_feedback_stale_or_mismatch", "zero_target_speed",
+    "initial_ready_not_latched", "chassis_control_fault"};
+
+struct TractionEvaluation {
+  ControlIntent intent;
+  RuntimeControlSettings profile;
+  std::uint32_t gate_mask{0};
+  bool evaluated{false};
+  bool pid_active{false};
+  bool automatic_parking{false};
+  bool idle_park{false};
+  bool parking_released{false};
+  bool critical_feedback_fresh{false};
+  double pid_output{0.0};
+  double dt_seconds{0.0};
+  std::array<double, mine_teleop::vcu::kMotorCount> generated_torque_nm{};
 };
 
 struct StopContext {
@@ -592,6 +619,18 @@ class ProtocolLogger {
             << static_cast<int>(kFeedbackTimeoutSeconds * 1000.0)
             << ",\"log_max_bytes\":" << max_bytes_
             << ",\"log_rotations\":" << rotations_;
+    details << ",\"diagnostics_revision\":\"traction-diagnostics-v1\""
+            << ",\"chassis_source_sha256\":\"" << MINE_TELEOP_CHASSIS_SOURCE_SHA256 << "\""
+            << ",\"traction_observation_delay_ms\":"
+            << mine_teleop::diagnostics::kTractionObservationDelayMs
+            << ",\"diagnostic_minimum_interval_ms\":"
+            << mine_teleop::diagnostics::kDiagnosticMinimumIntervalMs
+            << ",\"diagnostic_repeat_interval_ms\":"
+            << mine_teleop::diagnostics::kDiagnosticRepeatIntervalMs;
+    details << ",\"minimum_observed_tx_torque_nm\":"
+            << mine_teleop::diagnostics::kMinimumObservedTorqueNm
+            << ",\"near_zero_feedback_torque_nm\":"
+            << mine_teleop::diagnostics::kNearZeroFeedbackTorqueNm;
     event("session_start", details.str(), true);
     std::cerr << "{\"ts\":\"" << utc_timestamp()
               << "\",\"event\":\"vehicle_vcu_log_ready\""
@@ -697,7 +736,7 @@ class ProtocolLogger {
     write(line.str(), false);
   }
 
-  void feedback(
+  std::string feedback_fields(
       const mine_teleop::vcu::Feedback& feedback,
       mine_teleop::vcu::State state) {
     std::ostringstream details;
@@ -734,6 +773,16 @@ class ProtocolLogger {
     append_double_array(details, feedback.motor_torque_nm);
     details << ",\"motor_torque_valid\":";
     append_array(details, feedback.motor_torque_valid);
+    details << ",\"motor_speed_rpm\":";
+    append_double_array(details, feedback.motor_speed_rpm);
+    details << ",\"motor_speed_valid\":";
+    append_array(details, feedback.motor_speed_valid);
+    details << ",\"motor_current_a\":";
+    append_double_array(details, feedback.motor_current_a);
+    details << ",\"motor_inverter_status\":";
+    append_array(details, feedback.motor_inverter_status);
+    details << ",\"motor_fault_level\":";
+    append_array(details, feedback.motor_fault_level);
     details << ",\"steering_mode\":";
     append_array(details, feedback.steering_mode);
     details << ",\"steering_angle_deg\":";
@@ -746,7 +795,17 @@ class ProtocolLogger {
     append_double_array(details, feedback.brake_pressure_bar);
     details << ",\"brake_valid\":";
     append_array(details, feedback.brake_valid);
-    event("feedback_snapshot", details.str(), false);
+    details << ",\"brake_fault_level\":";
+    append_array(details, feedback.brake_fault_level);
+    details << ",\"brake_fault_code\":";
+    append_array(details, feedback.brake_fault_code);
+    return details.str();
+  }
+
+  void feedback(
+      const mine_teleop::vcu::Feedback& feedback,
+      mine_teleop::vcu::State state) {
+    event("feedback_snapshot", feedback_fields(feedback, state), false);
   }
 
   [[nodiscard]] const std::filesystem::path& path() const { return path_; }
@@ -1088,6 +1147,7 @@ class BridgeRuntime {
             "\",\"operator_action\":\"No action is required.\"",
         true);
     running_.store(true);
+    close_result_ = -EINPROGRESS;
     io_thread_ = std::thread(&BridgeRuntime::io_loop, this);
     return 0;
   }
@@ -1696,11 +1756,16 @@ class BridgeRuntime {
     std::lock_guard<std::mutex> lock(mutex_);
     MineTeleopChassisHandshakeStatus status{};
     const auto state = controller_.state();
+    const bool final_safe_batch_pending =
+        state == mine_teleop::vcu::State::Disarmed && !disarmed_transmitted_;
     const auto& feedback = controller_.feedback();
-    status.state = handshake_state_code(state);
+    // The protocol state alone does not confirm that its final safe commands
+    // reached the transport. Keep the operator-facing exit pending until then.
+    status.state = handshake_state_code(final_safe_batch_pending
+        ? mine_teleop::vcu::State::DisarmManual : state);
     status.requested = controller_.handshake_requested() ? 1 : 0;
     status.ready = controller_.ready() ? 1 : 0;
-    status.disarming = is_disarming(state) ? 1 : 0;
+    status.disarming = (is_disarming(state) || final_safe_batch_pending) ? 1 : 0;
     status.parking_ready =
         (parking_gate_fresh_locked(Clock::now()) && controller_.parking_ready())
         ? 1
@@ -1843,12 +1908,24 @@ class BridgeRuntime {
             ",\"io_error\":" + std::to_string(io_error_));
   }
 
-  void close() {
+  int close() {
     if (!running_.load()) {
       if (io_thread_.joinable()) io_thread_.join();
+      if (close_result_ == -EINPROGRESS) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        close_result_ = io_error_ != 0 ? io_error_ : -EIO;
+        logger_.issue(
+            "disarm_failed",
+            "vcu_disarm_incomplete",
+            "vcu_close",
+            "VCU I/O stopped before safe exit could be confirmed",
+            "Exit is incomplete; keep the vehicle isolated and use the independent hardware safety path.",
+            "safe_exit_unconfirmed",
+            "\"result\":" + std::to_string(close_result_));
+      }
       socket_.close();
       logger_.close();
-      return;
+      return close_result_;
     }
 
     {
@@ -1858,6 +1935,7 @@ class BridgeRuntime {
           MINE_TELEOP_CHASSIS_STOP_REASON_SESSION_LOST);
       latch_stop_provenance_locked(stop_context.source, stop_context.reason);
       controller_.request_disarm();
+      disarmed_transmitted_ = false;
       software_estop_ = true;
       logger_.event(
           "disarm_requested",
@@ -1873,10 +1951,15 @@ class BridgeRuntime {
     bool disarmed = false;
     {
       std::unique_lock<std::mutex> lock(mutex_);
-      disarmed = condition_.wait_for(
+      condition_.wait_for(
           lock,
           std::chrono::duration<double>(kDisarmTimeoutSeconds),
-          [&] { return controller_.disarmed() || !running_.load(); });
+          [&] {
+            return (controller_.disarmed() && disarmed_transmitted_) ||
+                !running_.load();
+          });
+      disarmed = controller_.disarmed() && disarmed_transmitted_;
+      close_result_ = disarmed ? 0 : (io_error_ != 0 ? io_error_ : -ETIMEDOUT);
     }
     if (!disarmed) {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -1885,10 +1968,11 @@ class BridgeRuntime {
           "vcu_disarm_timeout",
           "vcu_close",
           "VCU did not complete the reverse handshake within the timeout",
-          "Keep the vehicle isolated; inspect feedback/state and use the independent hardware safety path.",
-          "local_full_stop",
+          "Exit is incomplete; keep the vehicle isolated, inspect feedback/state, and use the independent hardware safety path.",
+          "safe_exit_unconfirmed",
           "\"timeout_ms\":" +
               std::to_string(static_cast<int>(kDisarmTimeoutSeconds * 1000.0)) +
+              ",\"result\":" + std::to_string(close_result_) +
               ",\"state\":\"" +
               std::string(mine_teleop::vcu::state_name(controller_.state())) + "\"");
       logger_.feedback(controller_.feedback(), controller_.state());
@@ -1907,6 +1991,7 @@ class BridgeRuntime {
     if (io_thread_.joinable()) io_thread_.join();
     socket_.close();
     logger_.close();
+    return close_result_;
   }
 
  private:
@@ -2088,13 +2173,20 @@ class BridgeRuntime {
     reset_direct_traction_locked();
   }
 
-  void ingest_locked(const CanFrame& frame) {
+  void ingest_locked(const CanFrame& frame, bool from_socket = false) {
     if (!controller_.ingest(frame)) {
       ++ignored_rx_count_;
       last_ignored_rx_id_ = frame.id;
       return;
     }
     const auto& feedback = controller_.feedback();
+    for (std::size_t index = 0; index < mine_teleop::vcu::kMotorCount; ++index) {
+      if (frame.id != kCriticalFeedbackIds[5 + index]) continue;
+      // The compatibility feedback ABI synthesizes zero torque. Only real RX
+      // frames can support a claim that motor torque feedback stayed zero.
+      if (from_socket) socket_motor_feedback_mask_ |= 1U << index;
+      else socket_motor_feedback_mask_ &= ~(1U << index);
+    }
     if (controller_.physical_emergency_latched()) {
       latch_stop_provenance_locked(
           MINE_TELEOP_CHASSIS_STOP_SOURCE_PHYSICAL_EMERGENCY,
@@ -2219,7 +2311,12 @@ class BridgeRuntime {
   void update_command_from_intent_locked(
       Clock::time_point now,
       double dt_seconds) {
+    traction_evaluation_ = {};
+    traction_evaluation_.intent = latest_intent_valid_ ? latest_intent_ : ControlIntent{};
+    traction_evaluation_.profile = runtime_control_;
+    traction_evaluation_.dt_seconds = dt_seconds;
     if (chassis_control_fault_latched_) {
+      traction_evaluation_.gate_mask = 1U << 14U;
       const auto state = controller_.state();
       if (!is_disarming(state) &&
           state != mine_teleop::vcu::State::Disarmed) {
@@ -2339,11 +2436,13 @@ class BridgeRuntime {
         std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count(),
         runtime_control_.parking_idle_timeout_ms);
     const bool automatic_parking = automatic_parking_enabled_locked();
+    const bool critical_feedback_fresh = feedback_fresh_locked(now);
     controller_.set_automatic_parking(automatic_parking, idle_park,
-        speed_fresh && feedback_fresh_locked(now) && measured_speed_magnitude_mps <= 0.1,
+        speed_fresh && critical_feedback_fresh && measured_speed_magnitude_mps <= 0.1,
         automatic_parking_pressure_bar_locked());
+    const bool parking_released = controller_.parking_released();
     const bool parking_allows_traction = !automatic_parking ||
-        (!idle_park && feedback_fresh_locked(now) && controller_.parking_released());
+        (!idle_park && critical_feedback_fresh && parking_released);
 
     const bool traction_pid_active =
         speed_control_.enabled && runtime_control_.active &&
@@ -2351,6 +2450,22 @@ class BridgeRuntime {
         !control_watchdog_latched_ && !software_estop_ &&
         parking_allows_traction && traction_requested && driving_gear && controller_.ready() &&
         speed_fresh && actual_gear_matches && intent.target_speed_mps > 0.0;
+    const std::array<bool, kTractionGateReasons.size()> gates{
+        traction_requested, speed_control_.enabled, runtime_control_.active,
+        !physical_emergency_latched, !hard_overspeed_latched_, !control_watchdog_latched_,
+        !software_estop_, parking_allows_traction, driving_gear, controller_.ready(),
+        speed_fresh, actual_gear_matches, intent.target_speed_mps > 0.0,
+        runtime_control_.parking_idle_timeout_ms < 0 || session_ready_latched_,
+        !chassis_control_fault_latched_};
+    traction_evaluation_.evaluated = true;
+    traction_evaluation_.pid_active = traction_pid_active;
+    traction_evaluation_.automatic_parking = automatic_parking;
+    traction_evaluation_.idle_park = idle_park;
+    traction_evaluation_.parking_released = parking_released;
+    traction_evaluation_.critical_feedback_fresh = critical_feedback_fresh;
+    for (std::size_t index = 0; index < gates.size(); ++index) {
+      if (!gates[index]) traction_evaluation_.gate_mask |= 1U << index;
+    }
     double normalized_output = 0.0;
     if (brake_requested && !physical_emergency_latched &&
         !hard_overspeed_latched_) {
@@ -2419,6 +2534,7 @@ class BridgeRuntime {
     }
 
     const bool direct_pressure_brake = physical_brake_input_ && brake_requested;
+    traction_evaluation_.pid_output = normalized_output;
     const double chassis_control_longitudinal =
         !direct_pressure_brake && brake_requested ? normalized_output : 0.0;
     const double measured_speed =
@@ -2473,6 +2589,7 @@ class BridgeRuntime {
       return;
     }
     const auto command_state = controller_.state();
+    traction_evaluation_.generated_torque_nm = command.motor_torque_nm;
     const bool accepts_intent =
         command_state != mine_teleop::vcu::State::DisarmTorque &&
         command_state != mine_teleop::vcu::State::DisarmStop &&
@@ -2505,6 +2622,108 @@ class BridgeRuntime {
       logger_.command("driver", command);
       last_logged_intent_generation_ = intent.generation;
     }
+  }
+
+  void log_traction_diagnostics_locked(
+      const std::vector<CanFrame>& frames,
+      mine_teleop::vcu::State transmit_state,
+      bool send_ok,
+      std::uint64_t cycle,
+      Clock::time_point now) {
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()).count();
+    const auto sent = mine_teleop::diagnostics::decode_sent_actuation(frames);
+    const auto& feedback = controller_.feedback();
+    std::uint32_t fresh_motor_mask = 0;
+    std::array<long long, mine_teleop::vcu::kMotorCount> motor_feedback_age_ms{};
+    for (std::size_t index = 0; index < motor_feedback_age_ms.size(); ++index) {
+      const auto found = last_seen_.find(kCriticalFeedbackIds[5 + index]);
+      motor_feedback_age_ms[index] = found == last_seen_.end() ? -1 :
+          std::chrono::duration_cast<std::chrono::milliseconds>(now - found->second).count();
+      if ((socket_motor_feedback_mask_ & (1U << index)) != 0 &&
+          feedback_id_fresh_locked(kCriticalFeedbackIds[5 + index], now)) {
+        fresh_motor_mask |= 1U << index;
+      }
+    }
+    const auto observation = torque_response_monitor_.observe(
+        now_ms, sent, send_ok, transmit_state == mine_teleop::vcu::State::Ready,
+        feedback, fresh_motor_mask);
+    const auto gate_key = static_cast<std::uint64_t>(traction_evaluation_.gate_mask) |
+        (static_cast<std::uint64_t>(transmit_state) << 32U) |
+        (static_cast<std::uint64_t>(send_ok) << 40U);
+    const bool gate_due = traction_gate_log_limiter_.due(gate_key, now_ms);
+    const bool response_due =
+        (observation.qualifying_motor_mask != 0 || last_reported_zero_feedback_mask_ != 0) &&
+        traction_response_log_limiter_.due(observation.qualifying_motor_mask, now_ms);
+    if (!gate_due && !response_due) return;
+
+    const char* end_reason = "comparison_no_longer_qualified";
+    if (!send_ok) end_reason = "can_send_failed";
+    else if (transmit_state != mine_teleop::vcu::State::Ready) end_reason = "vcu_left_ready";
+    else if ((fresh_motor_mask & last_reported_zero_feedback_mask_) != last_reported_zero_feedback_mask_) {
+      end_reason = "feedback_unavailable_or_not_socket_rx";
+    }
+    std::ostringstream details;
+    details << "\"diagnostic_only\":true,\"cycle\":" << cycle
+            << ",\"intent_generation\":" << traction_evaluation_.intent.generation
+            << ",\"profile_revision\":" << traction_evaluation_.profile.revision
+            << ",\"profile_active\":" << (traction_evaluation_.profile.active ? "true" : "false")
+            << ",\"intent_gear\":" << traction_evaluation_.intent.gear
+            << ",\"target_speed_mps\":" << traction_evaluation_.intent.target_speed_mps
+            << ",\"normalized_longitudinal\":" << traction_evaluation_.intent.normalized_longitudinal
+            << ",\"pid_evaluated\":" << (traction_evaluation_.evaluated ? "true" : "false")
+            << ",\"traction_pid_active\":" << (traction_evaluation_.pid_active ? "true" : "false")
+            << ",\"pid_output\":" << traction_evaluation_.pid_output
+            << ",\"control_dt_ms\":" << traction_evaluation_.dt_seconds * 1000.0
+            << ",\"max_motor_torque_nm\":" << traction_evaluation_.profile.max_motor_torque_nm
+            << ",\"automatic_parking\":" << (traction_evaluation_.automatic_parking ? "true" : "false")
+            << ",\"idle_park\":" << (traction_evaluation_.idle_park ? "true" : "false")
+            << ",\"parking_released\":" << (traction_evaluation_.parking_released ? "true" : "false")
+            << ",\"critical_feedback_fresh\":" << (traction_evaluation_.critical_feedback_fresh ? "true" : "false")
+            << ",\"gate_sample\":\"before_controller_tick\""
+            << ",\"transmit_state\":\"" << mine_teleop::vcu::state_name(transmit_state) << "\""
+            << ",\"send_ok\":" << (send_ok ? "true" : "false")
+            << ",\"blocking_conditions\":[";
+    bool first = true;
+    for (std::size_t index = 0; index < kTractionGateReasons.size(); ++index) {
+      if ((traction_evaluation_.gate_mask & (1U << index)) == 0) continue;
+      if (!first) details << ',';
+      first = false;
+      details << '"' << kTractionGateReasons[index] << '"';
+    }
+    details << "],\"observation\":\""
+            << (observation.qualifying_motor_mask != 0 ? "nonzero_tx_zero_torque_feedback" :
+                response_due && last_reported_zero_feedback_mask_ != 0 ? "observation_ended" : "none")
+            << "\",\"zero_feedback_motor_mask\":" << observation.qualifying_motor_mask
+            << ",\"previous_reported_zero_feedback_motor_mask\":" << last_reported_zero_feedback_mask_
+            << ",\"observation_end_reason\":\""
+            << (response_due && observation.qualifying_motor_mask == 0 ? end_reason : "") << "\""
+            << ",\"observed_duration_ms\":" << observation.longest_duration_ms
+            << ",\"motor_feedback_age_ms\":";
+    append_array(details, motor_feedback_age_ms);
+    details << ",\"fresh_motor_mask\":" << fresh_motor_mask
+            << ",\"socket_motor_feedback_mask\":" << socket_motor_feedback_mask_
+            << ",\"tx_motor_mask\":" << sent.motor_mask
+            << ",\"generated_motor_torque_nm\":";
+    append_double_array(details, traction_evaluation_.generated_torque_nm);
+    details << ",\"tx_motor_torque_nm\":";
+    append_double_array(details, sent.torque_nm);
+    details << ",\"tx_motor_command\":";
+    append_array(details, sent.motor_command);
+    details << ",\"tx_motor_mode\":";
+    append_array(details, sent.motor_mode);
+    details << ",\"tx_brake_frames_present\":" << (sent.brake_frames_present ? "true" : "false")
+            << ",\"tx_brake_pressure_bar\":";
+    append_double_array(details, sent.brake_pressure_bar);
+    details << ",\"tx_parking_frame_present\":" << (sent.parking_frame_present ? "true" : "false")
+            << ",\"tx_parking_request\":";
+    append_array(details, sent.parking_request);
+    // Feedback belongs to the preceding RX drain, not an acknowledgement of this TX batch.
+    details << ",\"feedback_sample\":\"latest_rx_not_tx_ack\","
+            << stale_feedback_ages_locked(now)
+            << ",\"feedback\":{" << logger_.feedback_fields(feedback, transmit_state) << '}';
+    logger_.event("traction_diagnostics", details.str(), false);
+    if (response_due) last_reported_zero_feedback_mask_ = observation.qualifying_motor_mask;
   }
 
   bool parking_gate_fresh_locked(Clock::time_point now) const {
@@ -2828,7 +3047,7 @@ class BridgeRuntime {
         }
         if (receive_result == 1) {
           std::lock_guard<std::mutex> lock(mutex_);
-          ingest_locked(frame);
+          ingest_locked(frame, true);
         } else if (receive_result == 2) {
           std::lock_guard<std::mutex> lock(mutex_);
           ++special_rx_count_;
@@ -2980,7 +3199,6 @@ class BridgeRuntime {
           next_feedback_log = Clock::now() + std::chrono::milliseconds(500);
         }
         update_feedback_locked();
-        condition_.notify_all();
       }
 
       std::vector<std::uint32_t> failed_send_ids;
@@ -2992,6 +3210,18 @@ class BridgeRuntime {
           transmit_state,
           ++transmit_cycle,
           failed_send_ids);
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // close() must not report completion before the final safe batch has
+        // actually reached the CAN socket. Failed sends keep the wait active.
+        disarmed_transmitted_ = failed_send_ids.empty() &&
+            (transmit_state == mine_teleop::vcu::State::Standby ||
+             transmit_state == mine_teleop::vcu::State::Disarmed) &&
+            controller_.disarmed();
+        log_traction_diagnostics_locked(
+            frames, transmit_state, failed_send_ids.empty(), transmit_cycle, Clock::now());
+        condition_.notify_all();
+      }
       if (failed_send_ids.empty()) {
         consecutive_send_failures = 0;
       } else if (++consecutive_send_failures == 3) {
@@ -3061,7 +3291,15 @@ class BridgeRuntime {
   mutable std::mutex mutex_;
   std::condition_variable condition_;
   SocketCan socket_;
+  bool disarmed_transmitted_{false};
+  int close_result_{0};
   ProtocolLogger logger_;
+  TractionEvaluation traction_evaluation_;
+  mine_teleop::diagnostics::TorqueResponseMonitor torque_response_monitor_;
+  mine_teleop::diagnostics::StateLogLimiter traction_gate_log_limiter_;
+  mine_teleop::diagnostics::StateLogLimiter traction_response_log_limiter_;
+  std::uint32_t last_reported_zero_feedback_mask_{0};
+  std::uint32_t socket_motor_feedback_mask_{0};
   ParallelController controller_;
   std::atomic<bool> running_{false};
   std::thread io_thread_;
@@ -3849,8 +4087,7 @@ extern "C" int mine_teleop_chassis_close() {
       std::lock_guard<std::mutex> lock(g_api_mutex);
       runtime = std::move(g_runtime);
     }
-    if (runtime) runtime->close();
-    return 0;
+    return runtime ? runtime->close() : 0;
   } catch (...) {
     return -5;
   }

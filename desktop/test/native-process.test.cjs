@@ -67,7 +67,9 @@ for(const mode of ['shutdown','owner-eof',...(process.platform==='win32'?[]:['si
         body:body===undefined?undefined:JSON.stringify(body)});
       return {status:response.status,body:await response.json()};
     };
-    assert.equal((await request(cloudUrl+'/vehicles/online',{vehicle_id:'fixture-vehicle',device_token:'fixture-secret',connection_id:'fixture'})).status,200);
+    // This fixture represents a current V9 vehicle. Unknown/legacy peers are
+    // covered by the native capability-admission regressions.
+    assert.equal((await request(cloudUrl+'/vehicles/online',{vehicle_id:'fixture-vehicle',device_token:'fixture-secret',connection_id:'fixture',native_control_capabilities:'v9-revision-recovery-v1'})).status,200);
     const approver=await request(cloudUrl+'/mobile/api/login',{password:'fixture-approver'});
     assert.equal(approver.status,200);
     const nativeRoot=path.join(fixture,'controller');

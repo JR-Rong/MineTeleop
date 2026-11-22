@@ -27,7 +27,7 @@ body .vehicle-state .can-summary-item span{font-size:10px}
 body .vehicle-state .can-summary-item strong{font-size:11px;white-space:normal;overflow-wrap:anywhere}
 body .visual-stage{grid-template-rows:auto auto minmax(0,1fr) auto}
 body .visual-stage>.camera-toolbar{grid-row:1}
-body .visual-stage>#estop-status{grid-row:2}
+body .visual-stage>#estop-status,body .visual-stage>#control-recovery-status{grid-row:2}
 body .visual-stage>#cameras{grid-row:3;grid-template-rows:repeat(var(--camera-rows,3),minmax(0,1fr))}
 body .visual-stage>#status{grid-row:4}
 body .camera-toolbar{display:flex;align-items:center;gap:8px;min-height:39px;font-size:12px}

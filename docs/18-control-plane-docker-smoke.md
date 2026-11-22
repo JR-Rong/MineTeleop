@@ -7,6 +7,11 @@ WebRTC/DataChannel 或现场车辆验收。它构建 Ubuntu 22.04 原生 C++ 镜
 - 本地驾驶页面服务器；
 - 一次性 `control-smoke` 客户端。
 
+smoke 使用镜像默认 CMD，控制端仅监听容器内 `127.0.0.1`，不发布控制端口。
+需要宿主机浏览器访问时，`scripts/deploy/run_control_plane_docker.sh` 仅支持 Linux
+host network，两项服务都绑定宿主机 loopback，端口环境变量同时用于监听和健康检查。
+macOS/Windows 请使用原生桌面客户端；Docker Desktop 仍可运行隔离 smoke。
+
 smoke 验证以下边界：
 
 1. 车辆凭据可注册在线连接并取得 generation。

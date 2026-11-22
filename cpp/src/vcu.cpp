@@ -419,11 +419,7 @@ bool ParallelController::request_parallel_handshake() {
 void ParallelController::request_disarm() {
   if (state_ == State::Standby || state_ == State::Disarmed) return;
   emergency_stop_ = true;
-  if (state_ == State::Initial) {
-    enter(State::Disarmed);
-    return;
-  }
-  if (state_ == State::WaitParallelHandshake) {
+  if (state_ == State::Initial || state_ == State::WaitParallelHandshake) {
     enter(State::DisarmManual);
     return;
   }
@@ -537,6 +533,8 @@ bool ParallelController::ingest(const CanFrame& frame) {
         decode_physical(extract_signal(frame, 16, kMotorTorqueBits),
                         kMotorTorqueResolutionNm, kMotorTorqueMinimumNm);
     feedback_.motor_torque_valid[motor_status01_index] = true;
+    feedback_.motor_current_a[motor_status01_index] =
+        decode_physical(extract_signal(frame, 32, 16), 0.05, -1600.0);
     return true;
   }
 
@@ -546,6 +544,10 @@ bool ParallelController::ingest(const CanFrame& frame) {
     feedback_.motor_mode[motor_status02_index] =
         static_cast<int>(extract_signal(frame, 4, 4));
     feedback_.motor_mode_valid[motor_status02_index] = true;
+    feedback_.motor_inverter_status[motor_status02_index] =
+        static_cast<int>(extract_signal(frame, 0, 4));
+    feedback_.motor_fault_level[motor_status02_index] =
+        static_cast<int>(extract_signal(frame, 8, 2));
     return true;
   }
 
@@ -571,6 +573,10 @@ bool ParallelController::ingest(const CanFrame& frame) {
       feedback_.brake_pressure_bar[brake_index] =
           decode_physical(extract_signal(frame, base + 4U, 12), 0.1, 0.0);
       feedback_.brake_valid[brake_index] = true;
+      feedback_.brake_fault_level[brake_index] =
+          static_cast<int>(extract_signal(frame, base + 16U, 2));
+      feedback_.brake_fault_code[brake_index] =
+          static_cast<int>(extract_signal(frame, base + 18U, 14));
     }
     return true;
   }
@@ -585,11 +591,10 @@ void ParallelController::enter(State state) {
 bool ParallelController::begin_arming_emergency_disarm() {
   switch (state_) {
     case State::Initial:
-      enter(State::Disarmed);
-      return true;
     case State::WaitParallelHandshake:
       // The parking brake is still applied here. Withdraw ShakeReq and require
-      // a fresh manual-handshake confirmation before another arming attempt.
+      // fresh manual/N/zero-speed/parking feedback before declaring exit complete,
+      // including an exit during the initial low-handshake interval.
       enter(State::DisarmManual);
       return true;
     case State::WaitParkingBrakeReleased:
@@ -852,9 +857,10 @@ std::vector<CanFrame> ParallelController::tick() {
   } else if (state_ == State::DisarmParkingBrake) {
     gear = kNeutralGear;
     parking_brake.fill(kParkingBrakePark);
-  } else if (state_ == State::DisarmManual) {
+  } else if (state_ == State::DisarmManual || state_ == State::Disarmed) {
     gear = kNeutralGear;
     handshake_request = kNoRequest;
+    // Keep the confirmed parking request in the final batch sent before close.
     parking_brake.fill(kParkingBrakePark);
   }
 

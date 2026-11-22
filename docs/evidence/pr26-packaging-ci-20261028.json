@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "recorded_at_utc": "2026-10-28T09:25:38.693388+00:00",
+  "source_parent_commit": "a946808de2251446f5e3d00578a4c142a45586be",
+  "source_identity": "Working-tree changes committed with this report; hashes exclude the report itself.",
+  "source_sha256": {
+    "deployments/cpp/Dockerfile.build": "8b1c06fe75f9eacfe0720c6ed743a488b1bedcf6863b2b02deea4865b7fd5c66",
+    "deployments/cpp/Dockerfile.macos-from-scratch": "546909df860bb410fc86f3f1e4330e9b9ea8a0920572f9ca0af2611c4af9faa7",
+    "deployments/container/Dockerfile.control": "63507a4f2b1d3638cf910ff2a99e1c1299f8c412a9021374ce0297a8b16d9373",
+    "docs/native-receiver-bench.md": "5cf35fbc8ecea0968e31ef680cc5758082f776fe06a9b0bcd8c589b404208522"
+  },
+  "artifact_root": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/pr26-review-followup-20261028",
+  "artifact_sha256": {
+    "libnice-sdk-check-final.log": "6bb91616732803145a27670a6aa94027f4e58cc9391af2ebd56fd462fc98354d",
+    "libnice-bundle-fixture.log": "04e1f6b960dc1961d8c8ff9c8feee888f026a5eaf8fc247ec54db40b883f3327",
+    "followup-vehicle-build.log": "82e6a43c961c9b36e8aebaeac4e62f878f9551914decac0099a6f97ad30aba21",
+    "dockerfile-build-check.log": "3281d6d88e03e51085d82068a71a32e3d03d04ada8e99f117b4763ee33d16485",
+    "dockerfile-control-check.log": "0f5598518c19c36940259e7d1a0c9f9f570c6147f32a620daecfa168701a723d",
+    "mac-product-repeat.log": "93d204d98a25750b08d01b50d0eaa2bad9574c8c758d66d5afcd100f09dbfa4c",
+    "dockerfile-cross-lint.log": "2290fad3e16d35cbbe972ae5e6f8b9e6e9351179b8188ceb067602faa573eb01",
+    "dockerfile-cross-lint-skip.log": "5c3188c3097147051ae71609abb048f98ffe88ea939bc176edc90a556d207e63"
+  },
+  "vehicle_ci_failure": {
+    "head": "a946808de2251446f5e3d00578a4c142a45586be",
+    "job": "https://github.com/JR-Rong/MineTeleop/actions/runs/40651334973/job/122692480588",
+    "cause": "CMake required nice >= 0.1.18 but package had GStreamer NICE runtime plugin without libnice-dev/nice.pc.",
+    "earlier_commit_also_failed": "e1d8d05d6e9c8815aa3a10af7445a050c6d6802b",
+    "fix": "Add libnice-dev to all three vehicle-enabled build images; control-plane runtime explicitly installs libnice10 and gstreamer1.0-nice; validate program and GStreamer NICE plugin resolve the same bundled library in complete vehicle tests."
+  },
+  "local_validation": {
+    "linux": "Ubuntu 22.04 arm64 container with only loopback: libnice-dev 0.1.18, vehicle binary builds, binary and NICE plugin resolve a shared private libnice copy; binary version invocation succeeds.",
+    "dockerfile_buildkit_check": "vehicle and control-plane Dockerfiles passed syntax/build checks without full image build",
+    "mac_product_direct": "same product-direct integration test passed four consecutive local iterations",
+    "cross_build_complete": false,
+    "complete_amd64_vehicle_package_built": false,
+    "ci_retest_pending": true,
+    "dockerfile_cross_check": "Dockerfile with only syntax frontend directive removed was checked using installed BuildKit frontend. One pre-existing RedundantTargetPlatform warning; skipping that existing warning passes. No cross-image build was performed.",
+    "original_cross_check": "Pinned Dockerfile frontend download was interrupted after stalling; not counted as passed."
+  },
+  "mac_ci_failure": {
+    "job": "https://github.com/JR-Rong/MineTeleop/actions/runs/40651334973/job/122692480469",
+    "failure": "product-direct integration route qualification failed after control recovery rejected commands; first rejection degraded_neutral_required, later session_control_profile_required.",
+    "previous_head_same_suite_failed": true,
+    "previous_failure": "recovery did not withdraw DC within fixture observation window",
+    "interpretation": "Different symptoms, no confirmed root cause. Four local passes do not prove absence of a safety issue.",
+    "production_safety_threshold_changed": false,
+    "test_assertions_weakened": false
+  },
+  "wan_validation": "0/1800 seconds for each of four independent-uplink arms",
+  "orin_contacted": false,
+  "new_lan_tests": false
+}

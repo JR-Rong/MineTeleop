@@ -29,6 +29,167 @@ Json metadata(std::int64_t start) {
       {"session_id", "session-000001"}, {"driver_id", "driver"}, {"vehicle_id", "vehicle"},
       {"started_at_utc_ms", start}, {"ended_at_utc_ms", start + 1000}};
 }
+Json recording_summary(const Json& session) {
+  const auto finished = session.at("ended_at_utc_ms").get<std::int64_t>() + 6000;
+  Json lane = {{"schema_version", 1}, {"configured_enabled", true}, {"active", false}, {"state", "finalized"},
+      {"incomplete", false}, {"issue_code", ""}, {"next_action", ""}, {"recording_attempt_id", "attempt-current"},
+      {"status_revision", 4}, {"accepted_access_units", 50}, {"worker_input_access_units", 50},
+      {"finalized_segments", 1}, {"unfinished_segments", 0}, {"final_eos_received", true}, {"cleanup_pending", false}};
+  return {{"schema_version", 1}, {"kind", "recording_session_summary"}, {"upload_state", "not_applicable"},
+      {"vehicle_id", session.at("vehicle_id")}, {"session_id", session.at("session_id")},
+      {"recording_attempt_id", "attempt-current"}, {"configured_enabled", true}, {"state", "finalized"}, {"incomplete", false},
+      {"expected_cameras", Json::array({"front"})}, {"final_eos_received", true}, {"summary_revision", 4},
+      {"reported_at_utc_ms", finished}, {"completed_at_utc_ms", finished}, {"attempt_complete", true},
+      {"completeness_scope", "current_runtime_known_attempts"}, {"session_history_known", false},
+      {"cameras", Json::array({{{"camera_id", "front"}, {"recording", lane}}})}};
+}
+
+void recording_terminal_failure_after_session_end() {
+  Directory dir; const auto session = metadata(now_ms());
+  const auto directory = dir.path / "recordings" / "vehicle" / "session-000001";
+  fs::create_directories(directory);
+  auto summary = recording_summary(session);
+  summary["state"] = "recording"; summary["attempt_complete"] = false;
+  summary["final_eos_received"] = false; summary["completed_at_utc_ms"] = nullptr;
+  summary["reported_at_utc_ms"] = session.at("ended_at_utc_ms").get<std::int64_t>() - 500;
+  auto& lane = summary["cameras"][0]["recording"];
+  lane["state"] = "recording"; lane["active"] = true; lane["final_eos_received"] = false;
+  lane["unfinished_segments"] = 1;
+  write(directory / "recording-session.status", summary.dump());
+  const auto started = Json{{"event", "vehicle_recording_attempt_started"}, {"vehicle_id", "vehicle"},
+      {"session_id", "session-000001"}, {"recording_attempt_id", "attempt-current"},
+      {"reported_at_utc_ms", session.at("started_at_utc_ms")}};
+  const auto finished_at = session.at("ended_at_utc_ms").get<std::int64_t>() + 8600;
+  const auto finished = Json{{"event", "vehicle_recording_attempt_finished"}, {"vehicle_id", "vehicle"},
+      {"session_id", "session-000001"}, {"recording_attempt_id", "attempt-current"},
+      {"event_at_utc_ms", finished_at}, {"reported_at_utc_ms", finished_at}, {"incomplete", true}};
+  auto other = finished; other["session_id"] = "session-000002";
+  auto other_vehicle = finished; other_vehicle["vehicle_id"] = "other-vehicle";
+  auto reused_session = finished; reused_session["recording_attempt_id"] = "later-unrelated-attempt";
+  reused_session["driver_id"] = "other-driver-must-not-export";
+  reused_session["reported_at_utc_ms"] = finished_at + 1000;
+  reused_session["event_at_utc_ms"] = finished_at + 1000;
+  auto reused_start = started; reused_start["recording_attempt_id"] = "later-unrelated-attempt";
+  reused_start["reported_at_utc_ms"] = session.at("ended_at_utc_ms").get<std::int64_t>() + 1000;
+  const auto snapshot = dir.path / "snapshot/runtime.log";
+  // Rotation scan order need not place the attempt-start before completion.
+  write(dir.path / "runtime.log", finished.dump() + "\n" + reused_session.dump() + "\n" +
+      other.dump() + "\n" + other_vehicle.dump() + "\n" + reused_start.dump() + "\n" + started.dump() + "\n");
+  collect_session_logs({{dir.path / "runtime.log", "runtime.log"}}, session, dir.path / "snapshot");
+  const auto exported = read(snapshot);
+  check(exported.find("vehicle_recording_attempt_finished") != std::string::npos,
+        "bounded recorder completion after the ordinary UTC tail was dropped");
+  check(exported.find("other-vehicle") == std::string::npos && exported.find("session-000002") == std::string::npos,
+        "late recorder completion crossed its vehicle/session boundary");
+  check(exported.find("other-driver-must-not-export") == std::string::npos,
+        "late completion from a reused session ID crossed the current attempt boundary");
+  const auto evidence = collect_session_recording_evidence(dir.path / "recordings", session, {}, snapshot, true);
+  check(evidence.at("evidence_status") == "incomplete" && evidence.at("complete") == false &&
+        evidence.at("attempt_complete") == false,
+        "terminal runtime failure was hidden by an older persisted recording snapshot");
+  check(evidence.at("attempt_fence").at("kind") == "finished" &&
+        evidence.at("attempt_fence").at("reported_at_utc_ms") == finished_at,
+        "completion failure did not retain its actual terminal observation time");
+  // The packaged launcher timestamps stdout when it relays it. Its delay
+  // cannot move a real attempt out of this session or a later attempt into it.
+  auto delayed_start = started;
+  delayed_start["logged_at_utc_ms"] = session.at("ended_at_utc_ms").get<std::int64_t>() + 3000;
+  delayed_start["relay_marker"] = "delayed-start-remains-outside-ordinary-log-window";
+  auto misleading_relay = reused_start;
+  misleading_relay["logged_at_utc_ms"] = session.at("started_at_utc_ms");
+  auto missing_producer_start = started;
+  missing_producer_start["recording_attempt_id"] = "missing-producer-time";
+  missing_producer_start.erase("reported_at_utc_ms");
+  missing_producer_start["logged_at_utc_ms"] = session.at("started_at_utc_ms");
+  auto missing_producer_finished = finished;
+  missing_producer_finished["recording_attempt_id"] = "missing-producer-time";
+  missing_producer_finished["driver_id"] = "missing-producer-must-not-export";
+  write(dir.path / "runtime.log", finished.dump() + "\n" + reused_session.dump() + "\n" +
+      misleading_relay.dump() + "\n" + missing_producer_finished.dump() + "\n" +
+      missing_producer_start.dump() + "\n" + delayed_start.dump() + "\n");
+  const auto delayed_snapshot = dir.path / "delayed/runtime.log";
+  collect_session_logs({{dir.path / "runtime.log", "runtime.log"}}, session, dir.path / "delayed");
+  const auto delayed_export = read(delayed_snapshot);
+  check(delayed_export.find("\"recording_attempt_id\":\"attempt-current\"") != std::string::npos,
+        "launcher relay delay hid a valid producer-time attempt anchor");
+  check(delayed_export.find("other-driver-must-not-export") == std::string::npos &&
+        delayed_export.find("missing-producer-must-not-export") == std::string::npos,
+        "launcher timestamps authorized a late completion without an in-session producer-time anchor");
+  check(delayed_export.find("delayed-start-remains-outside-ordinary-log-window") == std::string::npos,
+        "producer-time anchoring widened the ordinary log UTC window");
+  check(collect_session_recording_evidence(dir.path / "recordings", session, {}, delayed_snapshot, true)
+            .at("evidence_status") == "incomplete", "relay delay hid actual terminal failure evidence");
+  // Even a positive disk snapshot cannot erase explicit terminal negative
+  // evidence for that same attempt, including equal/coarse wall timestamps.
+  auto conflicting = recording_summary(session);
+  conflicting["reported_at_utc_ms"] = finished_at;
+  write(directory / "recording-session.status", conflicting.dump());
+  check(collect_session_recording_evidence(dir.path / "recordings", session, {}, snapshot, true)
+            .at("attempt_complete") == false, "terminal failure did not veto otherwise complete disk evidence");
+  write(directory / "recording-session.status", summary.dump());
+  // Logs are only negative evidence. A success event cannot upgrade stale disk state.
+  auto success = finished; success["incomplete"] = false;
+  write(snapshot, started.dump() + "\n" + success.dump() + "\n");
+  check(collect_session_recording_evidence(dir.path / "recordings", session, {}, snapshot, true)
+            .at("evidence_status") == "unknown", "success log fabricated persisted EOS proof");
+}
+
+void recording_evidence_scope_and_completion() {
+  Directory dir; const auto session = metadata(now_ms());
+  const auto directory = dir.path / "recordings" / "vehicle" / "session-000001";
+  fs::create_directories(directory);
+  const auto status_path = directory / "recording-session.status";
+  const auto started = Json{{"event", "vehicle_recording_attempt_started"}, {"vehicle_id", "vehicle"},
+      {"session_id", "session-000001"}, {"recording_attempt_id", "attempt-current"},
+      {"reported_at_utc_ms", session.at("started_at_utc_ms")}, {"configured_enabled", true}, {"summary_persisted", false}};
+  const auto tail = Json{{"event", "session-ended"}, {"vehicle_id", "vehicle"}, {"session_id", "session-000001"},
+      {"logged_at_utc_ms", session.at("ended_at_utc_ms")}};
+  write(dir.path / "runtime.log", started.dump() + "\n" + tail.dump() + "\n");
+  const auto logs = collect_session_logs({{dir.path / "runtime.log", "runtime.log"}}, session, dir.path / "snapshot");
+  check(logs.at("status") == "available", "recording attempt timestamp was not accepted by the production collector");
+  const auto snapshot = dir.path / "snapshot/runtime.log";
+  const auto read_evidence = [&] {return collect_session_recording_evidence(dir.path / "recordings", session, {"recording-secret"}, snapshot, true);};
+  check(read_evidence().at("evidence_status") == "unknown", "missing recording summary reported complete");
+  auto summary = recording_summary(session); write(status_path, summary.dump());
+  const auto evidence = read_evidence();
+  check(evidence.at("evidence_status") == "attempt_finalized" && evidence.at("complete").is_null() && evidence.at("attempt_complete") == true,
+        "late final EOS summary did not distinguish current attempt completion from unknown session history");
+  check(evidence.at("included") == false, "recording metadata claims the video is included");
+  check(session_recording_evidence(summary, session).at("evidence_status") == "unknown", "summary without a current-attempt fence reported completion");
+  check(collect_session_recording_evidence(dir.path / "recordings", session, {}, snapshot, false).at("evidence_status") == "unknown",
+        "incomplete runtime coverage was used as a positive current-attempt fence");
+  for (const auto* field : {"final_eos_received", "attempt_complete"}) {
+    auto changed = summary; changed[field] = false; write(status_path, changed.dump());
+    check(read_evidence().at("evidence_status") == "unknown", "unfinished recording reported complete");
+  }
+  for (const auto* field : {"unfinished_segments", "finalized_segments", "worker_input_access_units"}) {
+    auto changed = summary; changed["cameras"][0]["recording"][field] = std::string(field) == "unfinished_segments" ? 1 : 0;
+    write(status_path, changed.dump());check(read_evidence().at("evidence_status") == "unknown", "incomplete AU/segment coverage reported complete");
+  }
+  auto mismatched = summary; mismatched["cameras"][0]["recording"]["recording_attempt_id"] = "old-attempt";write(status_path, mismatched.dump());
+  check(read_evidence().at("evidence_status") == "unknown", "old lane finalization was spliced into a new summary attempt");
+  mismatched = summary; mismatched["session_id"] = "other-session";write(status_path, mismatched.dump());
+  check(read_evidence().at("evidence_status") == "unknown", "another session's recording summary was exported as evidence");
+  auto failed = summary; failed["incomplete"] = true; failed["state"] = "failed";
+  failed["cameras"][0]["recording"]["incomplete"] = true;failed["cameras"][0]["recording"]["next_action"] = "credential=recording-secret";
+  failed["password"] = "must-never-export";write(status_path, failed.dump());
+  const auto gap = read_evidence();check(gap.at("evidence_status") == "incomplete" && gap.at("complete") == false, "failed recording did not retain a gap");
+  check(gap.dump().find("recording-secret") == std::string::npos && gap.dump().find("must-never-export") == std::string::npos,
+        "recording metadata leaked unrelated fields or credentials");
+  write(status_path, summary.dump());
+  auto newer = started;newer["recording_attempt_id"] = "attempt-new";newer["reported_at_utc_ms"] = session.at("started_at_utc_ms").get<std::int64_t>() + 1;
+  write(snapshot, started.dump() + "\n" + newer.dump() + "\n");
+  check(read_evidence().at("evidence_status") == "unknown", "an old healthy file survived a new ENOSPC attempt and was reported complete");
+  const auto late_status = Json{{"event", "vehicle_media_status"}, {"vehicle_id", "vehicle"}, {"session_id", "session-000001"},
+      {"status", {{"lanes", Json::array({{{"recording", {{"configured_enabled", true}, {"recording_attempt_id", "attempt-current"},
+          {"reported_at_utc_ms", summary.at("reported_at_utc_ms")}, {"summary_persisted", false}, {"incomplete", false}, {"state", "finalized"}}}}})}}}};
+  write(snapshot, started.dump() + "\n" + late_status.dump() + "\n");
+  check(read_evidence().at("evidence_status") == "unknown", "a newer unpersisted state accepted an old healthy summary");
+  write(status_path, std::string(65537, 'x'));check(read_evidence().at("evidence_status") == "unknown", "oversized recording summary was trusted");
+  write(status_path, "not-json");check(read_evidence().at("evidence_status") == "unknown", "malformed recording summary was trusted");
+  fs::remove(status_path);fs::create_symlink(dir.path / "runtime.log", status_path);
+  check(read_evidence().at("evidence_status") == "unknown", "recording summary symlink was followed");
+}
 void collection_and_zip() {
   Directory dir; const auto start = now_ms(); const auto session = metadata(start);
   const auto record = [&](std::string id, std::string message, std::int64_t time) {
@@ -285,7 +446,27 @@ void three_endpoint_export() {
     return http.post_json_response(origin + "/auth/driver_login", {{"driver_id", id}, {"password", password}}).at("token").get<std::string>();
   };
   const auto token = login("driver", "driver-password");
-  static_cast<void>(http.post_json_response(origin + "/vehicles/online", {{"vehicle_id", "vehicle"}, {"device_token", "device-secret"}, {"connection_id", "test"}}));
+  const auto online = http.post_json_response(origin + "/vehicles/online",
+      {{"vehicle_id", "vehicle"}, {"device_token", "device-secret"}, {"connection_id", "test"}});
+  const auto vehicle_generation = online.at("connection_generation").get<std::uint64_t>();
+  std::atomic<bool> heartbeat_failed{false};
+  // The export worker does not own vehicle presence. Model the separate
+  // runtime heartbeat so slow retries cannot turn this into an offline test.
+  std::jthread heartbeat([&](std::stop_token stop) {
+    HttpClient keepalive_http(std::chrono::seconds(2));
+    while (!stop.stop_requested()) {
+      try {
+        static_cast<void>(keepalive_http.post_json_response(origin + "/vehicles/heartbeat",
+            {{"vehicle_id", "vehicle"}, {"device_token", "device-secret"},
+             {"connection_generation", vehicle_generation}}));
+      } catch (const std::exception&) {
+        heartbeat_failed = true;
+        return;
+      }
+      for (int tick = 0; tick < 10 && !stop.stop_requested(); ++tick)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  });
   const auto session = http.post_json_response(origin + "/sessions", {{"driver_id", "driver"}, {"vehicle_id", "vehicle"}, {"token", token}});
   const auto id = session.at("session_id").get<std::string>(); const auto timestamp = now_ms();
   const auto event = Json{{"logged_at_utc_ms", timestamp}, {"session_id", id}, {"event", "retained-test-event"},
@@ -306,6 +487,10 @@ void three_endpoint_export() {
   env("MINE_TELEOP_VEHICLE_RUNTIME_LOG_PATH", (dir.path / "vehicle-runtime.log").string());
   env("MINE_TELEOP_VCU_LOG_PATH", (dir.path / "vcu.jsonl").string());
   VehicleConfig vehicle; vehicle.vehicle_id = "vehicle"; vehicle.cloud.signaling_url = origin;
+  vehicle.recording.root_dir = dir.path / "recordings";
+  const auto recording_directory = vehicle.recording.root_dir / "vehicle" / id;fs::create_directories(recording_directory);
+  auto recording = recording_summary(records[0]);recording["incomplete"] = true;recording["state"] = "failed";
+  write(recording_directory / "recording-session.status", recording.dump());
   auto worker = start_vehicle_log_worker(vehicle, "device-secret");
   ControllerLogExport exported(origin, {}, {}, "driver", token, key.get<std::string>(), dir.path / "browser.jsonl");
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(18);
@@ -316,6 +501,9 @@ void three_endpoint_export() {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   const auto status = exported.status();
   check(status.at("state") == "ready", status.dump().c_str());
+  check(status.at("logs_complete") == status.at("complete") && status.at("complete_scope") == "logs_only", "recording gap changed or obscured log completeness");
+  check(status.at("recording").at("included") == false && status.at("recording").at("evidence_status") == "incomplete" &&
+        status.at("manifest").at("recording").at("complete") == false, "production vehicle worker/export did not preserve failed recording evidence");
   check(append_attempts >= 5 && finish_attempts == 2 && finish_acknowledged,
         "transient failures did not retry append and finish");
   const auto zip = exported.zip();
@@ -323,6 +511,7 @@ void three_endpoint_export() {
                                "vehicle/runtime.log", "vehicle/vcu-can.jsonl", "manifest.json", "test-CAN-evidence"})
     check(zip.find(required) != std::string::npos, "three-endpoint ZIP omitted source");
   check(zip.find("must-redact") == std::string::npos && zip.find("device-secret") == std::string::npos, "ZIP leaked credential");
+  check(zip.find(".mp4") == std::string::npos, "diagnostic export included video content");
   if (const char* output = std::getenv("MINE_TELEOP_TEST_EXPORT_ZIP")) write(output, zip);
   permanent_upload_failure = true;
   ControllerLogExport failed(origin, {}, {}, "driver", token, key.get<std::string>(), dir.path / "browser.jsonl");
@@ -334,7 +523,8 @@ void three_endpoint_export() {
   const auto failure = failed.status();
   check(failure.at("state") == "ready" && !failure.at("complete").get<bool>(),
         ("exhausted upload retry did not finish as partial: " + failure.dump()).c_str());
-  check(failure.at("manifest").at("vehicle").at("reason") == "vehicle_upload_failed", "worker swallowed upload failure");
+  check(failure.at("manifest").at("vehicle").at("reason") == "vehicle_upload_failed",
+        ("worker swallowed upload failure: " + failure.dump()).c_str());
   worker.request_stop(); worker.join();
   // A pending vehicle upload must not turn a desktop close into a 3-minute join.
   auto pending = std::make_unique<ControllerLogExport>(origin, std::vector<std::string>{}, fs::path{},
@@ -343,10 +533,12 @@ void three_endpoint_export() {
   check(pending->status().at("state") == "collecting", "export was not pending");
   const auto cancelled_at = std::chrono::steady_clock::now(); pending.reset();
   check(std::chrono::steady_clock::now() - cancelled_at < std::chrono::seconds(3), "export cancellation blocked shutdown");
+  heartbeat.request_stop(); heartbeat.join();
+  check(!heartbeat_failed, "fixture lost authenticated vehicle heartbeat");
   server.stop();
 }
 }
 int main() {
-  try { package_configuration(); collection_and_zip(); trace_batch_session_filter(); vehicle_export_failure_reporting(); session_window_scan_priority(); long_log_redaction(); three_endpoint_export(); std::cout << "session_log_export_tests=passed\n"; return 0; }
+  try { package_configuration(); collection_and_zip(); recording_terminal_failure_after_session_end(); recording_evidence_scope_and_completion(); trace_batch_session_filter(); vehicle_export_failure_reporting(); session_window_scan_priority(); long_log_redaction(); three_endpoint_export(); std::cout << "session_log_export_tests=passed\n"; return 0; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

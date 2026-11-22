@@ -46,7 +46,7 @@ def prepare(source, destination, commit, run_id, require_vehicle, version):
     parts(version)
     if not re.fullmatch(r'[0-9a-f]{40}', commit):
         raise ValueError('Expected a full source commit SHA')
-    patterns = list(DESKTOPS) + ['mine-teleop-cloud-*.tar.gz']
+    patterns = list(DESKTOPS) + ['mine-teleop-cloud-*.tar.gz', 'mine-teleop-cloud-windows-x64-*.zip']
     if require_vehicle:
         patterns.append('mine-teleop-vehicle-*.tar.gz')
     selected = []
@@ -67,6 +67,9 @@ def prepare(source, destination, commit, run_id, require_vehicle, version):
                 raise ValueError(f'{path.name}: dirty source')
         else:
             info = dict(line.split('=', 1) for line in metadata(path, 'BUILD-INFO.txt').splitlines() if '=' in line)
+            if pattern == 'mine-teleop-cloud-windows-x64-*.zip':
+                if (info.get('target_platform'), info.get('target_architecture')) != ('windows', 'x64'):
+                    raise ValueError(f'{path.name}: platform mismatch')
         if info.get('version', info.get('release_version')) != version:
             raise ValueError(f'{path.name}: release version mismatch')
         if info.get('source_commit') != commit:

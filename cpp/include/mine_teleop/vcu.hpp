@@ -89,6 +89,10 @@ struct Feedback {
   std::array<bool, kMotorCount> motor_torque_valid{};
   std::array<double, kMotorCount> motor_speed_rpm{};
   std::array<bool, kMotorCount> motor_speed_valid{};
+  // Diagnostic fields share validity with their Status01 (torque) / Status02 (mode) frame.
+  std::array<double, kMotorCount> motor_current_a{};
+  std::array<int, kMotorCount> motor_inverter_status{};
+  std::array<int, kMotorCount> motor_fault_level{};
 
   std::array<int, kSteeringAxisCount> steering_mode{};
   std::array<bool, kSteeringAxisCount> steering_valid{};
@@ -97,6 +101,8 @@ struct Feedback {
   std::array<int, kBrakeCount> brake_mode{};
   std::array<bool, kBrakeCount> brake_valid{};
   std::array<double, kBrakeCount> brake_pressure_bar{};
+  std::array<int, kBrakeCount> brake_fault_level{};
+  std::array<int, kBrakeCount> brake_fault_code{};
 };
 
 enum class State {

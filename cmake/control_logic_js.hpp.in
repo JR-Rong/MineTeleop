@@ -5,6 +5,7 @@
 
 namespace mine_teleop::web {
 
+inline constexpr std::string_view kConsoleSourceSha256 = "@MINE_TELEOP_CONSOLE_SOURCE_SHA256@";
 inline constexpr std::string_view kControlLogicJavaScript =
 @MINE_TELEOP_CONTROL_LOGIC_JS_LITERALS@;
 inline constexpr std::size_t kControlLogicJavaScriptLiteralChunks =

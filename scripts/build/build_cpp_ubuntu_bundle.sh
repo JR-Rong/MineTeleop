@@ -74,6 +74,7 @@ if [[ -z "$base_bundle_archive" ]]; then
     --platform "$platform" \
     --build-arg "MINE_TELEOP_BUILD_JOBS=$build_jobs" \
     --build-arg "MINE_TELEOP_BUILD_TESTS=$run_tests" \
+    --build-arg "MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS=${MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS:-OFF}" \
     --build-arg "MINE_TELEOP_REQUIRE_CHASSIS_RUNTIME=ON" \
     --target runtime \
     --load \
@@ -91,6 +92,7 @@ if [[ -z "$base_bundle_archive" ]]; then
     --platform "$platform" \
     --build-arg "MINE_TELEOP_BUILD_JOBS=$build_jobs" \
     --build-arg "MINE_TELEOP_BUILD_TESTS=$run_tests" \
+    --build-arg "MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS=${MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS:-OFF}" \
     --build-arg "MINE_TELEOP_REQUIRE_CHASSIS_RUNTIME=ON" \
     --target artifact \
     --output "type=local,dest=$temporary/artifact" \
@@ -149,6 +151,7 @@ else
     --platform "$platform" \
     --build-arg "MINE_TELEOP_BUILD_JOBS=$build_jobs" \
     --build-arg "MINE_TELEOP_BUILD_TESTS=$run_tests" \
+    --build-arg "MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS=${MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS:-OFF}" \
     --target build \
     --load \
     -t "$build_image" \
@@ -211,6 +214,8 @@ install -m 0644 "$repo_root/deployments/udev/99-mine-teleop-basler.rules" \
   "$output_root/deployments/udev/99-mine-teleop-basler.rules"
 install -m 0755 "$repo_root/scripts/deploy/setup_basler_usb_access.sh" \
   "$output_root/scripts/setup_basler_usb_access.sh"
+install -m 0755 "$repo_root/scripts/deploy/setup_orin_isx031.sh" \
+  "$output_root/scripts/setup_orin_isx031.sh"
 install -m 0644 "$repo_root/packaging/ubuntu-vehicle/README.txt" "$output_root/README.txt"
 printf '%s\n' \
   "source_commit=$(git -C "$repo_root" rev-parse HEAD)" \

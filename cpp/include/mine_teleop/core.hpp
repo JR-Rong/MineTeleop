@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <deque>
 #include <filesystem>
 #include <memory>
@@ -15,6 +16,8 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
+
+#include "mine_teleop/detail/transient_hold.hpp"
 
 namespace mine_teleop {
 
@@ -30,7 +33,7 @@ inline constexpr double kDefaultMaxBrakePressureBar = 327.6;
 inline constexpr double kMaxOrdinaryBrakePressureBar = 327.6;
 inline constexpr double kMaxEmergencyBrakePressureBar = 409.5;
 inline constexpr int kSessionControlProfileMaxAgeMs = 2000;
-inline constexpr int kSessionControlProfileVersion = 4;
+inline constexpr int kSessionControlProfileVersion = 7;
 static_assert(kMaxFullScaleMotorTorqueNm <= 800.0 * 0.8);
 static_assert(kMaxFullScaleMotorTorqueNm <= 838.3 * 0.8);
 
@@ -77,6 +80,21 @@ struct ControlCommand {
   bool estop{false};
   std::string control_token;
   bool operator_active{false};
+  bool mock_control_diagnostic{false};
+  bool critical_video_ready{true};
+  bool control_time_sync_ready{true};
+  bool operator_input_ready{true};
+  bool control_link_ready{true};
+  // Raw current sample health, distinct from a tolerated (<3) anomaly gate.
+  // Required on ordinary V8 transport so a shared recovery window cannot be
+  // renewed by repetitions of a failed candidate or a tolerated bad ACK.
+  bool recovery_sample_healthy{true};
+  std::uint64_t recovery_bad_sample_revision{0};
+  std::uint64_t recovery_brake_revision{0};
+  // Signed only after the vehicle advertised transient-hold-v1. The transient
+  // video flag is only meaningful with critical_video_ready=false.
+  bool transient_hold_capable{false};
+  bool critical_video_transient{false};
 
   void validate() const;
   [[nodiscard]] Json to_json() const;
@@ -91,6 +109,18 @@ struct NativeControlIntent {
   double throttle{0.0};
   double brake{0.0};
   bool estop{false};
+  bool critical_video_ready{true};
+  // Raw observation remains separate from the tolerated control-ready gate.
+  // Unknown observations cannot complete a recovery health window.
+  bool critical_video_sample_healthy{false};
+  std::uint64_t critical_video_bad_sample_revision{0};
+  std::uint64_t critical_video_brake_revision{0};
+  // Every blocked critical view is only stale, recovering or muted. Meaningful only
+  // with critical_video_ready=false, and only forwarded when a hold is negotiated.
+  bool critical_video_transient{false};
+  // Physical input may be held while a limit or gear transition zeros axes.
+  // This can veto a voluntary route upgrade; command readiness uses the axes.
+  bool operator_input_held{false};
 
   void validate() const;
   [[nodiscard]] bool is_neutral() const;
@@ -102,6 +132,13 @@ struct NativeControlIntentUpdate {
   bool duplicate{false};
   bool requires_fresh_input{true};
   std::string reason;
+  bool preserve_brake_during_rearm{false};
+  std::uint64_t ui_control_epoch{0};
+  std::uint64_t accepted_sample_id{0};
+  std::uint64_t accepted_refresh_sample_id{0};
+  std::uint64_t refresh_sample_id{0};
+  unsigned int consecutive_refresh_anomalies{0};
+  bool refresh_sample_healthy{false};
 };
 
 struct NativeControlIntentSample {
@@ -109,6 +146,16 @@ struct NativeControlIntentSample {
   bool fresh{false};
   bool requires_fresh_input{true};
   NativeControlIntent intent;
+  std::int64_t age_ms{0};
+  std::uint64_t ui_control_epoch{0};
+  std::uint64_t accepted_sample_id{0};
+  std::uint64_t accepted_refresh_sample_id{0};
+  std::string owner_ui_instance_id;
+  std::uint64_t refresh_sample_id{0};
+  unsigned int consecutive_refresh_anomalies{0};
+  bool refresh_sample_healthy{false};
+  std::uint64_t refresh_bad_sample_revision{0};
+  std::uint64_t refresh_brake_revision{0};
 };
 
 // Holds only the latest browser input intent. The native sender samples this
@@ -121,12 +168,18 @@ class NativeControlIntentStore {
 
   NativeControlIntentUpdate update(
       NativeControlIntent intent,
-      std::int64_t received_at_monotonic_ms);
+      std::int64_t received_at_monotonic_ms,
+      std::optional<std::uint64_t> expected_ui_control_epoch = std::nullopt,
+      bool takeover = false,
+      std::optional<std::int64_t> applied_at_monotonic_ms = std::nullopt);
+  // Start safe native heartbeats without assigning ownership to a browser.
+  void begin_session(std::int64_t received_at_monotonic_ms);
   [[nodiscard]] NativeControlIntentSample sample(std::int64_t now_monotonic_ms);
-  void invalidate();
+  void invalidate(bool preserve_brake = false);
   void reset();
 
   [[nodiscard]] int lease_ms() const { return lease_ms_; }
+  [[nodiscard]] std::pair<std::string, std::uint64_t> ownership_scope() const;
 
  private:
   int lease_ms_;
@@ -134,7 +187,21 @@ class NativeControlIntentStore {
   std::optional<NativeControlIntent> latest_;
   std::int64_t received_at_monotonic_ms_{0};
   bool requires_fresh_input_{true};
+  bool preserve_brake_during_rearm_{false};
   bool estop_latched_{false};
+  // One owner and a monotonic epoch replace an unbounded retired-page set.
+  std::string owner_ui_instance_id_;
+  std::uint64_t ui_control_epoch_{0};
+  std::uint64_t accepted_sample_id_{0};
+  std::uint64_t accepted_refresh_sample_id_{0};
+  std::optional<std::int64_t> last_refresh_received_at_monotonic_ms_;
+  std::optional<NativeControlIntent> last_observed_owner_intent_;
+  std::optional<std::int64_t> last_observed_owner_received_at_monotonic_ms_;
+  std::uint64_t refresh_sample_id_{0};
+  unsigned int consecutive_refresh_anomalies_{0};
+  bool refresh_sample_healthy_{false};
+  std::uint64_t refresh_bad_sample_revision_{0};
+  std::uint64_t refresh_brake_revision_{0};
 };
 
 struct SessionControlProfile {
@@ -152,6 +219,9 @@ struct SessionControlProfile {
   int speed_pid_max_dt_ms{100};
   double motor_torque_rise_rate_nm_per_s{kDefaultMotorTorqueRiseRateNmPerSecond};
   int parking_idle_timeout_ms{500};
+  int consecutive_late_frame_limit{3};
+  int critical_camera_stale_brake_ms{500};
+  int control_recovery_timeout_ms{5000};
 
   void validate() const;
   [[nodiscard]] Json to_json() const;
@@ -265,6 +335,11 @@ class ControlReceiver {
       int timestamp_warning_skew_ms = 5000);
 
   ReceiveResult accept(const ControlCommand& command, std::int64_t receive_time_ms);
+  ReceiveResult accept(const ControlCommand& command, std::int64_t receive_time_ms,
+      std::int64_t arrival_monotonic_ms);
+  void set_consecutive_late_frame_limit(int limit);
+  [[nodiscard]] int consecutive_late_frame_limit() const { return consecutive_late_frame_limit_; }
+  [[nodiscard]] int consecutive_late_frames() const { return consecutive_late_frames_; }
 
  private:
   std::string vehicle_id_;
@@ -277,6 +352,9 @@ class ControlReceiver {
   int timestamp_warning_skew_ms_;
   std::optional<std::uint64_t> last_seq_;
   std::optional<std::int64_t> last_valid_receive_ms_;
+  int consecutive_late_frame_limit_{1};
+  int consecutive_late_frames_{0};
+  std::optional<std::uint64_t> last_timing_violation_seq_;
 };
 
 enum class SafetyState {
@@ -290,6 +368,8 @@ enum class SafetyState {
 };
 
 std::string_view to_string(SafetyState state);
+enum class ControlRecoveryCause { CriticalVideo, TimeSynchronization, InputLease, ControlLink, ReadinessHistory };
+std::string_view to_string(ControlRecoveryCause cause);
 
 struct DecelerationStage {
   int after_ms{0};
@@ -360,6 +440,7 @@ class SafetyStateMachine {
   bool reset_estop(bool local_confirmed, std::string_view authorized_by, std::int64_t now_ms);
   bool reset_to_standby();
   void mark_fault();
+  void require_input_rearm();
 
   [[nodiscard]] SafetyState state() const { return state_; }
   [[nodiscard]] std::optional<std::int64_t> last_valid_receive_ms() const { return last_valid_receive_ms_; }
@@ -382,6 +463,11 @@ struct ControlConfig {
   int max_command_gap_ms{200};
   int degraded_timeout_ms{300};
   int control_timeout_ms{800};
+  // Chassis bridge apply watchdog (process liveness). Loaded as control_timeout_ms
+  // unless the YAML sets it, so it can stay shorter than a hold-extended hard watchdog.
+  int bridge_apply_timeout_ms{800};
+  // Disabled unless the YAML block enables it.
+  detail::TransientHoldConfig transient_hold;
   std::vector<DecelerationStage> deceleration_profile;
 };
 
@@ -392,17 +478,23 @@ struct CloudConfig {
   std::vector<std::string> resolve_entries;
   std::filesystem::path ca_bundle;
   std::string ice_transport_policy{"all"};
+  int ice_direct_timeout_ms{0};  // Opt-in bounded direct attempt; 0 preserves concurrent ICE.
 };
 
 [[nodiscard]] bool ice_transport_policy_is_valid(std::string_view value);
 
 struct VehicleRuntimeConfig {
+  // Internal only: zero keeps the reviewed default closed. Not YAML-loaded.
+  int experimental_direct_authority_max_ms{0};
   bool control_enabled{true};
   bool media_enabled{true};
+  bool mock_control_diagnostic{false};
   bool control_log_commands{false};
   int teleop_poll_interval_ms{50};
   int media_frame_timeout_ms{3000};
   int media_capture_interval_ms{0};
+  int critical_camera_stale_brake_ms{500};
+  int control_recovery_timeout_ms{5000};
 };
 
 struct MediaProfile {
@@ -490,7 +582,7 @@ struct FieldSafetyConfig {
   bool require_can_feedback_before_control{true};
   bool require_local_estop_reset{true};
   bool require_time_sync{true};
-  int max_time_sync_uncertainty_ms{25};
+  int max_time_sync_uncertainty_ms{100};
   int time_sync_interval_ms{30000};
   int time_sync_samples{7};
 };
@@ -516,6 +608,7 @@ struct VehicleConfig {
   [[nodiscard]] Json redacted_summary() const;
 };
 
+void validate_mock_control_diagnostic(const VehicleConfig& config);
 VehicleConfig load_vehicle_config(const std::filesystem::path& path);
 void validate_chassis_bridge_abi(const std::filesystem::path& library_path);
 
@@ -777,13 +870,16 @@ std::unique_ptr<VehicleAdapter> create_vehicle_adapter(const VehicleConfig& conf
 
 class VehicleControlService {
  public:
+  // Method timestamps remain UTC for packet validation/wire telemetry. Elapsed
+  // control and telemetry intervals use steady_clock (injectable in tests).
   VehicleControlService(
       const VehicleConfig& config,
       std::string driver_id,
       std::string session_id,
       std::string control_token,
       std::unique_ptr<VehicleAdapter> adapter,
-      int telemetry_interval_ms = 100);
+      int telemetry_interval_ms = 100,
+      std::function<std::int64_t()> monotonic_clock = {});
   ~VehicleControlService();
 
   void start(std::int64_t now_ms);
@@ -806,12 +902,50 @@ class VehicleControlService {
   }
   [[nodiscard]] Json control_limits() const;
   [[nodiscard]] Json session_control_profile() const;
+  [[nodiscard]] Json control_timing(std::int64_t now_ms) const;
+  void set_control_braking_wait(bool waiting, std::int64_t now_ms,
+      ControlRecoveryCause cause = ControlRecoveryCause::CriticalVideo);
+  [[nodiscard]] bool control_braking_wait() const { return control_braking_wait_; }
+  [[nodiscard]] ControlRecoveryCause control_recovery_cause() const { return recovery_cause_; }
+  [[nodiscard]] bool driver_critical_video_ready() const { return driver_critical_video_ready_; }
+  [[nodiscard]] bool driver_time_sync_ready() const { return driver_time_sync_ready_; }
+  [[nodiscard]] bool operator_input_ready() const { return operator_input_ready_; }
+  [[nodiscard]] bool recovery_samples_healthy() const { return recovery_samples_healthy_; }
+  [[nodiscard]] std::uint64_t recovery_bad_sample_revision() const { return recovery_bad_sample_revision_; }
+  [[nodiscard]] std::uint64_t recovery_brake_revision() const { return recovery_brake_revision_; }
+  [[nodiscard]] bool driver_control_link_ready() const { return driver_control_link_ready_; }
+  // Transient link hold (docs/64-transient-link-hold-design.md): enabled only for
+  // a session whose driver declared the capability against a vehicle that allows it.
+  [[nodiscard]] bool transient_hold_enabled() const;
+  [[nodiscard]] bool transient_hold_active() const { return transient_hold_.active(); }
+  // A driver video report that is neither ready nor merely stale/recovering.
+  [[nodiscard]] bool driver_critical_video_fault() const {
+    return !driver_critical_video_ready_ && !driver_critical_video_transient_;
+  }
+  // The media runtime reports whether a critical encoded lane is only stale.
+  void observe_vehicle_video_transient(bool stale, std::int64_t timestamp_ms);
+  // A transport epoch change during a hold escalates with its own reason.
+  void note_transport_epoch_changed(std::int64_t timestamp_ms);
+  [[nodiscard]] std::vector<Json> drain_transient_hold_events();
+  [[nodiscard]] std::pair<int, int> recovery_timing() const;
   [[nodiscard]] const std::deque<Json>& telemetry_history() const { return telemetry_history_; }
   [[nodiscard]] Json summary() const;
 
  private:
   [[nodiscard]] bool refresh_adapter_safe_stop_state() noexcept;
-  void evaluate_control_watchdog(std::int64_t now_ms);
+  void evaluate_control_watchdog();
+  void apply_recovery_brake(std::string_view gear_override = {});
+  // Returns true when the action escalated to the existing braking wait.
+  bool handle_transient_action(detail::TransientHoldAction action, ControlRecoveryCause cause,
+      std::int64_t timestamp_ms);
+  [[nodiscard]] ControlRecoveryCause transient_recovery_cause() const;
+  void apply_hold_output();
+  // Ends an active hold because a stronger stop took over (fault, hard timeout, ESTOP).
+  void end_transient_hold(std::string_view reason);
+  void record_transient_event(std::string_view event);
+  // Lowest brake request the staged hard timeout may apply: it never drops
+  // below the brake the vehicle was already holding.
+  [[nodiscard]] double current_brake_floor() const;
   void clear_session_profile() noexcept;
   [[nodiscard]] SessionControlProfileResult profile_result(
       const SessionControlProfileRequest& request,
@@ -827,9 +961,12 @@ class VehicleControlService {
   std::string control_token_;
   std::string commissioning_mode_;
   ControlReceiver receiver_;
+  std::function<std::int64_t()> monotonic_clock_;
   SafetyStateMachine safety_;
   std::unique_ptr<VehicleAdapter> adapter_;
   bool require_feedback_before_control_{true};
+  bool critical_video_required_{true};
+  bool mock_control_diagnostic_{false};
   double max_speed_kph_{40.0};
   double max_throttle_{1.0};
   double full_scale_motor_torque_nm_{kDefaultFullScaleMotorTorqueNm};
@@ -846,6 +983,8 @@ class VehicleControlService {
   double hard_overspeed_margin_kph_{3.6};
   Json control_limits_;
   int telemetry_interval_ms_;
+  int degraded_timeout_ms_;
+  detail::TransientHoldPolicy transient_hold_;
   std::optional<std::int64_t> last_telemetry_ms_;
   std::uint64_t telemetry_sequence_{0};
   std::deque<Json> telemetry_history_;
@@ -854,6 +993,22 @@ class VehicleControlService {
   std::optional<SessionControlProfileResult> last_session_profile_result_;
   std::optional<ControlCommand> last_effective_command_;
   bool adapter_safe_stop_active_{false};
+  bool timing_rearm_required_{false};
+  bool control_braking_wait_{false};
+  bool recovery_brake_hold_{false};
+  ControlRecoveryCause recovery_cause_{ControlRecoveryCause::CriticalVideo};
+  bool driver_critical_video_ready_{true};
+  bool driver_time_sync_ready_{true};
+  bool operator_input_ready_{true};
+  bool driver_control_link_ready_{true};
+  bool recovery_samples_healthy_{true};
+  std::uint64_t recovery_bad_sample_revision_{0};
+  std::uint64_t recovery_brake_revision_{0};
+  bool transient_hold_negotiated_{false};
+  bool driver_critical_video_transient_{false};
+  bool vehicle_video_transient_{false};
+  std::optional<ControlOutput> hold_output_;
+  std::deque<Json> transient_hold_events_;
   bool started_{false};
 };
 

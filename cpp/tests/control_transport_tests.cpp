@@ -1,0 +1,742 @@
+#include "mine_teleop/detail/control_transport.hpp"
+#include "mine_teleop/detail/control_transport_sender.hpp"
+#include "control_time_fixture.hpp"
+#include "mine_teleop/server.hpp"
+
+#include <iostream>
+#include <stdexcept>
+
+namespace mine_teleop {
+struct DriverConsoleTransportTestAccess {
+  static void begin_direct(DriverConsoleRuntime& runtime, const std::string& key) {
+    { std::lock_guard lock(runtime.mutex_); runtime.control_transport_mac_key_ = key; }
+    std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
+    runtime.control_transport_sender_.set_data_channel_is_p2p(true);
+    runtime.control_transport_sender_.begin(detail::ControlPath::DataChannel, "media-a", 500, 5000);
+  }
+  static Json sent(DriverConsoleRuntime& runtime, Json frame, std::int64_t sent_ms) {
+    std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
+    runtime.control_transport_sender_.decorate(frame);
+    runtime.control_transport_sender_.note_sent(frame, detail::ControlPath::DataChannel, sent_ms);
+    runtime.control_dc_ack_window_.note_sent(frame.at("seq").get<std::uint64_t>(), sent_ms);
+    runtime.control_transport_latest_dc_ = frame;
+    runtime.control_transport_latest_dc_at_ms_ = sent_ms;
+    return frame;
+  }
+  static void deliver(DriverConsoleRuntime& runtime, const Json& result, std::int64_t now) {
+    std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
+    static_cast<void>(runtime.consume_vehicle_control_result_locked(result, "session-001", "vehicle-001", "driver-001", now, true));
+  }
+  static void observe_offer_capabilities(DriverConsoleRuntime& runtime, const Json& payload) {
+    std::lock_guard lock(runtime.mutex_);
+    runtime.observe_transient_hold_offer_locked(payload);
+  }
+  static int transient_tolerance(DriverConsoleRuntime& runtime) {
+    std::lock_guard lock(runtime.mutex_);
+    return runtime.transient_hold_vehicle_capable_ ? runtime.transient_control_tolerance_ms_ : 0;
+  }
+  static bool direct_retired(DriverConsoleRuntime& runtime) {
+    std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
+    return runtime.control_transport_sender_.path() == detail::ControlPath::Wss &&
+        runtime.control_transport_latest_dc_.is_null() && runtime.control_dc_ack_window_.pending_count() == 0;
+  }
+  static void prepare_bridge_scope(DriverConsoleRuntime& runtime, const std::string& key, std::int64_t now_ms) {
+    NativeControlIntent intent;
+    intent.ui_instance_id = "ui-1";
+    intent.intent_seq = 1;
+    intent.gear = "D";
+    intent.critical_video_ready = true;
+    intent.critical_video_sample_healthy = true;
+    {
+      std::lock_guard lock(runtime.mutex_);
+      runtime.session_id_ = "session-001";
+      runtime.control_session_generation_ = 1;
+      runtime.media_scope_id_ = "media-a";
+      runtime.media_scope_session_ = "session-001";
+      runtime.media_offer_count_ = 1;
+      runtime.control_transport_vehicle_capable_ = true;
+      runtime.control_transport_cloud_capable_ = true;
+      runtime.control_transport_mac_key_ = key;
+      static_cast<void>(runtime.native_control_intent_.update(intent, now_ms, std::nullopt, true, now_ms));
+    }
+    std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
+    runtime.control_transport_sender_.set_data_channel_is_p2p(true);
+    runtime.control_transport_sender_.begin(detail::ControlPath::DataChannel, "media-a", now_ms, 5000);
+  }
+  static void publish_bridge_frame(DriverConsoleRuntime& runtime, Json frame, std::int64_t sent_ms) {
+    const auto current = runtime.native_control_intent_.sample(sent_ms);
+    std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
+    runtime.control_transport_sender_.decorate(frame);
+    runtime.control_transport_sender_.note_sent(frame, detail::ControlPath::DataChannel, sent_ms);
+    runtime.control_dc_ack_window_.note_sent(frame.at("seq").get<std::uint64_t>(), sent_ms);
+    frame["bridge_owner"] = current.owner_ui_instance_id;
+    frame["bridge_ui_epoch"] = current.ui_control_epoch;
+    runtime.control_transport_latest_dc_ = std::move(frame);
+    runtime.control_transport_latest_dc_sample_ = current;
+    runtime.control_transport_latest_dc_at_ms_ = sent_ms;
+  }
+};
+}  // namespace mine_teleop
+
+namespace {
+using namespace mine_teleop;
+using namespace mine_teleop::detail;
+void expect(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
+template<class F> void throws(F action) { bool failed = false; try { action(); } catch (const std::exception&) { failed = true; } expect(failed, "invalid protocol accepted"); }
+ControlCommand command(std::uint64_t seq, std::int64_t now) {
+  ControlCommand value; value.vehicle_id = "vehicle-001"; value.driver_id = "driver-001";
+  value.session_id = "session-001"; value.control_token = "fixture"; value.seq = seq;
+  value.sent_at_utc_ms = now; value.gear = "D"; return value;
+}
+ControlTransportFence fence() {
+  ControlTransportFence value; value.reset("vehicle-001", "driver-001", "session-001", "fixture"); return value;
+}
+Json stamp(std::uint64_t epoch, std::uint64_t from, ControlPath path, std::uint64_t minimum, bool select = true) {
+  return ControlTransportStamp{epoch, from, minimum, path, path == ControlPath::DataChannel ? "media-a" : "", select}.to_json();
+}
+auto admit(ControlTransportFence& value, const ControlCommand& cmd, const Json* wire, ControlPath path, std::int64_t now) {
+  return value.admit(cmd, wire, path, "media-a", now, 100000, 200, true);
+}
+void driver_negotiates_transient_hold_from_offer() {
+  DriverConfig config; config.driver_id = "driver-001"; config.signaling_url = "http://127.0.0.1:1";
+  config.browser_event_log_path.clear();
+  DriverConsoleRuntime runtime(config, "vehicle-001", "fixture");
+  NativeControlIntent intent; intent.ui_instance_id = "ui"; intent.intent_seq = 1;
+  intent.critical_video_ready = true; intent.critical_video_transient = true;
+  bool rejected = false; try { intent.validate(); } catch (const std::invalid_argument&) { rejected = true; }
+  expect(rejected, "intent accepted transient video while video was ready");
+  const Json offer = {{"transient_hold_capability", "transient-hold-v1"},
+      {"transient_hold", {{"control_tolerance_ms", 1000}, {"video_tolerance_ms", 1200}, {"max_hold_ms", 700}}}};
+  DriverConsoleTransportTestAccess::observe_offer_capabilities(runtime, offer);
+  expect(DriverConsoleTransportTestAccess::transient_tolerance(runtime) == 1000, "valid capability not negotiated");
+  DriverConsoleTransportTestAccess::observe_offer_capabilities(runtime, Json::object());
+  expect(DriverConsoleTransportTestAccess::transient_tolerance(runtime) == 0, "missing capability kept a stale negotiation");
+  Json out_of_range = offer; out_of_range["transient_hold"]["control_tolerance_ms"] = 399;
+  DriverConsoleTransportTestAccess::observe_offer_capabilities(runtime, out_of_range);
+  expect(DriverConsoleTransportTestAccess::transient_tolerance(runtime) == 0, "out-of-range tolerance negotiated");
+  DriverConfig mock_config = config; mock_config.disable_transient_hold = true;
+  DriverConsoleRuntime mock_runtime(mock_config, "vehicle-001", "fixture");
+  DriverConsoleTransportTestAccess::observe_offer_capabilities(mock_runtime, offer);
+  expect(DriverConsoleTransportTestAccess::transient_tolerance(mock_runtime) == 0, "mock client negotiated the hold");
+}
+void version_scope_and_expiry() {
+  expect(!DriverConfig{}.enable_experimental_control_transport, "experimental transport default must remain closed pending authority review");
+  auto value = fence(); auto cmd = command(1, 1000); auto wire = stamp(1, 0, ControlPath::DataChannel, 1);
+  expect(!admit(value, cmd, nullptr, ControlPath::DataChannel, 1000).admitted, "legacy DC re-enabled");
+  cmd.control_token = "wrong"; expect(!admit(value, cmd, &wire, ControlPath::DataChannel, 1000).admitted, "wrong token admitted");
+  cmd = command(1, 799); expect(!admit(value, cmd, &wire, ControlPath::DataChannel, 1000).admitted, "old packet retimestamped");
+  cmd.sent_at_utc_ms = 1201; expect(!admit(value, cmd, &wire, ControlPath::DataChannel, 1000).admitted, "future packet admitted");
+  cmd = command(1, 1000); expect(!value.admit(cmd, &wire, ControlPath::DataChannel, "media-b", 1000, 100000, 200, true).admitted, "old media attempt admitted");
+  expect(!value.admit(cmd, &wire, ControlPath::DataChannel, "media-a", 1000, 1000, 200, true).admitted, "expired lease admitted");
+  expect(!value.admit(cmd, &wire, ControlPath::DataChannel, "media-a", 1000, 100000, 200, false).admitted, "cloud revocation bypassed");
+  auto invalid = wire; invalid["protocol"] = "future"; throws([&]{ ControlTransportStamp::from_json(invalid); });
+  invalid = wire; invalid["epoch"] = -1; throws([&]{ ControlTransportStamp::from_json(invalid); });
+  invalid = wire; invalid["unexpected_semantics"] = true; throws([&]{ ControlTransportStamp::from_json(invalid); });
+}
+void single_receiver_epoch_replay_and_emergency() {
+  auto value = fence(); auto cmd = command(1, 1000);
+  expect(admit(value, cmd, nullptr, ControlPath::Wss, 1000).admitted, "legacy WSS broken");
+  auto wire = stamp(1, 0, ControlPath::DataChannel, 2); cmd = command(2, 1050); cmd.throttle = .5;
+  expect(!admit(value, cmd, &wire, ControlPath::DataChannel, 1050).admitted, "moving selection accepted");
+  cmd.throttle = 0; auto result = admit(value, cmd, &wire, ControlPath::DataChannel, 1050);
+  expect(result.admitted && result.changed, "DC selection failed");
+  cmd = command(3, 1100); result = admit(value, cmd, &wire, ControlPath::DataChannel, 1100);
+  expect(result.admitted && !result.changed, "lost selection result was not idempotent");
+  cmd = command(999, 1101); expect(!admit(value, cmd, nullptr, ControlPath::Wss, 1101).admitted, "late old-path high sequence applied");
+  wire = stamp(2, 1, ControlPath::Wss, 4); cmd = command(4, 1150);
+  expect(admit(value, cmd, &wire, ControlPath::Wss, 1150).changed, "same-session WSS fallback failed");
+  auto old = stamp(1, 0, ControlPath::DataChannel, 2, false); cmd = command(1000, 1151);
+  expect(!admit(value, cmd, &old, ControlPath::DataChannel, 1151).admitted, "retired epoch applied");
+  cmd = command(5, 1200); cmd.estop = true;
+  expect(admit(value, cmd, nullptr, ControlPath::Wss, 1200).admitted, "epoch blocked fresh WSS ESTOP");
+  expect(!admit(value, cmd, nullptr, ControlPath::Wss, 1200).admitted, "duplicate ESTOP renewed the receiver");
+}
+Json payload(std::uint64_t seq, std::int64_t now) {
+  auto value = command(seq, now).to_json(); value["intent_seq"] = seq + 100;
+  value["intent_fresh"] = true; return value;
+}
+NativeControlIntentSample healthy_idle_input() {
+  NativeControlIntentSample sample;
+  sample.active = sample.fresh = sample.refresh_sample_healthy = true;
+  sample.requires_fresh_input = false;
+  sample.ui_control_epoch = 1;
+  sample.intent.gear = "D";
+  sample.intent.critical_video_ready = sample.intent.critical_video_sample_healthy = true;
+  return sample;
+}
+Json response(const Json& frame, bool accepted = true, bool selected = false) {
+  return {{"event", "vehicle_control_result"}, {"protocol", kControlTransportCapability},
+      {"session_id", "session-001"}, {"vehicle_id", "vehicle-001"}, {"driver_id", "driver-001"},
+      {"command_seq", frame.at("seq")}, {"intent_seq", frame.at("intent_seq")}, {"result_seq", frame.at("seq")},
+      {"accepted", accepted}, {"rearm_required", false}, {"control_status_seq", 0}, {"reason", "fixture"},
+      {"transport_admitted", true}, {"transport_selected", selected},
+      {"authority_epoch", frame.contains("control_transport") ? frame.at("control_transport").at("epoch") : Json(0)},
+      {"control_transport", frame.value("control_transport", Json(nullptr))}};
+}
+void late_dc_results_withdraw_publication_in_result_handler() {
+  DriverConfig config; config.driver_id = "driver-001"; config.signaling_url = "http://127.0.0.1:1";
+  config.browser_event_log_path.clear();
+  DriverConsoleRuntime runtime(config, "vehicle-001", "fixture");
+  const std::string key = "01234567890123456789012345678901";
+  DriverConsoleTransportTestAccess::begin_direct(runtime, key);
+  for (std::uint64_t seq = 1; seq <= 3; ++seq) {
+    const std::int64_t now = 1000 + static_cast<std::int64_t>(seq) * 300;
+    const auto frame = DriverConsoleTransportTestAccess::sent(runtime, payload(seq, now - 250), now - 250);
+    auto result = response(frame, true, seq == 1);
+    result["vehicle_mac"] = transport_message_mac(result, key, true);
+    DriverConsoleTransportTestAccess::deliver(runtime, result, now);
+    if (seq < 3) expect(!DriverConsoleTransportTestAccess::direct_retired(runtime), "DC retired before three late results");
+  }
+  expect(DriverConsoleTransportTestAccess::direct_retired(runtime),
+      "third late DC result did not synchronously retire publication and select WSS");
+}
+void baseline(ControlTransportSender& sender) {
+  for (std::uint64_t seq = 1; seq <= 3; ++seq) {
+    const auto frame = payload(seq, seq * 50); sender.note_sent(frame, ControlPath::Wss, seq * 50);
+    auto result = response(frame); result.erase("control_transport");
+    expect(sender.note_result(result, seq * 50 + 40, 5000).matched, "WSS baseline failed");
+  }
+}
+void exact_result_and_neutral_qualification() {
+  ControlTransportSender sender; baseline(sender);
+  expect(sender.consider_dc("media-a", 200, 5000) && sender.holding_motion(), "qualification did not hold motion");
+  for (std::uint64_t seq = 4; seq <= 6; ++seq) {
+    auto frame = payload(seq, seq * 50); sender.decorate(frame); sender.note_sent(frame, ControlPath::DataChannel, seq * 50);
+    auto result = response(frame, true, seq == 4);
+    if (seq == 4) {
+      auto invalid = result; invalid["intent_seq"] = 999;
+      expect(!sender.note_result(invalid, 210, 5000).matched, "unmatched result renewed route");
+    }
+    expect(sender.note_result(result, seq * 50 + 20, 5000).matched, "exact DC result lost");
+    expect(!sender.note_result(result, seq * 50 + 21, 5000).matched, "duplicate result counted twice");
+    if (seq < 6) expect(sender.holding_motion(), "one result qualified motion");
+  }
+  expect(sender.path() == ControlPath::DataChannel && !sender.holding_motion(), "faster qualified DC not retained");
+  expect(sender.observe(false, "media-a", 400, 5000) && sender.path() == ControlPath::Wss && sender.selecting(), "DC loss did not fence WSS fallback");
+}
+void neutral_required_does_not_postpone_direct_fallback() {
+  ControlTransportSender sender;
+  sender.set_data_channel_is_p2p(true);
+  expect(sender.consider_dc("media-a", 0, 5000), "direct trial missing");
+  for (std::uint64_t seq = 1; seq <= 3; ++seq) {
+    auto frame = payload(seq, seq * 50);
+    sender.decorate(frame);
+    sender.note_sent(frame, ControlPath::DataChannel, seq * 50);
+    expect(sender.note_result(response(frame, true, seq == 1), seq * 50 + 20, 5000).matched,
+        "healthy direct result lost");
+  }
+  expect(!sender.holding_motion(), "direct trial did not qualify");
+  auto moving = payload(4, 620);
+  moving["steering"] = 0.25;
+  sender.decorate(moving);
+  sender.note_sent(moving, ControlPath::DataChannel, 620);
+  auto rejected = response(moving, false);
+  rejected["reason"] = "degraded_neutral_required";
+  rejected["rearm_required"] = true;
+  rejected["control_status_seq"] = 1;
+  const auto receipt = sender.note_result(rejected, 650, 5000);
+  expect(receipt.matched && receipt.current && !receipt.dc_ack_progress,
+      "authenticated rejection counted as direct ACK progress");
+  expect(!sender.observe(true, "media-a", 670, 5000), "direct fallback fired before its existing deadline");
+  expect(sender.observe(true, "media-a", 671, 5000) && sender.path() == ControlPath::Wss &&
+      sender.selecting() && !sender.owns_dc_publication(moving),
+      "neutral-required rejection postponed the fenced WSS fallback");
+}
+void stale_or_rejected_dc_results_do_not_postpone_direct_fallback() {
+  ControlTransportSender sender;
+  sender.set_data_channel_is_p2p(true);
+  expect(sender.consider_dc("media-a", 0, 5000), "direct trial missing");
+  for (std::uint64_t seq = 1; seq <= 3; ++seq) {
+    auto frame = payload(seq, seq * 50);
+    sender.decorate(frame);
+    sender.note_sent(frame, ControlPath::DataChannel, seq * 50);
+    expect(sender.note_result(response(frame, true, seq == 1), seq * 50 + 28, 5000).matched,
+        "healthy direct result lost");
+  }
+  expect(!sender.holding_motion(), "direct trial did not qualify");
+  // Last fresh accepted DC result was at t=178 (seq 3, age 28ms).
+  // 1) Non-rearm rejection (accepted=false, rearm_required=false) must not count as ACK progress.
+  auto non_rearm_rejected = payload(4, 220);
+  sender.decorate(non_rearm_rejected);
+  sender.note_sent(non_rearm_rejected, ControlPath::DataChannel, 220);
+  auto rej = response(non_rearm_rejected, false);
+  rej["reason"] = "stale_safe_heartbeat_gear_untrusted";
+  rej["rearm_required"] = false;
+  const auto rej_receipt = sender.note_result(rej, 240, 5000);
+  expect(rej_receipt.matched && rej_receipt.current && !rej_receipt.dc_ack_progress,
+      "non-rearm DC rejection counted as direct ACK progress");
+  // 2) Late accepted straggler (sent at t=175, arrives 484ms later at t=659 > kFreshAckMs)
+  // must not reset last_dc_result_ms_ to 659 and postpone the t=678+1 stall deadline.
+  auto straggler = payload(5, 175);
+  sender.decorate(straggler);
+  sender.note_sent(straggler, ControlPath::DataChannel, 175);
+  const auto late_receipt = sender.note_result(response(straggler, true), 659, 5000);
+  expect(late_receipt.matched && late_receipt.current && late_receipt.dc_ack_progress && !late_receipt.boundary,
+      "late accepted straggler before 500ms stall unexpectedly changed path");
+  expect(!sender.observe(true, "media-a", 678, 5000), "direct fallback fired before 500ms since last fresh result");
+  expect(sender.observe(true, "media-a", 679, 5000) && sender.path() == ControlPath::Wss && sender.selecting(),
+      "484ms straggler postponed the 500ms direct stall fallback");
+
+  // 3) If the straggler itself arrives after the 500ms stall window, note_result fences WSS synchronously.
+  ControlTransportSender sync_sender;
+  sync_sender.set_data_channel_is_p2p(true);
+  expect(sync_sender.consider_dc("media-b", 0, 5000), "second direct trial missing");
+  for (std::uint64_t seq = 1; seq <= 3; ++seq) {
+    auto frame = payload(seq, seq * 50);
+    sync_sender.decorate(frame);
+    sync_sender.note_sent(frame, ControlPath::DataChannel, seq * 50);
+    expect(sync_sender.note_result(response(frame, true, seq == 1), seq * 50 + 20, 5000).matched,
+        "healthy direct result lost");
+  }
+  auto very_late = payload(4, 180);
+  sync_sender.decorate(very_late);
+  sync_sender.note_sent(very_late, ControlPath::DataChannel, 180);
+  const auto sync_receipt = sync_sender.note_result(response(very_late, true), 685, 5000);
+  expect(sync_receipt.matched && sync_receipt.boundary && sync_sender.path() == ControlPath::Wss &&
+      sync_sender.selecting() && !sync_sender.owns_dc_publication(very_late),
+      "over-stall straggler did not synchronously fence WSS fallback");
+}
+void rearm_preserves_the_last_accepted_gear_across_routes() {
+  ControlTransportSender sender;
+  auto reverse = payload(1, 100);
+  reverse["gear"] = "R";
+  sender.note_sent(reverse, ControlPath::Wss, 100);
+  expect(sender.note_result(response(reverse), 110, 5000).matched, "reverse acceptance lost");
+  expect(!sender.recovery_gear(), "stable WSS blocked gear changes");
+  sender.set_data_channel_is_p2p(true);
+  expect(sender.consider_dc("media-a", 120, 5000) && sender.recovery_gear() == "R",
+      "direct upgrade lost the accepted reverse gear");
+
+  auto reject_selection = [&](std::uint64_t seq, ControlPath path, std::int64_t now) {
+    auto forward = payload(seq, now);
+    sender.decorate(forward);
+    sender.note_sent(forward, path, now);
+    auto rejected = response(forward, false, true);
+    rejected["reason"] = "degraded_neutral_required";
+    rejected["rearm_required"] = true;
+    rejected["control_status_seq"] = seq;
+    expect(sender.note_result(rejected, now + 10, 5000).matched,
+        "transport selection rejection lost");
+    expect(sender.recovery_gear() == "R", "rejected forward gear replaced reverse");
+  };
+  reject_selection(2, ControlPath::DataChannel, 140);
+  sender.begin(ControlPath::Wss, {}, 170, 5000);
+  reject_selection(3, ControlPath::Wss, 180);
+  expect(!sender.selecting() && sender.recovery_gear() == "R",
+      "transport-only acknowledgement cleared the neutral gear guard");
+
+  for (std::uint64_t seq = 4; seq <= 5; ++seq) {
+    auto neutral = payload(seq, seq * 50);
+    neutral["gear"] = "R";
+    neutral["intent_fresh"] = seq == 5;
+    sender.decorate(neutral);
+    sender.note_sent(neutral, ControlPath::Wss, seq * 50);
+    expect(sender.note_result(response(neutral), seq * 50 + 10, 5000).matched,
+        "neutral result lost");
+    expect(sender.recovery_gear().has_value() == (seq == 4),
+        "only a fresh accepted neutral command should release the gear guard");
+  }
+}
+void slower_dc_and_lost_selection() {
+  ControlTransportSender sender; baseline(sender); expect(sender.consider_dc("media-a", 200, 5000), "trial missing");
+  for (std::uint64_t seq = 4; seq <= 6; ++seq) {
+    auto frame = payload(seq, seq * 100); sender.decorate(frame); sender.note_sent(frame, ControlPath::DataChannel, seq * 100);
+    expect(sender.note_result(response(frame, true, seq == 4), seq * 100 + 80, 5000).matched, "slow result lost");
+  }
+  expect(sender.path() == ControlPath::Wss && sender.selecting(), "DC topology overrode faster WSS result");
+  auto frame = payload(7, 800); sender.decorate(frame); sender.note_sent(frame, ControlPath::Wss, 800);
+  auto conflict = response(frame, false); conflict["authority_epoch"] = 0; conflict["reason"] = "transport_epoch_conflict";
+  expect(sender.note_result(conflict, 820, 5000).boundary, "lost request did not reconcile authority");
+  frame = payload(8, 850); sender.decorate(frame);
+  expect(frame["control_transport"]["epoch"] == 1 && frame["control_transport"]["from_epoch"] == 0,
+      "reconciled selection skipped the actual vehicle epoch");
+}
+void cloud_ingress_without_vehicle_result_can_only_start_a_neutral_trial() {
+  ControlTransportSender sender;
+  sender.note_sent(payload(1, 0), ControlPath::Wss, 0);
+  expect(!sender.consider_dc("media-a", 499, 5000), "trial began before the existing stall boundary");
+  expect(sender.consider_dc("media-a", 500, 5000) && sender.selecting() && sender.holding_motion(),
+      "fast cloud ingress without vehicle results stranded WSS forever");
+  sender.observe(false, "media-a", 501, 5000);
+  expect(!sender.consider_dc("media-a", 502, 5000), "failed candidate retried without debounce");
+}
+
+void healthy_proven_p2p_is_preferred_to_a_faster_cloud_backup() {
+  ControlTransportSender initial; initial.set_data_channel_is_p2p(true);
+  expect(initial.consider_dc("media-a", 0, 5000) && initial.holding_motion(), "default proven direct path waited for cloud performance baseline");
+  ControlTransportSender sender; sender.set_data_channel_is_p2p(true); baseline(sender);
+  expect(sender.consider_dc("media-a", 200, 5000), "direct trial lost after faster WSS baseline");
+  for (std::uint64_t seq = 4; seq <= 6; ++seq) {
+    auto frame = payload(seq, seq * 50); sender.decorate(frame); sender.note_sent(frame, ControlPath::DataChannel, seq * 50);
+    expect(sender.note_result(response(frame, true, seq == 4), seq * 50 + 80, 5000).matched, "healthy direct qualification lost");
+  }
+  expect(sender.path() == ControlPath::DataChannel && !sender.holding_motion(), "healthy direct path never qualified");
+  expect(!sender.observe(true, "media-a", 450, 5000) && sender.path() == ControlPath::DataChannel,
+      "healthy direct path left merely because cloud might be faster");
+  expect(sender.observe(false, "media-a", 451, 5000) && sender.path() == ControlPath::Wss,
+      "direct preference prevented genuine cloud fallback");
+  expect(!sender.consider_dc("media-a", 452, 5000), "direct failure retried without existing recovery debounce");
+  auto fallback = payload(7, 452); sender.decorate(fallback); sender.note_sent(fallback, ControlPath::Wss, 452);
+  expect(sender.note_result(response(fallback, true, true), 472, 5000).matched && !sender.selecting(),
+      "fallback did not complete its own epoch barrier before another trial");
+  expect(sender.consider_dc("media-a", 5451, 5000), "recovered direct candidate was never retried");
+}
+
+void healthy_wss_waits_for_idle_before_returning_to_direct() {
+  ControlTransportSender sender;
+  sender.set_data_channel_is_p2p(true);
+  expect(sender.consider_dc("media-a", 0, 5000), "initial direct trial missing");
+  expect(sender.observe(false, "media-a", 1, 5000), "direct fault did not fall back");
+
+  auto input = healthy_idle_input();
+  std::int64_t now = 5001;
+  std::uint64_t seq = 1;
+  auto tick = [&](double brake) {
+    input.intent.brake = brake;
+    auto frame = payload(seq, now - 10);
+    frame["brake"] = brake;
+    sender.decorate(frame);
+    sender.note_sent(frame, ControlPath::Wss, now - 10);
+    expect(sender.note_result(response(frame, true, seq == 1), now, 5000).matched,
+        "WSS result missing");
+    sender.observe_wss_upgrade_idle(input, true, now);
+    ++seq;
+  };
+  for (int i = 0; i < 10; ++i, now += 50) {
+    tick(0.5);
+    expect(!sender.consider_dc("media-a", now, 5000) &&
+        !sender.consider_dc("media-b", now, 5000), "healthy WSS interrupted held brake");
+  }
+  input.intent.operator_input_held = true;
+  for (int i = 0; i < 8; ++i, now += 50) {
+    tick(0);
+    expect(!sender.consider_dc("media-a", now, 5000), "capped axes disguised held input as neutral");
+  }
+  input.intent.operator_input_held = false;
+  for (int i = 0; i < 6; ++i, now += 50) {
+    tick(0);
+    expect(!sender.consider_dc("media-a", now, 5000), "brief neutral input enabled a direct retry");
+  }
+  ++input.ui_control_epoch;
+  for (int i = 0; i < 6; ++i, now += 50) {
+    tick(0);
+    expect(!sender.consider_dc("media-a", now, 5000), "new page inherited neutral history");
+  }
+  tick(0);
+  expect(sender.consider_dc("media-a", now, 5000) && sender.holding_motion(),
+      "sustained neutral input did not permit a fenced direct trial");
+}
+
+void publication_is_owned_only_by_its_current_dc_epoch() {
+  for (int cause = 0; cause < 6; ++cause) {
+    ControlTransportSender sender; baseline(sender);
+    expect(sender.consider_dc("media-a", 200, 5000), "DC trial missing");
+    auto pending = payload(7, 201); pending["throttle"] = 0.4; sender.decorate(pending);
+    expect(sender.owns_dc_publication(pending), "current DC publication rejected");
+    if (cause == 0) sender.begin(ControlPath::Wss, {}, 202, 5000);
+    else if (cause == 1) sender.observe(false, "media-a", 202, 5000);
+    else if (cause == 2) sender.observe(true, "replacement", 202, 5000);
+    else if (cause == 3) sender.observe(true, "media-a", 5200, 5000);
+    else if (cause == 4) {
+      auto selection = payload(4, 201); sender.decorate(selection); sender.note_sent(selection, ControlPath::DataChannel, 201);
+      auto conflict = response(selection, false); conflict["reason"] = "transport_epoch_conflict"; conflict["authority_epoch"] = 0;
+      sender.note_result(conflict, 202, 5000);
+    } else {
+      for (std::uint64_t seq = 4; seq <= 6; ++seq) {
+        auto frame = payload(seq, seq * 100); sender.decorate(frame); sender.note_sent(frame, ControlPath::DataChannel, seq * 100);
+        sender.note_result(response(frame, true, seq == 4), seq * 100 + 80, 5000);
+      }
+    }
+    expect(sender.path() == ControlPath::Wss && !sender.owns_dc_publication(pending), "fallback still owns pending DC motion");
+    sender.begin(ControlPath::DataChannel, "media-a", 6000, 5000);
+    expect(!sender.owns_dc_publication(pending), "next DC epoch revived old publication");
+  }
+}
+
+void failed_direct_trials_back_off_and_exhaust_per_attempt() {
+  ControlTransportSender sender; sender.set_data_channel_is_p2p(true);
+  std::int64_t now = 0;
+  std::uint64_t seq = 1;
+  for (int failure = 1; failure <= 3; ++failure) {
+    expect(sender.consider_dc("media-a", now, 5000), "bounded candidate retry missing");
+    expect(sender.observe(false, "media-a", ++now, 5000), "failed DC did not fall back");
+    auto frame = payload(seq++, now); sender.decorate(frame); sender.note_sent(frame, ControlPath::Wss, now);
+    sender.note_result(response(frame, true, true), now + 1, 5000);
+    const auto delay = 5000 * (1 << (failure - 1));
+    expect(!sender.consider_dc("media-a", now + delay - 1, 5000), "candidate retried before backoff");
+    now += delay;
+  }
+  expect(!sender.consider_dc("media-a", now + 600000, 5000), "exhausted media attempt retried forever");
+  sender.set_data_channel_is_p2p(false); sender.set_data_channel_is_p2p(true);
+  expect(!sender.consider_dc("media-a", now + 600001, 5000), "UI readiness flap reset trial budget");
+  expect(sender.consider_dc("media-b", now + 600002, 5000) && sender.holding_motion(),
+      "new media attempt did not start a bounded neutral trial");
+}
+
+void confirmed_profile_permits_only_one_new_bounded_dc_budget() {
+  ControlTransportSender sender; sender.set_data_channel_is_p2p(true);
+  std::int64_t now = 0;
+  std::uint64_t seq = 1;
+  for (int failure = 1; failure <= 3; ++failure) {
+    expect(sender.consider_dc("media-a", now, 5000), "profile-blocked DC trial missing");
+    auto frame = payload(seq++, now); sender.decorate(frame); sender.note_sent(frame, ControlPath::DataChannel, now);
+    auto rejected = response(frame, false, true); rejected["reason"] = "session_profile_not_ready";
+    expect(sender.note_result(rejected, now + 1, 5000).matched, "profile rejection was not matched");
+    expect(sender.observe(false, "media-a", now + 2, 5000), "profile-blocked DC did not fall back");
+    frame = payload(seq++, now + 3); sender.decorate(frame); sender.note_sent(frame, ControlPath::Wss, now + 3);
+    auto unavailable = response(frame, false, true); unavailable["reason"] = "session_profile_not_ready";
+    expect(sender.note_result(unavailable, now + 4, 5000).matched, "WSS fallback was not selected");
+    now += 2 + 5000 * (1 << (failure - 1));
+  }
+  expect(!sender.consider_dc("media-a", now + 1, 5000), "unconfirmed profile reset the budget");
+  auto moving = payload(seq++, now + 2); moving["throttle"] = 0.5;
+  sender.decorate(moving); sender.note_sent(moving, ControlPath::Wss, now + 2);
+  sender.note_result(response(moving, true, false), now + 3, 5000);
+  expect(!sender.consider_dc("media-a", now + 4, 5000), "moving acceptance reset the budget");
+  auto stale = payload(seq++, now + 5); sender.decorate(stale); sender.note_sent(stale, ControlPath::Wss, now + 5);
+  sender.note_result(response(stale, true, false), now + 1005, 5000);
+  expect(!sender.consider_dc("media-a", now + 1006, 5000), "stale acceptance reset the budget");
+  auto neutral = payload(seq++, now + 1007); sender.decorate(neutral); sender.note_sent(neutral, ControlPath::Wss, now + 1007);
+  expect(sender.note_result(response(neutral, true, false), now + 1008, 5000).matched, "fresh WSS acceptance missing");
+  now += 1009;
+  const auto idle = healthy_idle_input();
+  for (int i = 0; i < 8; ++i) {
+    now += 50;
+    auto frame = payload(seq++, now - 10);
+    sender.decorate(frame);
+    sender.note_sent(frame, ControlPath::Wss, now - 10);
+    sender.note_result(response(frame), now, 5000);
+    sender.observe_wss_upgrade_idle(idle, true, now);
+  }
+  expect(sender.consider_dc("media-a", now, 5000) && sender.holding_motion(),
+      "confirmed profile and idle WSS did not permit a bounded retry");
+  for (int failure = 1; failure <= 3; ++failure) {
+    if (failure > 1) expect(sender.consider_dc("media-a", now, 5000), "second bounded budget ended early");
+    auto frame = payload(seq++, now); sender.decorate(frame); sender.note_sent(frame, ControlPath::DataChannel, now);
+    auto rejected = response(frame, false, true); rejected["reason"] = "session_profile_not_ready";
+    sender.note_result(rejected, now + 1, 5000);
+    sender.observe(false, "media-a", now + 2, 5000);
+    frame = payload(seq++, now + 3); sender.decorate(frame); sender.note_sent(frame, ControlPath::Wss, now + 3);
+    sender.note_result(response(frame, true, true), now + 4, 5000);
+    now += 2 + 5000 * (1 << (failure - 1));
+  }
+  expect(!sender.consider_dc("media-a", now + 600000, 5000), "profile retry became unbounded");
+}
+
+void mock_idle_reprobe_is_fenced_fresh_and_once_per_attempt() {
+  ControlTransportSender sender; sender.set_data_channel_is_p2p(true);
+  std::int64_t now = 0; std::uint64_t seq = 1;
+  for (int failure = 1; failure <= 3; ++failure) {
+    expect(sender.consider_dc("media-a", now, 5000), "initial bounded trial missing");
+    expect(sender.observe(false, "media-a", ++now, 5000), "failed trial did not fall back");
+    auto frame = payload(seq++, now); sender.decorate(frame); sender.note_sent(frame, ControlPath::Wss, now);
+    sender.note_result(response(frame, true, true), now + 1, 5000);
+    now += 5000 * (1 << (failure - 1));
+  }
+  // Fresh neutral WSS results are required for a continuous interval. A
+  // stale loop, owner change, or active input must reset the interval.
+  auto input = healthy_idle_input();
+  auto tick = [&](bool idle, std::uint64_t owner_epoch, std::int64_t step = 50) {
+    now += step;
+    auto frame = payload(seq++, now - 10); sender.decorate(frame); sender.note_sent(frame, ControlPath::Wss, now - 10);
+    expect(sender.note_result(response(frame, true, false), now, 5000).matched, "fresh WSS result missing");
+    input.ui_control_epoch = owner_epoch;
+    sender.observe_wss_upgrade_idle(input, idle, now);
+    sender.observe_mock_idle_reprobe(idle, owner_epoch, now);
+  };
+  for (int i = 0; i < 1205; ++i) { tick(false, 1); expect(!sender.consider_dc("media-a", now, 5000), "active input enabled reprobe"); }
+  for (int i = 0; i < 600; ++i) { tick(true, 1); expect(!sender.consider_dc("media-a", now, 5000), "early idle reprobe"); }
+  tick(true, 2); // ownership handoff restarts the whole idle interval
+  for (int i = 0; i < 600; ++i) { tick(true, 2); expect(!sender.consider_dc("media-a", now, 5000), "owner handoff retained idle time"); }
+  tick(true, 2, 200); // a missed lease-sized observation restarts it too
+  for (int i = 0; i < 1199; ++i) { tick(true, 2); expect(!sender.consider_dc("media-a", now, 5000), "reprobe before 60 seconds"); }
+  tick(true, 2);
+  expect(sender.consider_dc("media-a", now, 5000) && sender.holding_motion() &&
+      sender.status().at("mock_idle_reprobe_used").get<bool>(), "qualified mock reprobe missing its motion fence");
+  expect(sender.observe(false, "media-a", ++now, 5000), "failed mock reprobe did not fall back");
+  auto selected = payload(seq++, now); sender.decorate(selected); sender.note_sent(selected, ControlPath::Wss, now);
+  sender.note_result(response(selected, true, true), now + 1, 5000);
+  for (int i = 0; i < 2405; ++i) { tick(true, 2); expect(!sender.consider_dc("media-a", now, 5000), "mock reprobe exceeded its one-attempt budget"); }
+  expect(sender.consider_dc("media-b", now + 1, 5000) && sender.holding_motion(), "new media attempt did not rearm safely");
+}
+
+void mock_idle_reprobe_requires_all_fresh_neutral_guards() {
+  NativeControlIntentSample sample;
+  sample.active = sample.fresh = sample.refresh_sample_healthy = true;
+  sample.requires_fresh_input = false; sample.ui_control_epoch = 1;
+  sample.intent.critical_video_ready = sample.intent.critical_video_sample_healthy = true;
+  auto eligible = [&](bool enabled = true, bool dc = true, bool waiting = false, bool clock = true) {
+    return mock_idle_reprobe_eligible(enabled, dc, waiting, sample, clock);
+  };
+  expect(eligible(), "healthy neutral mock sample rejected");
+  expect(!eligible(false) && !eligible(true, false) && !eligible(true, true, true) &&
+      !eligible(true, true, false, false), "mock, DC, ACK, or clock guard omitted");
+  auto original = sample;
+  sample.active = false; expect(!eligible(), "inactive owner accepted"); sample = original;
+  sample.fresh = false; expect(!eligible(), "stale input accepted"); sample = original;
+  sample.refresh_sample_healthy = false; expect(!eligible(), "unhealthy refresh accepted"); sample = original;
+  sample.requires_fresh_input = true; expect(!eligible(), "unrearmed input accepted"); sample = original;
+  sample.ui_control_epoch = 0; expect(!eligible(), "missing owner accepted"); sample = original;
+  sample.intent.gear = "D"; expect(!eligible(), "drive gear accepted"); sample = original;
+  sample.intent.throttle = .1; expect(!eligible(), "throttle accepted"); sample = original;
+  sample.intent.estop = true; expect(!eligible(), "emergency accepted"); sample = original;
+  sample.intent.critical_video_ready = false; expect(!eligible(), "unready video accepted"); sample = original;
+  sample.intent.critical_video_sample_healthy = false; expect(!eligible(), "unhealthy video accepted");
+  DriverConfig invalid; invalid.mock_idle_direct_reprobe = true;
+  throws([&] { DriverConsoleRuntime runtime(invalid, "vehicle-001", "fixture"); });
+}
+
+void signatures_bind_native_bytes_and_vehicle_results() {
+  const std::string key = "01234567890123456789012345678901"; // Public test vector, never a deployed key.
+  expect(control_transport_mac("abc", key) == "d5c75dc69d8243aa0882a04342d9ff7c73537a0311a7950800607be225594009", "SHA256 MAC disagrees with independent test vector");
+  auto frame = payload(1, 1000); frame["control_transport"] = stamp(1, 0, ControlPath::DataChannel, 1);
+  frame["native_mac"] = transport_message_mac(frame, key, false);
+  expect(verify_transport_message(Json::parse(frame.dump()), key, false), "original native bytes lost authentication");
+  auto forged = frame; forged["throttle"] = .7;
+  expect(!verify_transport_message(forged, key, false), "page could forge actuation");
+  forged = frame; forged["control_transport"]["epoch"] = 2;
+  expect(!verify_transport_message(forged, key, false), "page could forge a new epoch");
+  forged = frame; forged["unsigned_extension"] = "added-by-page";
+  expect(!verify_transport_message(forged, key, false), "page could add a field to signed bytes");
+  forged = frame; forged["throttle"] = 0; // JS parse/stringify can change 0.0 to 0.
+  expect(!verify_transport_message(forged, key, false), "raw-byte courier requirement was lost");
+  auto result = response(frame); result["vehicle_mac"] = transport_message_mac(result, key, true);
+  expect(verify_transport_message(result, key, true), "vehicle result MAC invalid");
+  auto bounded = bounded_vehicle_control_result(result, "session-001", "vehicle-001", "driver-001");
+  expect(verify_transport_message(bounded, key, true), "cloud canonicalization changed authenticated vehicle result");
+  bounded["accepted"] = false;
+  expect(!verify_transport_message(bounded, key, true), "page could forge vehicle acceptance");
+  expect(!verify_transport_message(frame, key, true), "command signature reflected as vehicle result");
+}
+
+void private_signing_material_is_not_public_session_state() {
+  SignalingServerConfig config;
+  config.driver_passwords = {{"fixture-driver", "fixture-password"}};
+  config.device_tokens = {{"fixture-vehicle", "fixture-device"}};
+  config.driver_vehicle_permissions = {{"fixture-driver", {"fixture-vehicle"}}};
+  SignalingService service(config);
+  const auto post = [&](std::string path, Json body) {
+    HttpRequest request; request.method = "POST"; request.path = path; request.target = path;
+    request.peer_address = "127.0.0.1"; request.body = body.dump();
+    const auto response = service.handle(request);
+    expect(response.status == 200, "fixture cloud POST rejected"); return Json::parse(response.body);
+  };
+  const auto login = post("/auth/driver_login", {{"driver_id", "fixture-driver"}, {"password", "fixture-password"}});
+  const auto online = post("/vehicles/online", {{"vehicle_id", "fixture-vehicle"}, {"device_token", "fixture-device"},
+      {"connection_id", "fixture-runtime"}, {"native_control_capabilities", kNativeControlCapabilities}});
+  const auto session = post("/sessions", {{"driver_id", "fixture-driver"}, {"vehicle_id", "fixture-vehicle"},
+      {"token", login.at("token")}, {"required_control_transport_capability", kControlTransportCapability}});
+  expect(session.at("transport_mac_key").get<std::string>().size() >= 32, "native key not issued");
+  HttpRequest public_state; public_state.method = "GET"; public_state.path = "/sessions/" + session.at("session_id").get<std::string>();
+  public_state.target = public_state.path; public_state.peer_address = "127.0.0.1";
+  public_state.query = {{"actor", "fixture-driver"}}; public_state.headers = {{"x-mine-teleop-driver-token", login.at("token").get<std::string>()}};
+  const auto public_response = service.handle(public_state);
+  expect(public_response.status == 200 && !Json::parse(public_response.body).contains("transport_mac_key"), "public session serializer exposed native signing material");
+  HttpRequest vehicle_state; vehicle_state.method = "GET"; vehicle_state.path = "/vehicles/fixture-vehicle/session";
+  vehicle_state.target = vehicle_state.path; vehicle_state.peer_address = "127.0.0.1";
+  vehicle_state.query = {{"connection_generation", std::to_string(online.at("connection_generation").get<std::uint64_t>())}};
+  vehicle_state.headers = {{"x-mine-teleop-device-token", "fixture-device"}};
+  const auto vehicle_response = service.handle(vehicle_state);
+  expect(vehicle_response.status == 200 && Json::parse(vehicle_response.body).at("transport_mac_key") == session.at("transport_mac_key"),
+      "authenticated vehicle did not receive the same session key");
+}
+
+void bounded_status_rejects_unsupported_kinds_and_scope_mismatch() {
+  Json status = {{"event", "vehicle_control_status"}, {"protocol", kControlTransportCapability},
+      {"session_id", "session-001"}, {"vehicle_id", "vehicle-001"}, {"driver_id", "driver-001"},
+      {"status", {{"event", "vehicle_telemetry"}, {"control_status_seq", 1}}}};
+  expect(bounded_vehicle_control_status(status, "session-001", "vehicle-001", "driver-001").at("status").at("session_id") == "session-001",
+      "authenticated status lost normalized session identity");
+  auto invalid = status; invalid["status"]["driver_id"] = "other";
+  throws([&] { bounded_vehicle_control_status(invalid, "session-001", "vehicle-001", "driver-001"); });
+  for (const auto* identity : {"session_id", "vehicle_id", "driver_id"}) {
+    invalid = status; invalid["status"][identity] = 7;
+    bool rejected = false;
+    try { static_cast<void>(bounded_vehicle_control_status(invalid, "session-001", "vehicle-001", "driver-001")); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected, "non-string status identity did not fail closed with the same scope error");
+  }
+  invalid = status; invalid["status"]["event"] = "control_command";
+  throws([&] { bounded_vehicle_control_status(invalid, "session-001", "vehicle-001", "driver-001"); });
+  invalid = status; invalid["status"]["control_status_seq"] = 0;
+  throws([&] { bounded_vehicle_control_status(invalid, "session-001", "vehicle-001", "driver-001"); });
+  invalid = status; invalid["status"]["oversized"] = std::string(48 * 1024, 'x');
+  throws([&] { bounded_vehicle_control_status(invalid, "session-001", "vehicle-001", "driver-001"); });
+}
+
+void real_service_switch_does_not_disable_watchdog() {
+  auto config = load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  auto adapter = std::make_unique<MockVehicleAdapter>();
+  test::LogicalTimeControlService service(config, "driver-001", "session-001", "fixture", std::move(adapter));
+  service.start(0);
+  SessionControlProfileRequest profile; profile.vehicle_id = "vehicle-001"; profile.driver_id = "driver-001";
+  profile.session_id = "session-001"; profile.control_token = "fixture"; profile.seq = 1;
+  expect(service.receive_session_profile(profile, 0).accepted, "profile not ready");
+  auto value = fence(); auto cmd = command(1, 0); cmd.throttle = .5;
+  expect(admit(value, cmd, nullptr, ControlPath::Wss, 0).admitted && service.receive_command(cmd, 0).accepted, "initial WSS motion failed");
+  auto wire = stamp(1, 0, ControlPath::DataChannel, 2); cmd = command(2, 50); cmd.control_link_ready = false; cmd.operator_input_ready = false;
+  const auto selected = admit(value, cmd, &wire, ControlPath::DataChannel, 50);
+  expect(selected.changed, "selection failed");
+  service.set_control_braking_wait(true, 50, ControlRecoveryCause::ControlLink);
+  const auto braking = service.receive_command(cmd, 50);
+  if (!(braking.accepted && braking.command && braking.command->brake == 1))
+    throw std::runtime_error("switch brake result: " + braking.reason + "; accepted=" + std::to_string(braking.accepted) +
+        "; brake=" + (braking.command ? std::to_string(braking.command->brake) : "no-command"));
+  cmd = command(900, 100); cmd.throttle = .8;
+  expect(!admit(value, cmd, nullptr, ControlPath::Wss, 100).admitted, "old path refreshed watchdog");
+  service.tick(50 + config.control.control_timeout_ms);
+  expect(service.safety_state() == SafetyState::TimeoutBrake && service.session_control_profile().at("active") == false,
+      "transport feature suppressed existing hard timeout/profile clear");
+  service.close();
+}
+
+void bridge_withholds_frame_while_dc_send_not_ready() {
+  DriverConfig config; config.driver_id = "driver-001"; config.signaling_url = "http://127.0.0.1:1";
+  config.browser_event_log_path.clear();
+  DriverConsoleRuntime runtime(config, "vehicle-001", "fixture");
+  const std::string key = "01234567890123456789012345678901";
+  const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  DriverConsoleTransportTestAccess::prepare_bridge_scope(runtime, key, now_ms);
+  DriverConsoleTransportTestAccess::publish_bridge_frame(runtime, payload(7, 1000), now_ms);
+  Json req = {{"source_session_id", "session-001"}, {"source_control_session_generation", 1ULL},
+      {"media_negotiation_id", "media-a"}, {"ui_instance_id", "ui-1"}, {"ui_control_epoch", 1ULL},
+      {"dc_ready", true}, {"dc_network_path", "p2p"}, {"last_seen_seq", 0ULL}};
+  auto invalid = req; invalid["dc_send_ready"] = "invalid";
+  throws([&] { static_cast<void>(runtime.control_transport_bridge(invalid)); });
+  auto blocked = req; blocked["dc_send_ready"] = false;
+  const auto held = runtime.control_transport_bridge(blocked);
+  expect(held.at("enabled") == true && held.at("transport").at("path") == "dc" &&
+      held.at("frame").is_null() && held.at("frame_json").is_null() &&
+      held.at("valid_for_ms").get<std::int64_t>() > 0,
+      "dc_send_ready=false either broke DC readiness or consumed the fresh frame");
+  const auto delivered = runtime.control_transport_bridge(req);
+  expect(delivered.at("frame").is_object() && delivered.at("frame").at("seq") == 7 &&
+      delivered.at("frame_json").is_string(),
+      "held fresh frame was not delivered once dc_send_ready became true");
+  DriverConsoleTransportTestAccess::publish_bridge_frame(
+      runtime, payload(8, 1050), now_ms - detail::kNativeBridgePublicationMaxAgeMs - 1);
+  const auto expired = runtime.control_transport_bridge(req);
+  expect(expired.at("frame").is_null() && expired.at("valid_for_ms") == 0,
+      "expired publication was delivered after drain");
+}
+}  // namespace
+int main() {
+  try {
+    publication_is_owned_only_by_its_current_dc_epoch();
+    driver_negotiates_transient_hold_from_offer();
+    late_dc_results_withdraw_publication_in_result_handler();
+    neutral_required_does_not_postpone_direct_fallback();
+    stale_or_rejected_dc_results_do_not_postpone_direct_fallback();
+    bridge_withholds_frame_while_dc_send_not_ready();
+    rearm_preserves_the_last_accepted_gear_across_routes();
+    failed_direct_trials_back_off_and_exhaust_per_attempt();
+    mock_idle_reprobe_is_fenced_fresh_and_once_per_attempt();
+    mock_idle_reprobe_requires_all_fresh_neutral_guards();
+    confirmed_profile_permits_only_one_new_bounded_dc_budget();
+    version_scope_and_expiry(); single_receiver_epoch_replay_and_emergency(); exact_result_and_neutral_qualification();
+    slower_dc_and_lost_selection(); cloud_ingress_without_vehicle_result_can_only_start_a_neutral_trial(); healthy_proven_p2p_is_preferred_to_a_faster_cloud_backup(); signatures_bind_native_bytes_and_vehicle_results(); private_signing_material_is_not_public_session_state(); bounded_status_rejects_unsupported_kinds_and_scope_mismatch(); real_service_switch_does_not_disable_watchdog();
+    healthy_wss_waits_for_idle_before_returning_to_direct();
+    std::cout << "22 control transport cases passed; real common safety service, no sockets\n";
+  } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+}

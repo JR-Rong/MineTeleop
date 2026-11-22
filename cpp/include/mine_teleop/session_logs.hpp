@@ -21,6 +21,15 @@ Json collect_session_logs(const std::vector<SessionLogSource>& sources,
                           const Json& session, const std::filesystem::path& destination,
                           const std::vector<std::string>& secrets = {},
                           std::stop_token stop = {});
+// Recording evidence is metadata only. It neither includes video files nor
+// changes whether the three requested log sources were collected completely.
+Json session_recording_evidence(const Json& summary, const Json& session,
+                               const Json& attempt_fence = Json());
+Json collect_session_recording_evidence(const std::filesystem::path& recording_root,
+                                       const Json& session,
+                                       const std::vector<std::string>& secrets = {},
+                                       const std::filesystem::path& runtime_snapshot = {},
+                                       bool runtime_source_complete = false);
 Json session_log_chunk(const std::filesystem::path& directory, const Json& manifest,
                        std::string_view name, std::uint64_t offset);
 // Upload retries may only repeat bytes already stored at the same offset.

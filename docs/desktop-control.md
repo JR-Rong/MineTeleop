@@ -22,6 +22,12 @@
 
 ## 构建
 
+本地控制 HTTP 服务只允许回环监听。两个原生入口均遵守此约束；
+请求必须携带数值回环 Host，有 Origin 时须与 Host 的 HTTP origin 完全匹配，
+浏览器跨站请求被拒绝，POST 必须为 `application/json`。无 Origin 的本地
+CLI JSON 调用仍兼容；重复的 Host/Origin/Content-Type/Sec-Fetch-Site 头被拒绝。
+这保护浏览器来源边界，不提供对同一操作系统中恶意本地进程的身份隔离。
+
 先用已有平台脚本生成原生包并解压。开发机使用 Node 22.12+：
 
 ```sh

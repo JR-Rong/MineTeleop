@@ -4,8 +4,10 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <chrono>
+#include <csignal>
 #include <cstdlib>
 #include <cerrno>
 #include <filesystem>
@@ -646,10 +648,251 @@ void test_runtime_operator_parking(double vehicle_brake_limit_bar) {
   ::close(sockets[1]);
 }
 
+void send_diagnostic_feedback(int fd, double actual_torque_nm) {
+  const auto send = [fd](std::uint32_t id, const std::array<std::uint8_t, 8>& data) {
+    can_frame frame{};
+    frame.can_id = id | CAN_EFF_FLAG;
+    frame.can_dlc = 8;
+    std::copy(data.begin(), data.end(), frame.data);
+    expect(::send(fd, &frame, sizeof(frame), 0) == static_cast<ssize_t>(sizeof(frame)),
+           "diagnostic CAN feedback injection failed");
+  };
+  send(0x18F0F5D0U, {0, 5, 0, 0, 0, 0, 0, 0});
+  send(0x18F2F5D0U, {12, 0, 0, 0, 0, 0, 0, 0});
+  send(0x18F3F5D0U, {0x88, 0x13, 0, 0, 0, 0, 0, 0});  // 0 m/s.
+  send(0x18F5F5D0U, {0, 0, 0, 0, 0, 0, 0, 2});
+  send(0x18CFF4D0U, {1, 0, 1, 0, 1, 0, 1, 0});
+  const auto raw_torque = static_cast<std::uint16_t>(std::llround((actual_torque_nm + 3200.0) * 10.0));
+  for (unsigned index = 0; index < 8; ++index) {
+    send(0x18A0F4D0U + index * 0x30000U,
+         {0x40, 0x9F, static_cast<std::uint8_t>(raw_torque & 255U),
+          static_cast<std::uint8_t>(raw_torque >> 8U), 0, 0x7D, 0, 0});
+    send(0x18A1F4D0U + index * 0x30000U, {0x14, 0, 0, 0, 0, 0, 0, 0});
+  }
+  for (unsigned index = 0; index < 4; ++index) {
+    send(0x18C0F4D0U + index * 0x10000U, {1, 0x86, 0x3D, 0, 0, 0, 0, 0});
+    send(0x18C8F4D0U + index * 0x10000U, {0x41, 0x1F, 0, 0, 0x41, 0x1F, 0, 0});
+  }
+}
+
+void test_runtime_traction_diagnostics() {
+  int sockets[2];
+  expect(::socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) == 0, "diagnostic test transport failed");
+  const auto fd = std::to_string(sockets[0]);
+  const std::filesystem::path path("/tmp/mine-teleop-traction-diagnostics-smoke.jsonl");
+  std::filesystem::remove(path);
+  ::setenv("MINE_TELEOP_CHASSIS_TEST_FD", fd.c_str(), 1);
+  ::setenv("MINE_TELEOP_VCU_LOG_PATH", path.c_str(), 1);
+  auto config = valid_v4_config("mt-test", 800);
+  expect(mine_teleop_chassis_open_v4(&config) == 0, "diagnostic runtime open failed");
+  ::unsetenv("MINE_TELEOP_CHASSIS_TEST_FD");
+  ::unsetenv("MINE_TELEOP_VCU_LOG_PATH");
+  auto feedback = runtime_feedback(3, 1, 2, 0.0);
+  expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "diagnostic parked feedback failed");
+  auto profile = valid_runtime_control_config(1, 5.0, 300.0, 100.0);
+  MineTeleopChassisRuntimeControlResultV1 profile_result{};
+  expect(mine_teleop_chassis_configure_runtime_control_v2(&profile, &profile_result) == 0,
+         "diagnostic runtime profile failed");
+  std::array<double, 4> steering{};
+  expect(mine_teleop_chassis_request_parallel_handshake() == 0 &&
+             mine_teleop_chassis_apply_state(3, 0.0, 0.0, steering.data(), steering.size()) == 0 &&
+             wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARALLEL_HANDSHAKE),
+         "diagnostic handshake setup failed");
+  complete_runtime_arming_to_ready(3);
+  feedback = runtime_feedback(5, 3, 1, 0.0);
+  for (int phase = 0; phase < 3; ++phase) {
+    std::size_t traction_batches = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1250);
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (phase == 0) {
+        expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "synthetic feedback failed");
+      } else {
+        send_diagnostic_feedback(sockets[1], phase == 1 ? 0.0 : 300.0);
+      }
+      expect(mine_teleop_chassis_apply_state(3, 5.0, 0.5, steering.data(), steering.size()) == 0,
+             "diagnostics changed traction acceptance");
+      const auto frames = drain_can_frames(sockets[1], 20);
+      for (const auto& frame : frames) {
+        if ((frame.can_id & CAN_EFF_MASK) == 0x18F0D0F5U && can_signal(frame, 8, 16) == 35000) {
+          ++traction_batches;
+        }
+      }
+    }
+    expect(traction_batches >= 10, "diagnostics suppressed the real traction CAN output");
+  }
+  MineTeleopChassisTelemetry telemetry{};
+  expect(mine_teleop_chassis_read_telemetry(&telemetry) == 0 && telemetry.estop == 0 &&
+             telemetry.stop_reason == MINE_TELEOP_CHASSIS_STOP_REASON_NONE,
+         "a diagnostic observation changed the safety/control state");
+  expect(mine_teleop_chassis_disconnect_parallel_handshake() == 0,
+         "diagnostic fixture disarm request failed");
+  complete_runtime_disarm(3, "traction diagnostics");
+  expect(mine_teleop_chassis_close() == 0, "diagnostic runtime close failed");
+  ::close(sockets[0]);
+  ::close(sockets[1]);
+  const auto events = read_json_lines(path);
+  int diagnostics_count = 0;
+  bool no_response_found = false;
+  bool ended_found = false;
+  for (const auto& event : events) {
+    if (event.value("name", "") != "traction_diagnostics") continue;
+    ++diagnostics_count;
+    if (event.value("observation", "") == "nonzero_tx_zero_torque_feedback") {
+      no_response_found = true;
+      expect(event.value("socket_motor_feedback_mask", 0) == 255 &&
+                 event.value("fresh_motor_mask", 0) == 255 &&
+                 event.value("zero_feedback_motor_mask", 0) == 255 &&
+                 event.value("observed_duration_ms", 0) >= 1000 &&
+                 event.value("send_ok", false) && event["blocking_conditions"].empty() &&
+                 event["tx_motor_torque_nm"][0] == 300.0 &&
+                 event["tx_parking_request"][0] == 1 &&
+                 event["feedback"]["motor_torque_nm"][0] == 0.0 &&
+                 event["feedback"]["motor_current_a"][0] == 0.0 &&
+                 event["feedback"]["motor_inverter_status"][0] == 4 &&
+                 event["feedback"]["brake_pressure_bar"][0] == 50.0,
+             "session59/62 diagnostic was wrong or relied on synthesized zero torque");
+    } else if (event.value("observation", "") == "observation_ended") {
+      ended_found = true;
+    }
+  }
+  expect(no_response_found && ended_found && diagnostics_count <= 12,
+         "sustained no-response/ending diagnostics were missing or emitted at CAN frequency");
+  std::filesystem::remove(path);
+}
+
+class MockCanDrain {
+ public:
+  explicit MockCanDrain(int descriptor) : worker_([this, descriptor] {
+    while (!stopped_.load()) {
+      can_frame frame{};
+      while (::recv(descriptor, &frame, sizeof(frame), MSG_DONTWAIT) > 0) {}
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }) {}
+  ~MockCanDrain() { stop(); }
+  void stop() {
+    stopped_.store(true);
+    if (worker_.joinable()) worker_.join();
+  }
+ private:
+  std::atomic<bool> stopped_{false};
+  std::thread worker_;
+};
+
+void test_runtime_safe_exit_results() {
+  // The same production BridgeRuntime/SocketCan/VCU objects run here. Only the
+  // transport is an adopted AF_UNIX datagram pair; no CAN device is opened.
+  for (int scenario = 0; scenario < 3; ++scenario) {
+    int transport[2]{-1, -1};
+    expect(::socketpair(AF_UNIX, SOCK_DGRAM, 0, transport) == 0,
+        "safe-exit datagram transport creation failed");
+    MockCanDrain drain(transport[1]);
+    const auto path = std::filesystem::path(
+        "/tmp/mine-teleop-safe-exit-" + std::to_string(scenario) + ".jsonl");
+    std::error_code error;
+    std::filesystem::remove(path, error);
+    ::setenv("MINE_TELEOP_VCU_LOG_PATH", path.c_str(), 1);
+    const auto descriptor = std::to_string(transport[0]);
+    ::setenv("MINE_TELEOP_CHASSIS_TEST_FD", descriptor.c_str(), 1);
+    auto config = valid_v4_config("mt-test");
+    expect(mine_teleop_chassis_open_v4(&config) == 0, "safe-exit runtime open failed");
+    ::unsetenv("MINE_TELEOP_CHASSIS_TEST_FD");
+    ::unsetenv("MINE_TELEOP_VCU_LOG_PATH");
+    auto feedback = runtime_feedback(3, 1, 2, 0.0);
+    expect(mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+        mine_teleop_chassis_request_parallel_handshake() == 0,
+        "safe-exit initial parking/handshake failed");
+    expect(wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARALLEL_HANDSHAKE),
+        "safe-exit runtime did not reach its handshake wait");
+    expect(mine_teleop_chassis_disconnect_parallel_handshake() == 0 &&
+        wait_for_handshake_state(MINE_TELEOP_VCU_DISARM_MANUAL),
+        "safe-exit runtime did not await new manual parking feedback");
+    if (scenario == 1) {
+      // The duplicated descriptor belongs to the same socket. Shut down only
+      // its write side before the final confirmation to fail the last batch;
+      // receive stays alive, so the production close deadline is exercised.
+      expect(::shutdown(transport[0], SHUT_WR) == 0,
+          "final CAN write fault injection failed");
+    }
+    if (scenario != 0) {
+      expect(mine_teleop_chassis_update_feedback(&feedback) == 0,
+          "safe-exit new manual/N/zero/park feedback injection failed");
+      if (scenario == 1) {
+        expect(wait_until([&] {
+          MineTeleopChassisHandshakeStatus status{};
+          expect(mine_teleop_chassis_read_handshake_status(&status) == 0,
+              "failed final-batch status read failed");
+          expect(status.state != MINE_TELEOP_VCU_DISARMED,
+              "operator-facing exit completed before a successful final CAN batch");
+          return status.state == MINE_TELEOP_VCU_FAULT;
+        }, 500), "failed last CAN batch did not latch the existing transport fault");
+      } else {
+        expect(wait_for_handshake_state(MINE_TELEOP_VCU_DISARMED),
+            "safe-exit new feedback plus final CAN write did not complete");
+      }
+    }
+    const auto started = std::chrono::steady_clock::now();
+    const int result = mine_teleop_chassis_close();
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    expect(result == (scenario == 0 ? -ETIMEDOUT : (scenario == 1 ? -EIO : 0)),
+        "safe-exit result hid missing feedback or failed last CAN write: " +
+            std::to_string(result));
+    expect(mine_teleop_chassis_close() == 0, "already closed bridge was not idempotent");
+    drain.stop();
+    ::close(transport[0]);
+    ::close(transport[1]);
+    const auto events = read_json_lines(path);
+    const auto completes = std::count_if(events.begin(), events.end(), [](const auto& event) {
+      return event.value("name", "") == "disarm_complete";
+    });
+    if (scenario != 2) {
+      expect(completes == 0, "failed safe exit was reported as complete");
+      expect(elapsed_ms >= 14900, "safe-exit test changed the production 15-second budget");
+      expect(std::any_of(events.begin(), events.end(), [result](const auto& event) {
+        return event.value("name", "") == "disarm_timeout" &&
+            event.value("result", 0) == result &&
+            event.value("safety_action", "") == "safe_exit_unconfirmed" &&
+            event.value("operator_action", "").find("Exit is incomplete") != std::string::npos;
+      }), "safe-exit failure did not tell the operator that confirmation is incomplete");
+      if (scenario == 1) {
+        expect(std::any_of(events.begin(), events.end(), [](const auto& event) {
+          return event.value("kind", "") == "can_tx_batch" &&
+              event.value("state", "") == "disarmed" && !event.value("send_ok", true);
+        }), "last-CAN failure test did not run the production Disarmed transmit path");
+      }
+    } else {
+      expect(completes == 1, "successful safe exit did not complete exactly once");
+      auto completion = events.end();
+      auto final_batch = events.end();
+      for (auto iterator = events.begin(); iterator != events.end(); ++iterator) {
+        if (iterator->value("name", "") == "disarm_requested") final_batch = events.end();
+        if (iterator->value("kind", "") == "can_tx_batch" &&
+            iterator->value("state", "") == "disarmed" &&
+            iterator->value("send_ok", false)) final_batch = iterator;
+        if (iterator->value("name", "") == "disarm_complete") completion = iterator;
+      }
+      expect(final_batch != events.end() && completion != events.end() && final_batch < completion,
+          "safe-exit completion preceded its successful post-close final batch");
+    }
+    std::cout << "safe_exit_scenario=" << scenario << " result=" << result
+              << " elapsed_ms=" << elapsed_ms << '\n';
+    std::filesystem::remove(path, error);
+  }
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  // A deliberately shut-down AF_UNIX mock write must return EPIPE to the
+  // production send path instead of terminating this fault-injection process.
+  std::signal(SIGPIPE, SIG_IGN);
   try {
+    if (argc == 2 && std::string(argv[1]) == "--safe-exit-only") {
+      test_runtime_safe_exit_results();
+      std::cout << "chassis_bridge_safe_exit=passed\n";
+      return 0;
+    }
     expect(
         mine_teleop_chassis_abi_version() == 6U &&
             mine_teleop_chassis_open_config_v2_size() ==
@@ -1911,6 +2154,25 @@ int main() {
     ::close(transport[1]);
 
     const auto runtime_events = read_json_lines(runtime_log_path);
+    const auto startup = std::find_if(runtime_events.begin(), runtime_events.end(), [](const auto& event) {
+      return event.value("name", "") == "session_start";
+    });
+    expect(startup != runtime_events.end() && startup->value("chassis_source_sha256", "").size() == 64 &&
+               startup->value("traction_observation_delay_ms", 0) == 1000,
+           "bridge source identity or diagnostic timing was missing");
+    bool gates_observed = false;
+    for (const auto& event : runtime_events) {
+      if (event.value("name", "") != "traction_diagnostics") continue;
+      gates_observed = true;
+      expect(event.value("diagnostic_only", false) && event.contains("blocking_conditions") &&
+                 event.contains("intent_generation") && event.contains("cycle") &&
+                 event.contains("tx_motor_torque_nm") && event.contains("motor_feedback_age_ms") &&
+                 event["feedback"].contains("motor_current_a") &&
+                 event["feedback"].contains("motor_fault_level") &&
+                 event["feedback"].contains("brake_fault_code"),
+             "production bridge diagnostic did not capture gates, actual TX, and decoded RX together");
+    }
+    expect(gates_observed, "production bridge did not emit traction diagnostics");
     expect(
         count_logged_events(runtime_log_path, "control_apply_timeout") ==
             preexisting_control_apply_timeouts + 2,
@@ -2295,6 +2557,30 @@ int main() {
     ::close(pressure_transport[0]);
     ::close(pressure_transport[1]);
     const auto pressure_events = read_json_lines(pressure_log_path);
+    std::size_t final_park_batch = pressure_events.size();
+    std::size_t disarm_complete = pressure_events.size();
+    for (std::size_t index = 0; index < pressure_events.size(); ++index) {
+      const auto& event = pressure_events[index];
+      if (event.value("kind", "") == "can_tx_batch" &&
+          event.value("state", "") == "disarmed" &&
+          event.value("send_ok", false)) {
+        bool parked = false;
+        bool neutral = false;
+        for (const auto& frame : event.at("frames")) {
+          if (frame.value("id", "") == "0x18FBD0F5") {
+            parked = frame.value("data", "") == "02 02 02 02 00 00 00 00";
+          }
+          if (frame.value("id", "") == "0x18FCD0F5") {
+            neutral = frame.value("data", "") == "00 01 00 00 00 00 00 00";
+          }
+        }
+        expect(parked && neutral, "final disarmed CAN batch withdrew EPB park or N");
+        if (final_park_batch == pressure_events.size()) final_park_batch = index;
+      }
+      if (event.value("name", "") == "disarm_complete") disarm_complete = index;
+    }
+    expect(final_park_batch < disarm_complete,
+        "close reported disarm_complete before a successful parked CAN batch");
     expect(
         std::any_of(
             pressure_events.begin(),
@@ -2416,8 +2702,44 @@ int main() {
                 MINE_TELEOP_CHASSIS_STOP_REASON_SESSION_LOST,
         "session-loss stop context was not consumed by the next stop action");
     expect(
-        mine_teleop_chassis_close() == 0,
-        "arming-watchdog runtime did not close cleanly");
+        wait_for_handshake_state(MINE_TELEOP_VCU_DISARM_MANUAL),
+        "initial-arming session loss did not withdraw the handshake into manual disarm");
+    const auto session_stop_frames = drain_can_frames(arming_transport[1], 40);
+    MineTeleopChassisHandshakeStatus session_exit_status{};
+    expect(
+        mine_teleop_chassis_read_handshake_status(&session_exit_status) == 0 &&
+            session_exit_status.state == MINE_TELEOP_VCU_DISARM_MANUAL &&
+            session_exit_status.disarming == 1,
+        "initial-arming session loss reused its pre-stop manual parking feedback");
+    expect_all_motor_torque_raw(
+        session_stop_frames, 32000, "initial-arming session-loss exit");
+    expect_all_brake_pressure_raw(
+        session_stop_frames, 4095, "initial-arming session-loss exit");
+    for (unsigned channel = 0; channel < 4; ++channel) {
+      expect(
+          can_signal(
+              last_frame_with_id(session_stop_frames, 0x18FBD0F5U),
+              channel * 8U,
+              2) == 2,
+          "initial-arming session-loss exit withdrew an EPB parking request");
+    }
+    {
+      // A real peer consumes transmitted frames while reporting its new
+      // manual/N/zero-speed/park confirmation. Keep the AF_UNIX mock peer
+      // draining throughout confirmation and close so queue saturation does
+      // not inject an unrelated transport fault into this recovery case.
+      MockCanDrain session_exit_drain(arming_transport[1]);
+      feedback = runtime_feedback(3, 1, 2, 0.0);
+      drive_runtime_disarm_phase(
+          MINE_TELEOP_VCU_DISARM_MANUAL,
+          MINE_TELEOP_VCU_DISARMED,
+          feedback,
+          "initial-arming session-loss recovery",
+          "manual-parking confirmation");
+      expect(
+          mine_teleop_chassis_close() == 0,
+          "arming-watchdog runtime did not close cleanly");
+    }
     ::close(arming_transport[0]);
     ::close(arming_transport[1]);
     const auto arming_events = read_json_lines(arming_log_path);
@@ -2426,6 +2748,36 @@ int main() {
           return event.value("name", "") == "arming_feedback_timeout";
         }) == 1,
         "initial arming feedback deadline did not latch/log exactly once");
+    auto session_close_requested = arming_events.end();
+    auto session_final_batch = arming_events.end();
+    auto session_close_completed = arming_events.end();
+    for (auto event = arming_events.begin(); event != arming_events.end(); ++event) {
+      if (event->value("name", "") == "disarm_requested") {
+        session_close_requested = event;
+        session_final_batch = arming_events.end();
+      }
+      if (session_close_requested != arming_events.end() &&
+          session_final_batch == arming_events.end() &&
+          event->value("kind", "") == "can_tx_batch" &&
+          event->value("state", "") == "disarmed" &&
+          event->value("send_ok", false)) {
+        session_final_batch = event;
+      }
+      if (event->value("name", "") == "disarm_complete") {
+        session_close_completed = event;
+      }
+    }
+    expect(
+        session_close_requested != arming_events.end() &&
+            session_final_batch != arming_events.end() &&
+            session_close_completed != arming_events.end() &&
+            session_close_requested < session_final_batch &&
+            session_final_batch < session_close_completed &&
+            std::none_of(arming_events.begin(), arming_events.end(), [](const auto& event) {
+              return event.value("name", "") == "disarm_timeout";
+            }),
+        "initial-arming session-loss close lacked a successful post-request final safe batch");
+    std::cout << "case_id=arming_session_loss_fresh_feedback_final_batch result=passed\n";
     std::filesystem::remove(arming_log_path, error);
 
     int physical_transport[2]{-1, -1};
@@ -2660,6 +3012,8 @@ int main() {
 
     test_runtime_operator_parking(327.6);
     test_runtime_operator_parking(60.0);
+    test_runtime_traction_diagnostics();
+    test_runtime_safe_exit_results();
     std::cout << "chassis_bridge_diagnostics_smoke=passed\n";
     return 0;
   } catch (const std::exception& error) {

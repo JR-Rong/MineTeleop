@@ -17,13 +17,25 @@ runtime:
   control_log_commands: true
   teleop_poll_interval_ms: 500
   media_frame_timeout_ms: 3000
+  critical_camera_stale_brake_ms: 500
+  control_recovery_timeout_ms: 5000
   media_capture_interval_ms: 0
 
 control:
   rate_hz: 20
   max_command_gap_ms: 200
   degraded_timeout_ms: 300
-  control_timeout_ms: 800
+  # Hard watchdog; transient_hold may spend up to max_hold_ms of it before the staged stop.
+  control_timeout_ms: 1200
+  bridge_apply_timeout_ms: 800
+  transient_hold:
+    enabled: true
+    max_hold_ms: 700
+    hold_brake: 0.15
+    resume_fresh_commands: 2
+    budget_window_ms: 60000
+    max_holds_per_window: 6
+    max_hold_time_per_window_ms: 3000
   timeout_action:
     deceleration_profile:
       - after_ms: 0
@@ -177,7 +189,7 @@ field_safety:
   require_can_feedback_before_control: true
   require_local_estop_reset: true
   require_time_sync: true
-  max_time_sync_uncertainty_ms: 25
+  max_time_sync_uncertainty_ms: 100
   time_sync_interval_ms: 30000
   time_sync_samples: 7
 

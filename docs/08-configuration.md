@@ -72,6 +72,8 @@ runtime:
   control_log_commands: true
   teleop_poll_interval_ms: 500
   media_frame_timeout_ms: 3000
+  critical_camera_stale_brake_ms: 500
+  control_recovery_timeout_ms: 5000
   media_capture_interval_ms: 0
 
 cloud:
@@ -83,8 +85,9 @@ cloud:
 ```
 
 `runtime.media_frame_timeout_ms` 是单路采集等待下一帧的超时，默认 `3000 ms`，
-必须为正数。对关键相机而言，这也是“持续无帧”被确认成采集故障前的默认安全确认
-窗口；它不是浏览器显示的端到端时延预算，后者由
+必须为正数。它控制采集源何时报错并进行有限重开，与关键视频安全门限分开；
+关键画面无新帧默认 500 ms 进入制动等待，等待 5 s 未恢复再安全停车。
+它不是浏览器显示的端到端时延预算，后者由
 `hardware.encoding.max_end_to_end_latency_ms` 单独约束。
 
 `runtime.control_log_commands=true` 会把通过车端 control-only WSS 收到并解析的控制命令约每秒汇总为一条
@@ -128,16 +131,8 @@ cloud:
   auth_url: https://teleop.example.com/auth
   device_cert: /etc/mine-teleop/certs/vehicle.crt
   device_key: /etc/mine-teleop/certs/vehicle.key
-
-ice:
-  stun_servers:
-    - stun:turn.example.com:3478
-  turn_servers:
-    - url: turn:turn.example.com:3478?transport=udp
-      username: mine-teleop
-      credential_mode: turn_rest
-      static_auth_secret_file: /etc/mine-teleop/turn-static-auth.secret
-      credential_ttl_seconds: 600
+  # 0 保持原有 ICE 并发选路；例如 3000 启用一次直连优先、失败后允许 TURN 的重试。
+  ice_direct_timeout_ms: 0
 
 control:
   rate_hz: 20
@@ -145,6 +140,11 @@ control:
   max_command_gap_ms: 200
   degraded_timeout_ms: 300
   control_timeout_ms: 800
+  # 可选。底盘桥自己的 apply 看门狗，缺省等于 control_timeout_ms。
+  # bridge_apply_timeout_ms: 800
+  # 可选。瞬态链路保持，缺省关闭；开启方式见本文“瞬态链路保持参数”。
+  # transient_hold:
+  #   enabled: true
   # 非 mock 车辆适配器必须提供该标定证据，且 control_timeout_ms 不能超过上限。
   timeout_calibration:
     max_control_timeout_ms: 900
@@ -321,11 +321,14 @@ pipeline。控制端按车端 offer 中实际声明的轨道逐路渲染，云�
 `reopen_attempts` 表示同一次媒体运行尝试内、单路采集源允许重开的次数，默认 `3`，
 范围 `0..10`；设为 `0` 时首个采集故障直接禁用该 lane。计数不会因中途成功取帧
 而无限重置，因此不会形成无界重开循环。`reopen_backoff_ms` 是每次重开前的退避，
-默认 `500 ms`，范围 `0..60000 ms`。关键相机的首个已确认故障会立即锁止控制并
-触发本地安全停车，同时只重开故障 lane。相机恢复只恢复视频；控制锁存跨同一云端
-session 内的 `VehicleMediaRuntime` 重建保持不变。必须结束当前 session，在新 session
-中重新建立 profile/VCU/status DataChannel 与 control-only WSS，并重新完成 VCU 握手后
-才能恢复驾驶权限。V4L2 设备路径
+默认 `500 ms`，范围 `0..60000 ms`。关键相机的已确认采集故障立即进入制动等待；
+持续无编码帧或驾驶端无新显示帧默认 500 ms 进入同一等待。制动等待保留会话、
+参数修订号与 VCU 控制服务，撤牵引并使用独立安全制动。故障 lane 仍做有限重开。
+全部关键编码/显示恢复至少 3 帧，且持续健康 300 ms 后退出等待；必须释放旧运动输入，
+提供新零输入后重新按键，禁止自动恢复此前牵引。制动等待的 5 s 截止时间不会因
+重开、偶发一帧或同会话 runtime 重建而延长；超时仍锁定本会话并进入安全停车。
+控制链路持续无有效命令的 800 ms、物理急停、CAN 和公共控制传输故障保护仍独立生效。
+V4L2 设备路径
 在 USB 拔插或 udev 重建期间
 暂时不存在时，仍按 `reopen_attempts` 做有限重试；永久路径错误应由启动 preflight
 报告。非关键相机在重开额度耗尽后只禁用自身 lane，其他视频和当前控制不受影响。
@@ -363,6 +366,13 @@ MJPEG/testsrc/vendor pipeline 保持原状。`VIDIOC_S_PARM` 成功返回后，�
 `timeperframe` 分子、分母必须非零，且必须精确等于配置的 `1/capture_fps`；驱动返回
 其它速率时启动失败并报告 `camera_ccg2_fps_mismatch`，不会按近似值继续运行。
 
+要请求 20/25 Hz 直接采集，将每路 `capture_fps` 与使用的 realtime profile `fps`
+同时设为 20/25；匹配时不添加 `videorate`。请求是否成功应检查启动协商值与
+`vehicle_camera_capture_sample` 的 5 s 实测交付帧率。V4L2 允许驱动跳帧实现速率，
+因此这些值不能证明传感器曝光或级联触发已降频，仍需板卡/驱动厂商核验。
+关键视频的毫秒制动/恢复门限不随 FPS 自动延长；20 Hz 正常帧间隔是 50 ms，
+25 Hz 是 40 ms。现场配置保持原值，修改前需在停车台架上确认支持的模式。
+
 示例的 `hardware.encoding` 有意使用 `preferred_encoder: vaapi`、
 `fallback_encoder: nvenc`。Ubuntu 22.04/GStreamer 1.20.3 的目标机上，RTX 2000 Ada
 NVCodec 会在运行期报告 `Selected preset not supported`，而 Intel VAAPI 已用同一
@@ -391,6 +401,15 @@ CAN netdev 置为 DOWN：部署阶段仍需先用 `ip link` 按配置设置波�
 `fallback_codec=h264` 定义浏览器支持范围内的 codec 顺序。`media-probe` 直接检查随包
 GStreamer factory，`max_end_to_end_latency_ms` 与 `min_realtime_fps` 用于车端和浏览器
 验收汇总。DRI 节点变化只修改本节配置，不依赖宿主机 FFmpeg。
+
+Jetson Orin NX 也使用 `nvenc` 后端：桌面 `nvh264enc`/`nvautogpuh264enc`
+不可用时，检查 `nvv4l2h264enc`（H.265 对应 `nvv4l2h265enc`）。Jetson 分支用
+`nvvidconv` 将输入转为 NVMM/NV12，将 kbit/s 换算为 bit/s，使用其自己的 CBR、
+I/IDR 间隔、无 B 帧和时间戳复制参数；不向它传入桌面 NVENC 的 `preset=p1`
+或 `tune` 参数。参见 `configs/vehicle-agent.orin-nx-isx031-bench.yaml`：它保持 mock、
+零速、关闭录像和上传，并强制硬件编码，不会静默回退 CPU。插件可创建不等于
+硬件可用，仍需真实帧编码、IDR/PTS 和接收端验证。当前采集、色彩转换和缩放仍有
+CPU 处理，不宣称全链路 zero-copy，也不改变原有队列或安全门槛。
 
 `hardware.network.interface` 会进入弱网矩阵和目标主机验收脚本。`field_safety` 用来记录现场
 安全链路的最低门禁：调试阶段、目标车速、牵引转矩满量程、是否必须先收到 CAN feedback、
@@ -605,6 +624,32 @@ ChassisControl `chassis_control` 动态库；MinePilot `include/can/can_common.h
 
 `control_timeout_ms` 不能只按网络体验调大。配置前必须结合车速上限、独立安全制动动作、坡道/松散路面和矿区安全距离，反推允许的最大控制超时。本地参考实现会在非 `mock` 车辆适配器配置中要求 `timeout_calibration` 标定证据，并拒绝超过标定上限的 `control_timeout_ms`。
 
+### 瞬态链路保持参数
+
+`control.bridge_apply_timeout_ms`：整数，20–60000，不大于 `control_timeout_ms`，不小于
+`field_safety.speed_feedback_timeout_ms`；缺省等于 `control_timeout_ms`（旧配置行为不变）。传给底盘桥的 apply
+看门狗，用来检测车端进程卡死。把 `control_timeout_ms` 放宽后它仍可保持较短。
+
+`control.transient_hold`：可选块，**缺省关闭**（没有该块、块为空、`enabled: false` 都是关闭）。字段、范围、默认值：
+
+| 字段 | 默认 | 范围 | 含义 |
+| --- | --- | --- | --- |
+| `enabled` | `false` | 布尔 | 总开关；还需要驾驶端声明 `transient-hold-v1` 才会生效 |
+| `max_hold_ms` | `700` | 100–1500 | 单次保持上限，超出升级为制动等待 |
+| `hold_brake` | `0.15` | 0–0.3 | 保持期间的最小制动（归一化），与驾驶员制动取较大值 |
+| `resume_fresh_commands` | `2` | 1–5 | 恢复所需的连续新鲜命令数 |
+| `budget_window_ms` | `60000` | 10000–600000 | 频次预算的滑动窗口 |
+| `max_holds_per_window` | `6` | 1–100 | 窗口内最多保持次数，第 N+1 次升级 |
+| `max_hold_time_per_window_ms` | `3000` | 100–`budget_window_ms` | 窗口内累计保持时长上限 |
+
+启动校验（任一不满足即拒绝启动并指出字段）：各字段在上述范围内；块内出现未知键（拼写错误不会静默回到默认值）；
+`transient_hold` 不是映射；开启时 `degraded_timeout_ms + max_hold_ms + 100 ≤ control_timeout_ms`。
+现场配置（`vehicle-agent.three-machine.field.yaml`、`vehicle-agent.ccg2-8m.yaml`）显式开启，并设
+`control_timeout_ms: 1200`、`bridge_apply_timeout_ms: 800`；开发、台架和 Orin 示例配置不变，保持关闭。
+生效值出现在 `config-check` 和启动日志的 `effective_vehicle_config` 里（`control_timeout_ms`、`bridge_apply_timeout_ms`、
+`transient_hold.{enabled,max_hold_ms,hold_brake}`）。运行时行为和安全约束见
+[控制与安全](07-control-and-safety.md) 的“瞬态链路保持”。
+
 ## 驾驶端配置示例
 
 控制台启动后，在网页填写驾驶员 ID 和密码。旧配置的 `driver.id` 仅保留为原生开发接口兼容项；网页 `/api/login` 必须同时提交两个字段，不使用默认密码。退出成功后清除内存密码；切换账号必须先退出，网络故障导致退出失败时保留原身份供重试。
@@ -739,6 +784,39 @@ profile/握手门禁和实际 apply。任何单侧“已提交”或“已发送
 ACK。现场三机配置启用此项，并使用 `16 MiB × 4` 轮转容量；复现完成后应按现场保留
 策略归档或删除。
 
+## ICE 配置来源与直连回退
+
+车端和网页从经过认证的信令接口 `/sessions/{session_id}/ice_servers` 取得相同的
+ICE 服务列表。STUN/TURN 地址在信令服务的 `--stun-urls` / `--turn-urls` 配置，
+短期 TURN 凭据由服务端签发；不在车辆 YAML 保存 TURN secret。
+历史示例中的 `ice.stun_servers` / `ice.turn_servers` 从未被 C++ 读取，现已删除；
+如旧配置还含这两个键，加载时会明确报错，要求迁移到信令服务，避免继续静默忽略。
+
+`cloud.ice_direct_timeout_ms` 范围为 0–30000，默认 0 保持既有同时收集候选的行为。
+设为正数且信令提供 TURN、`cloud.ice_transport_policy` 非 `relay` 时：首次 offer
+携带 `ice_route_mode: direct`，两端暂不配置 TURN，车端过滤远端 SDP/trickle 的 relay。
+从 matching answer 成功应用后起计时，未连接超时或连接状态 terminal failed 时，
+先执行已有 `stop_pipeline`，关闭控制服务与旧 Peer，再用相同编码器发起新代际 offer
+(`ice_route_mode: all`)，允许 TURN。车端在安全关闭后、网页/原生接收端在新代际协商时重新获取短期凭据，
+避免长时间直连后回退使用已过期 credential；迟到的获取结果受代际围栏保护。
+每次媒体 runtime 最多一次这种回退，
+不承诺新尝试一定成功，也不会继承旧控制就绪状态。未收到 answer 是信令问题，不启动
+此计时；没有 TURN 时不进行无意义重试。强制 relay 配置保持强制 relay。
+
+这不是原 Peer 的 `restartIce()`，不实现健康 relay 的周期性直连升级或基于 RTT/丢包
+阈值的自动重协商。双栈候选由 WebRTC/libnice 收集和检查，产品没有禁用公网 IPv6；
+最终使用哪个地址族以选中候选对为准。不能根据设置支持双栈就认定当前运营商可达。
+GStreamer 的 `stun-server` 属性仅配置列表中第一个 STUN，TURN 则逐项配置；浏览器可使用
+整个列表。固定地址族 A/B 应使用对应族可达的同一 STUN 服务，不能假定原生同时完成
+两族、多 STUN 映射探测。公网 IPv6 host 不需要先形成 srflx。
+
+产品事件 `vehicle_ice_configuration` 明确记录配置来源、STUN/TURN 是否应用与 route mode；
+每代前 64 个本地/远端候选记录类型、UDP/TCP、地址族、地址类别；
+`vehicle_ice_selected_pair` / `media_negotiation.selected_pair` 记录实际连接对与变更计数；
+`vehicle_ice_connected` 记录连接里程碑，`vehicle_ice_relay_fallback` 记录回退。
+新增候选诊断不含地址、端口、ufrag 或凭据。`peer_connected_observed` 不代表视频新鲜或
+控制可以恢复；原安全门禁仍必须满足。
+
 ## 配置校验
 
 启动时必须校验：
@@ -850,7 +928,7 @@ fps/低分辨率 profile，pipeline hook 成功后才更新活动状态。
 默认现场车辆对应 5 km/h、油门比例 0.5、转向 30°、320 Nm、163.8 bar。
 
 页面“无操作自动驻车”取值 0–1 秒，默认 0.5 秒；线协议为整数
-`parking_idle_timeout_ms`（0–1000），属于 `profile_version=4` 的完整会话快照。
+`parking_idle_timeout_ms`（0–1000），属于 `profile_version=6` 的完整会话快照。
 修改延时必须在 N 挡、零速、EPB 驻车、VCU standby/disarmed 时重新确认参数。
 
 首次握手在收到状态 5 后请求释放四路 EPB，等待四路新鲜反馈全部为 1（释放），
@@ -877,3 +955,44 @@ CAN 前拒绝启动，旧会话参数不会被默默按新行为解释。本地�
 两路均为控制关键相机，使用 `/dev/ccg2-channel-0` 和 `-1` 稳定节点。
 内核驱动、稳定链接及板卡初始化须由目标主机提供；这些前提不由 YAML 自动安装。
 开发用 mock/testsrc 配置仍用于无硬件测试，不作为发布默认值。
+
+
+控制端“当前会话驾驶与 PID 参数”中的 `consecutive_late_frame_limit` 为连续迟到帧数，
+默认 3，可选整数 1–5。修改该项需 N 挡、零速、电子驻车及 standby/disarmed（或隔离 mock 台架），
+并等待车端精确确认 V7 会话快照。旧版车端不支持 V7 时会拒绝，不会静默采用其他阈值。
+车端对超过 200 ms 的命令始终丢弃，只累计新的、身份和令牌有效的序号；重复与乱序包不增加计数。
+未达阈值时，新有效帧清除计数，300 ms 降级撤牵引可在当前会话内恢复；达到阈值时要求新零输入，
+释放方向键后重新按下即可恢复。1 帧保留原先首次控制间隔超限也要求重新输入的行为。
+800 ms 持续没有有效执行的控制命令仍撤销参数并安全停车，过期包不会重置此期限。
+物理急停、硬件故障、关键相机故障及其他安全门控保持原有处理。
+
+原生控制 WebSocket 的车端 delivery ACK 新增独立 `control_feedback`，由已认证车辆报告
+命令序号、是否接受、是否要求零输入及控制状态序号。云端每会话仅保留最新一条，随下次驾驶端
+入口 ACK 通过 `vehicle_control_feedback` 返回；入口 ACK 本身仍仅表示云端收到了命令。
+驾驶端收到重新输入通知后立即清零当前原生输入，并将状态序号返回页面，避免延后的媒体通知重复清除新输入。
+这条恢复通知需要云端、车端和驾驶端同时更新。
+
+诊断中 `control_timing_decision` 记录连续迟到计数、确认阈值、重新输入状态和最后有效控制年龄；
+`websocket_receive_loop` 记录两次接收调用之间的间隔与本次等待时间，帮助区分接收线程未及时调用和等待数据。
+日志仍不能单独证明无线丢包或 TCP 重传，需结合网络采样。诊断写入现有有界异步队列。
+
+
+800 ms 控制超时从车端最后一次成功接受并应用控制命令起算，收到过期、重复、错身份或被门禁拒绝的包
+不会重置这个时间。不按键时仍由原生控制端周期发送零输入心跳，车端接受这些心跳，因此不会因为
+“800 ms 没按键”触发链路故障；无操作自动驻车是独立的 `parking_idle_timeout_ms`（默认 500 ms）。
+可恢复迟到期间，控制端只阻止旧牵引/转向输入继续生效，保留同一输入租约内仍按住的 Space/B 或手柄刹车；
+新鲜的仅制动输入可以续期并送到车端，但不解除运动输入锁。释放制动并提供完整零输入后才解除运动输入锁。
+真实输入租约过期、页面替换、失焦、急停或权限撤销仍执行原有保护，不把过期刹车标记为新鲜。
+
+控制端“实车调试限幅”可设置 `critical_camera_stale_brake_ms`（整数 100–3000 ms，
+默认 500）与 `control_recovery_timeout_ms`（整数 1000–30000 ms，页面以秒输入，
+默认 5 s）。这两个字段属于完整 V7 会话快照，必须停车、N、零速、EPB 且
+standby/disarmed（或隔离 mock 台架），并由车端应用后精确 ACK 才生效。
+车端 `runtime` 中同名值只提供未配置会话时的默认值；页面从车端默认值预填，
+不自动提交。V6 及更旧版本、缺失、非整数、越界或反馈值不一致均拒绝，更新时必须同步驾驶端、
+云端和车端三个包，并重新打开驾驶页面。旧 YAML 的 `critical_camera_recovery_timeout_ms`
+兼容为新恢复上限的别名；同时填写且值不同会拒绝启动，防止静默选错门限。
+采集等待 `media_frame_timeout_ms` 和控制链路 `control_timeout_ms=800` 不由这些字段改写。
+视频、时间同步和输入租约共用恢复等待上限。详细状态与日志见 [控制故障制动恢复](38-time-sync-input-lease-recovery.md)。
+驾驶端收到车端可恢复制动或撤牵引反馈时，在主画面显示黄色提示条，分别说明制动等待或控制暂缓；恢复后提示制动保持与重新输入。
+红色安全停车/急停提示优先，过期遥测明确标注当前状态待确认；视频或 RTT 指标变差本身不等于车端已制动。

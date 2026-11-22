@@ -8,9 +8,48 @@ Requirements:
 
 Start the three-machine control client:
 
-  1. Open the bin folder.
-  2. Double-click mine-teleop-control.exe.
+  1. Double-click Start-High-Performance.cmd in the package root.
+  2. Accept the Windows administrator (UAC) prompt.
   3. Enter the driver credentials in the browser page that opens.
+
+The managed launcher activates a private High Performance plan, sets wireless
+AC/battery power saving to Maximum Performance, and disables supported Wi-Fi
+device-auto-off and idle-suspend controls. Applying/restoring these settings
+can briefly reconnect Wi-Fi. Unsupported driver controls are reported. The
+private plan also sets the automatic Energy Saver battery threshold to 0%.
+If Windows still reports Energy Saver active (manual or managed policy), startup
+fails and restores settings; switch it off in Windows Settings and retry. The
+launcher also requests that Windows keep the system and display awake while
+the client runs; it does not override manual sleep or a critical battery.
+
+Keep the administrator PowerShell window created after UAC open. Closing that
+window stops the managed control process;
+its independent watcher restores the saved power settings. Closing only the
+browser tab does not exit the local control process: close the launcher when
+finished. Normal process exit also restores settings. Only one managed client
+is allowed at a time. After power loss/reboot or a reported restoration error,
+run the following before starting another managed client:
+
+  powershell -ExecutionPolicy Bypass -File .\run-high-performance.ps1 -Restore
+
+Read-only inspection (no elevation or setting change):
+
+  powershell -ExecutionPolicy Bypass -File .\run-high-performance.ps1 -Inspect
+
+The trusted package launcher uses process-only ExecutionPolicy Bypass so that
+unsigned scripts extracted from a downloaded ZIP can run. It does not change
+machine/user execution policy or override Group Policy. UAC consent is still
+required before changing power settings.
+
+OEM/Modern Standby machines may reject the High Performance plan; the launcher
+then restores settings and fails explicitly. The launcher does not override
+manually forced Energy Saver or enterprise power policies. It does not modify
+VPN, routes, the router, Wi-Fi roaming settings or vehicle safety thresholds.
+Higher power use can increase battery drain, heat and fan noise. This feature
+does not guarantee a stable wireless link or a successful control soak.
+
+To start without managing Windows power settings, open bin and double-click
+mine-teleop-control.exe instead.
 
 The executable loads config\driver-console.yaml automatically. That bundled
 default connects to the field three-machine signaling endpoint, resolves it
@@ -41,6 +80,9 @@ Contents:
   config\         local baseline and field-tested three-machine driver YAML
   protocol\       protocol-v1 interoperability vectors
   run-control.ps1 one-command PowerShell launcher
+  Start-High-Performance.cmd administrator high-performance launcher
+  run-high-performance.ps1  managed startup, inspection and recovery
+  performance-profile.psm1  power backup, verification and restoration
   BUILD-INFO.txt  source, architecture, curl/TLS versions, and build status
   DEPENDENCIES.json exact linked curl provenance and runtime file hashes
   DEPENDENCIES.lock.json reproducible vcpkg/curl build inputs

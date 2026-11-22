@@ -1,0 +1,134 @@
+{
+  "generated_at_utc": "2026-10-28T05:59:23.519695+00:00",
+  "pull_request": 26,
+  "base_pull_request": 25,
+  "target_branch": "rjr/cx/orin-isx031-cpu",
+  "pre_change_commit": "956c811a7bbb4e1eb7f43e31b078a13a43765546",
+  "source_sha256": {
+    "CMakeLists.txt": "a116a9793f595fc0c0d9582dc238784a3cf516f6759af6ebde0692da88ea81f3",
+    "cpp/include/mine_teleop/detail/ice_diagnostics.hpp": "e89aa75bb95a0ccfa195661e522af73d72e49e9abfdc99c43dc3a173aab41904",
+    "cpp/include/mine_teleop/media.hpp": "89f9cad2fc4ae5b114e1045158cf37100c587e9dd78eefb318b00879ab56d878",
+    "cpp/src/webrtc_media.cpp": "8f4b994dd4d6e4f2bb9d24829a9c6de30c8c4213516c52108d8e30d673394a5b",
+    "cpp/tests/ice_route_policy_tests.cpp": "f9f0eebb8acc1619ac2ac0c51219d6b848328217816b7f962267aac870fdf4a8",
+    "cpp/tests/native_receiver_core.hpp": "e6df72ca0f3cefb6f62f7e9d2dd0cc8f273efcb9d591694104619f40fe934727",
+    "cpp/tests/vehicle_ice_fallback_runtime_tests.cpp": "40b5d7d67f39d2200e484035efac69d98de69c34353c8c3e1f6d4644506cc98a",
+    "cpp/web/control_logic.js": "ee0e9cc5f3f81affaba30fe45c44132a4dc035f16fdd3a2b1e45b0e4d014a8a7",
+    "desktop/bench/main.cjs": "d04f011b2ad4141765c95413583126d011a4261c911d54ccde8e61d76dc5640f",
+    "desktop/bench/network-policy.cjs": "3c181fdef2b8f105163ec9f4fb0a40cbb6c5f916abaad37a4be8f1407cebe07f",
+    "desktop/bench/renderer.js": "80cf30b1c1dfb06e37ff6b6d7b8b467dadb206ef72ce1e17a3b4c5dd1989782f",
+    "desktop/bench/turn-allowlist.cjs": "61fd6faaff26f7411094a9862a06ff1818e853a6db539315cfd10243d174c937",
+    "desktop/test/bench-network-policy.test.cjs": "1595d2da9745eea95d3309c9ba21999aef011e53cace1487e09b8bad169dac26",
+    "docs/native-receiver-bench.md": "44e034ccf72e849bc61b1a8b85c9d070e79c6d6b1a9ca08b54cd78e267dc0e78",
+    "scripts/test/hybrid_receiver_analyze.py": "4c2e418cbd212671742f58f14b46e9a2655e7d51f437126c7f33f65d52a47d89",
+    "scripts/test/hybrid_receiver_analyze.test.py": "b6470d8e5f073ef71f7cccb413c1a46d977518c86e549e32e5a15475f32f4874"
+  },
+  "artifact_root": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/pr26-review-20261028",
+  "log_sha256": {
+    "analyzer-tests.log": "38eeff1237d74275801617a271eced659e08b1cad8069897d18e659ae40641d8",
+    "build.log": "0493355e4e8631de544be1f9498d2bb56910ade6a9557a236b46b72555250778",
+    "configure.log": "a745945e65cfd61ce58e8d5075ce3e04dc5f76c72d2790ab88d648c3f7a74ac8",
+    "deps.log": "588dae775d4234c385b70bd192782784b42833726c9494503d9065a3f282e145",
+    "final-ice-tests.log": "acacaff50db91b67f1f4240a0b84be46fa829c30714d5c8c5fa7c538212dc016",
+    "js-tests.log": "8f0d2a2990865324d49e8a94d098a0f5826e9961656066b4b02891fc2538b316",
+    "linux-final-details.log": "d15abc4ed9dcd11aaf4a1ecb21607c3ada5331c751d86d43a7ccc35201a6728b",
+    "mac-build.log": "df1541ddf6dca9662a042904671307ae90a9f019ca7b1c35e737db2f359bcd8c",
+    "mac-policy-test.log": "5a4f424e65ff06c513bdd104ec048313afe6e401581a25a4603431c82936aaec",
+    "network-isolation.log": "b1ab2b7dbc18fa00aa24a8c2ea3021577004322b8e23e133934a7b61b830c83b",
+    "network-policy-final.log": "0302fa85a8233fa254951e8356e2fb0e89b1301a80222108e273a58f1848a367",
+    "offline-regressions.log": "bfc96879cdd796ef86700e54cc291d651525c2cb5065a28595fe40b15cb4ce7d",
+    "runtime-final-build.log": "70d57295389ae038da88b1da3a0584e241914975e88305fa9e7c060f582b8a07",
+    "runtime-rebuild.log": "674258a925a0b2153f5e1034b6c8cbbf7c7c4cdb09d5b8c5277a81a8cdf043c6",
+    "runtime-tests-retry.log": "f926fdcbc10eae2e8905557f103e54252ff1ea949e068e46cff49871bf59c47d",
+    "runtime-tests.log": "d6619318fb98b4a7ee0bb85e2e6d1f14b273e368506488ec4a24352d1c8586f7",
+    "signaling-build.log": "4defd9d87ad0672456095b1024e72cb32312e32fbaa0c2fb2523d1f4597c1dbc",
+    "wss-fixture-rejected.log": "c5758bed0b394b5a923527423fc90089d751bb76da4d371aad9f8da55dda17f8"
+  },
+  "changes": {
+    "turn_udp_acceptance": "Preserve both relayProtocol/url fields. Each relay leg must be observed UDP; TCP/TLS/unknown rejected. Never infer from candidate.protocol or configured URL.",
+    "turn_identity": "Require explicit TURN URL + live DNS snapshot + operator-specified allocation pool; URL must occur in current authenticated signaling. Pin each non-relay endpoint independently. Late credential responses cannot overwrite replacement negotiation evidence.",
+    "native_limit": "libnice callback lacks complete TURN leg/server evidence. Native WAN relay selection latches an acceptance error. Browser remote relay lacks standard remote url/relayProtocol and fails closed. No authenticated remote evidence channel added.",
+    "production_shutdown": "Check stop token immediately before and after fallback credential refresh.",
+    "ipv6_zone": "Strip IPv6 zone for classification; candidate diagnostics emit no address/interface/zone."
+  },
+  "validation": {
+    "linux_environment": {
+      "os": "Ubuntu 22.04 ARM64",
+      "compiler": "GCC 11.4",
+      "gstreamer": "1.20.3",
+      "libnice": "0.1.18",
+      "isolation": "only lo; Docker bridge disconnected; no external routes",
+      "dependency_install": "APT signature-verified Ubuntu packages from TUNA mirror; unused bad-plugin development dependencies not installed (official dev archive extracted for headers/pkg-config)"
+    },
+    "linux_targeted_ctest": {
+      "passed": 8,
+      "failed": 0,
+      "full_suite_run": false,
+      "elapsed_s": 20.92,
+      "suites": [
+        "ice-route-policy",
+        "control-logic-js",
+        "ice-page",
+        "ice-signaling",
+        "ice-fallback-gstreamer",
+        "vehicle-ice-fallback-runtime",
+        "ice-vehicle-callback-mock",
+        "ice-gstreamer-init"
+      ]
+    },
+    "actual_runtime": {
+      "passed": true,
+      "cases": [
+        "applied answer then direct deadline in actual run loop",
+        "mock control/old channel retired before fresh credential GET",
+        "different Peer/negotiation and credential payload",
+        "late promise/candidate/DataChannel callbacks plus old messages through actual polling leave replacement state unchanged",
+        "fresh mock service remains unaffected by old channel callbacks",
+        "at most one fallback",
+        "shutdown during credential GET creates no replacement offer"
+      ],
+      "fixture": "Real production source/run loop + authenticated loopback SignalingService + real GStreamer answerer. Withhold remote candidates. Inject real on-open callback for mock lifecycle precondition; vehicle cloud-control WSS disabled to avoid competing authorization. TURN intentionally unreachable; actual TURN transport is a separate component test.",
+      "not_proven": [
+        "Full vehicle/VCU rearm after a real established path fails",
+        "actual TURN delivery inside VehicleMediaRuntime loop",
+        "WAN/NAT/5G behavior",
+        "native UI runtime fallback"
+      ]
+    },
+    "mac_build": "native-video-layer, native-receiver-probe, ice-route-policy targets passed; policy binary passed",
+    "js": {
+      "control_logic_passed": 104,
+      "shipped_page_passed": 19,
+      "network_policy_passed": 10
+    },
+    "python_analyzer": {
+      "passed": 10
+    },
+    "fixed_offline_regressions": "passed",
+    "fixture_development_failures": [
+      "First stale-message API call was correctly rejected by controller scope fence; fixture now asserts rejection and separately injects already-in-flight messages into real vehicle poll.",
+      "Disabling all WSS also rejected controller connect. Fixture corrected to disable vehicle cloud-control WSS only; final eight suites passed."
+    ],
+    "hardware_used": false,
+    "orin_connected": false,
+    "cameras_used": false,
+    "can_used": false,
+    "new_lan_ab": false
+  },
+  "boundaries": {
+    "ice_direct_timeout_ms_default": 0,
+    "field_config_direct_first_enabled": false,
+    "healthy_relay_to_direct_upgrade": false,
+    "wan_seconds": {
+      "ipv4_browser": 0,
+      "ipv4_native": 0,
+      "ipv6_browser": 0,
+      "ipv6_native": 0
+    },
+    "required_seconds_per_arm": 1800
+  },
+  "review": {
+    "reuse": "Shared product address parser and bench policy; actual production runtime implementation and existing teardown/fences.",
+    "quality": "Missing TURN evidence fails closed. Allocation pools separated from DNS listening addresses. Mock lifecycle is explicitly separate from real control rearm.",
+    "efficiency": "DNS resolution once per bench run; existing sampling cadence; production adds two cancellation checks, no per-frame work."
+  }
+}

@@ -34,6 +34,15 @@ int main() {
     const auto loaded = mine_teleop::load_driver_config(yaml.string());
     expect(loaded.visual_assets_root == (root / "assets"), "relocated bundle root did not resolve");
     expect(loaded.scene_manifest == "models/custom/model.json", "replacement model config lost");
+    expect(loaded.control_transport_mode == "p2p_preferred" && !loaded.enable_experimental_control_transport &&
+        !loaded.enable_experimental_direct_authority, "normal product default needs experimental flags");
+    for (const auto* mode : {"cloud_only", "p2p_preferred", "relay", ""}) {
+      std::ofstream(yaml) << "driver:\n  id: test\ncloud:\n  signaling_url: ws://127.0.0.1:8765/signaling\ncontrol:\n  transport_mode: '" << mode << "'\n";
+      bool invalid_mode = false;
+      try { expect(mine_teleop::load_driver_config(yaml.string()).control_transport_mode == mode, "mode changed during loading"); }
+      catch (const std::invalid_argument&) { invalid_mode = true; }
+      expect(invalid_mode == !mine_teleop::control_transport_mode_is_valid(mode), "invalid control mode was accepted");
+    }
     std::ofstream(yaml) << "driver:\n  id: test\ncloud:\n  signaling_url: ws://127.0.0.1:8765/signaling\nui:\n  scene_manifest: ../secret.json\n";
     bool rejected = false;
     try { static_cast<void>(mine_teleop::load_driver_config(yaml.string())); } catch (const std::exception&) { rejected = true; }

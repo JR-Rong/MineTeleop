@@ -9,7 +9,24 @@
       const detail = progress.claimed ? `车端已接任务，已接收 ${(Number(progress.bytes_received || 0) / 1048576).toFixed(1)} MB。` : '等待车端接收采集任务。';
       return `正在收集三端日志。${detail}请保持车辆空闲、三端在线；最长约 10 分钟。`;
     }
-    if (value.complete) return '收集完成，可以保存 ZIP。';
+    const manifest=value.manifest||{},recording = value.recording || manifest.recording || (manifest.vehicle||{}).recording || {};
+    const summary=recording.summary||{},gap=recording.evidence_status==='incomplete'||recording.incomplete===true||summary.incomplete===true;
+    const confirmedGap = Array.isArray(summary.cameras) && summary.cameras.some(camera => camera && camera.recording &&
+      ['recording_admission_overflow','recording_invalid_access_unit','recording_disk_full'].includes(camera.recording.issue_code));
+    const recordingMessage = recording.included === false && gap
+      ? confirmedGap ? '录像不完整；已确认的此前缺口无法补录。下一步：车辆空闲后检查存储空间、目录权限和录制日志。'
+        : '录像证据不足，完整性待确认。下一步：保留已有片段和日志，检查车端封装证据、存储和录制状态。'
+      : recording.included === false && recording.evidence_status === 'finalized' && recording.complete === true &&
+          summary.completeness_scope==='full_session' && summary.session_history_known===true
+        ? '车端会话摘要确认整会话录像完整。'
+        : recording.included === false && recording.evidence_status === 'attempt_finalized' && recording.attempt_complete === true
+          ? '车端摘要报告本次录像封装完成；整会话录像完整性未确认。'
+        : recording.included === false && recording.evidence_status === 'not_enabled'
+          ? '该会话未启用录像。'
+          : '录像完整性未确认。下一步：检查车端会话录制摘要、存储和车端版本。';
+    const scopeMessage = 'ZIP 仅包含日志和录制状态摘要，不包含视频文件。';
+    if (value.logs_complete === true || value.logs_complete === undefined && value.complete === true)
+      return `三端日志收集完成，可以保存 ZIP。${recordingMessage}${scopeMessage}`;
     const reasons = {
       vehicle_offline: '车端离线',
       vehicle_worker_unresponsive: '车端未响应采集任务，请检查车端版本及日志采集进程',
@@ -29,14 +46,14 @@
       const files = (report.files || []).filter(file => !file.optional && file.status !== 'available');
       return files.length ? [`${label}日志缺失或截断：${files.map(file => file.name).join('、')}`] : [];
     });
-    return `仅收集到部分日志：${missing.join('；') || '可选日志缺失或截断'}。可以保存现有日志，详细原因见 ZIP 清单。`;
+    return `仅收集到部分日志：${missing.join('；') || '可选日志缺失或截断'}。可以保存现有日志，详细原因见 ZIP 清单。${recordingMessage}${scopeMessage}`;
   }
   function install() {
     const button = document.getElementById('export-session-logs');
     if (!button) return;
     const dialog = document.createElement('dialog');
     dialog.id = 'session-log-dialog';
-    dialog.innerHTML = '<h2>导出会话日志</h2><p>选择已结束的会话，收集车端、控制端和云端日志。车端需保持在线；缺失或截断信息会写入 ZIP 清单。</p>' +
+    dialog.innerHTML = '<h2>导出会话日志</h2><p>选择已结束的会话，收集车端、控制端和云端日志。车端需保持在线；缺失或截断信息会写入 ZIP 清单。录像完整性单独报告，视频文件不包含在 ZIP 中。</p>' +
       '<label>会话 <select id="log-session-select" style="width:100%;margin:12px 0"></select></label>' +
       '<p id="log-export-message" role="status" aria-live="polite"></p>' +
       '<div><button id="log-export-start">收集三端日志</button> <button id="log-export-download" hidden>保存 ZIP</button> <button id="log-export-close">关闭</button></div>';

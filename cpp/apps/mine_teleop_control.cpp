@@ -79,6 +79,7 @@ class Arguments {
         "--driver-password",
         "--signaling-url",
         "--ice-transport-policy",
+        "--control-transport",
         "--no-open-browser",
         "--desktop-managed",
         "--browser-event-log",
@@ -130,6 +131,7 @@ Options:
   --driver-password VALUE    development override (prefer MINE_TELEOP_DRIVER_PASSWORD)
   --signaling-url URL        override cloud.signaling_url
   --ice-transport-policy P   all (default) or relay (forced TURN)
+  --control-transport P     p2p_preferred (default) or cloud_only
   --no-open-browser          do not open the default browser
   --desktop-managed          exit when the owning desktop pipe closes
   --browser-event-log PATH   write browser events outside the application bundle
@@ -208,16 +210,24 @@ int run(const Arguments& arguments, const char* executable) {
     }
     config.ice_transport_policy = ice_transport_policy;
   }
+  const auto control_transport_mode = arguments.value("--control-transport");
+  if (!control_transport_mode.empty()) {
+    if (!mine_teleop::control_transport_mode_is_valid(control_transport_mode))
+      throw std::invalid_argument("--control-transport must be p2p_preferred or cloud_only");
+    config.control_transport_mode = control_transport_mode;
+  }
   const auto configured_password = environment("MINE_TELEOP_DRIVER_PASSWORD");
   const auto password = arguments.value(
       "--driver-password", configured_password);
+  const mine_teleop::ScopedWifiStreaming wifi_streaming;
   auto runtime = std::make_shared<mine_teleop::DriverConsoleRuntime>(
       std::move(config), arguments.value("--vehicle-id", "vehicle-001"), password);
   auto app = std::make_shared<mine_teleop::DriverConsoleHttpApp>(runtime);
   mine_teleop::SimpleHttpServer server(
       host,
       port_option(arguments),
-      [app](const auto& request) { return app->handle(request); });
+      [app](const auto& request) { return app->handle(request); },
+      8 * 1024 * 1024, {}, mine_teleop::HttpConnectionPolicy::BoundedKeepAlive);
 
   try {
     server.start();
@@ -235,6 +245,12 @@ int run(const Arguments& arguments, const char* executable) {
                    {"sent_at_utc_ms", mine_teleop::now_ms()},
                    {"runtime", "cpp"},
                    {"platform", mine_teleop::platform_name()},
+                   {"wifi_streaming_mode", {
+                       {"api_available", wifi_streaming.status().api_available},
+                       {"connected_interfaces", wifi_streaming.status().connected_interfaces},
+                       {"enabled_interfaces", wifi_streaming.status().enabled_interfaces},
+                       {"background_scan_disabled_interfaces", wifi_streaming.status().background_scan_disabled_interfaces},
+                       {"error_code", wifi_streaming.status().error_code}}},
                    {"host", host},
                    {"port", server.port()},
                    {"url", url},
