@@ -74,6 +74,7 @@ if [[ -z "$base_bundle_archive" ]]; then
     --platform "$platform" \
     --build-arg "MINE_TELEOP_BUILD_JOBS=$build_jobs" \
     --build-arg "MINE_TELEOP_BUILD_TESTS=$run_tests" \
+    --build-arg "MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS=${MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS:-OFF}" \
     --build-arg "MINE_TELEOP_REQUIRE_CHASSIS_RUNTIME=ON" \
     --target runtime \
     --load \
@@ -91,6 +92,7 @@ if [[ -z "$base_bundle_archive" ]]; then
     --platform "$platform" \
     --build-arg "MINE_TELEOP_BUILD_JOBS=$build_jobs" \
     --build-arg "MINE_TELEOP_BUILD_TESTS=$run_tests" \
+    --build-arg "MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS=${MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS:-OFF}" \
     --build-arg "MINE_TELEOP_REQUIRE_CHASSIS_RUNTIME=ON" \
     --target artifact \
     --output "type=local,dest=$temporary/artifact" \
@@ -149,6 +151,7 @@ else
     --platform "$platform" \
     --build-arg "MINE_TELEOP_BUILD_JOBS=$build_jobs" \
     --build-arg "MINE_TELEOP_BUILD_TESTS=$run_tests" \
+    --build-arg "MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS=${MINE_TELEOP_ENABLE_BENCH_EXPERIMENTS:-OFF}" \
     --target build \
     --load \
     -t "$build_image" \

@@ -36,6 +36,10 @@ PRELUDE = r'''
 #include <vector>
 #include <utility>
 #include <nlohmann/json.hpp>
+#include "mine_teleop/detail/ice_diagnostics.hpp"
+#include "mine_teleop/detail/isolated_mock_bench.hpp"
+#include "mine_teleop/detail/transient_hold.hpp"
+namespace detail { using mine_teleop::detail::kTransientHoldCapability; using mine_teleop::detail::parse_transient_hold_offer; using mine_teleop::detail::ice_candidate_summary; using mine_teleop::detail::ice_direct_sdp; using mine_teleop::detail::isolated_mock_bench_offer; using mine_teleop::detail::kIsolatedMockBenchCapability; }
 using Json=nlohmann::json;
 namespace detail { constexpr std::string_view kControlTransportCapability = "native-control-transport-v1"; constexpr std::string_view kEmergencyStopCapability = "native-stop-only-v1"; constexpr std::string_view kFeedbackTransportCapability = "native-feedback-transport-v1"; }
 using guint=unsigned;using guint8=unsigned char;using gchar=char;using gpointer=void*;
@@ -96,7 +100,10 @@ struct Signaling {Json incoming={{"messages",Json::array()}};std::vector<std::pa
 struct Impl {
 '''
 MEMBERS = r'''
-  struct { struct { int experimental_direct_authority_max_ms=0; bool mock_control_diagnostic=false; } runtime; } config;
+  bool attested=false;
+  bool isolated_mock_bench_attested() const {return attested;}
+  struct { struct { int experimental_direct_authority_max_ms=0; bool mock_control_diagnostic=false; int critical_camera_stale_brake_ms=500; } runtime;
+           struct { int degraded_timeout_ms=300; struct { bool enabled=false; int max_hold_ms=700; } transient_hold; } control; } config;
   void flush_control_status() {} // Control status has separate protocol/service coverage.
   void process_control_management(const Json&,const Json&) {}
   struct Lane {struct {std::string id="front";} camera;struct {int width=1,height=1,fps=1,bitrate_kbps=1;} profile;};
@@ -148,6 +155,29 @@ void case_order() {
 #ifdef HAS_MEDIA_SCOPE_STATUS
   expect(impl.signaling.sent[0].second.value("legacy_bootstrap_allowed",false),"producer bootstrap declaration missing");
 #endif
+}
+void case_isolated_mock_attestation() {
+  for (bool attested : {false,true}) {
+    Impl impl;impl.attested=attested;GstElement peer;activate(impl,peer);negotiate(impl,peer);
+    complete(peer);impl.flush_outgoing_signals();
+    expect(impl.signaling.sent.size()==1&&impl.signaling.sent[0].first=="webrtc_offer","attestation offer missing");
+    expect(impl.signaling.sent[0].second.value("isolated_mock_bench_capability","")==
+        (attested?std::string(detail::kIsolatedMockBenchCapability):std::string{}),"isolated mock bench attestation mismatch");
+    expect(detail::isolated_mock_bench_offer(impl.signaling.sent[0].second)==attested,"attestation did not satisfy the viewer predicate");
+  }
+}
+void case_transient_hold_offer() {
+  for (bool enabled : {false,true}) {
+    Impl impl;impl.config.control.transient_hold.enabled=enabled;GstElement peer;activate(impl,peer);negotiate(impl,peer);
+    complete(peer);impl.flush_outgoing_signals();
+    expect(impl.signaling.sent.size()==1&&impl.signaling.sent[0].first=="webrtc_offer","transient hold offer missing");
+    const auto& offer=impl.signaling.sent[0].second;
+    const auto parsed=detail::parse_transient_hold_offer(offer);
+    expect(offer.value("transient_hold_capability","")==(enabled?std::string(detail::kTransientHoldCapability):std::string{}),"transient hold capability mismatch");
+    expect(parsed.has_value()==enabled,"driver predicate disagrees with the vehicle's transient hold declaration");
+    if (enabled) expect(parsed->control_tolerance_ms==1000&&parsed->video_tolerance_ms==1200&&parsed->max_hold_ms==700,"declared tolerances are not degraded+hold and stale+hold");
+    else expect(offer.at("transient_hold").is_null(),"disabled vehicle declared tolerances");
+  }
 }
 void case_late_callbacks() {
   Impl impl;GstElement old,replacement;activate(impl,old);negotiate(impl,old);auto state=impl.media_signal_state;
@@ -243,8 +273,24 @@ void case_retired_answer_completion() {
     expect(peer.refs==1&&replacement.refs==1,"retired answer leaked a peer reference");
   }
 }
+void case_direct_filter_and_fresh_fallback() {
+  Impl impl;GstElement old,replacement;
+  activate(impl,old);impl.media_signal_state->ice_route_mode="direct";
+  negotiate(impl,old);complete(old);const auto first=impl.media_signal_state->negotiation_id;
+  received(impl,"webrtc_answer",{{"media_negotiation_id",first},{"sdp","v=0\r\na=ice-ufrag:remote\r\na=candidate:r 1 UDP 1 8.8.8.8 5000 typ relay\r\n"}});
+  expect(old.remote.back().find("typ relay")==std::string::npos,"embedded relay admitted in direct stage");
+  auto relay=ice(first);relay["candidate"]="candidate:r 1 UDP 1 8.8.8.8 5000 typ relay";
+  received(impl,"ice_candidate",relay);expect(old.added.empty(),"trickle relay admitted in direct stage");
+  auto host=ice(first);host["candidate"]="candidate:v6 1 UDP 100 2001:4860::1 5000 typ host";
+  received(impl,"ice_candidate",host);expect(old.added.size()==1,"public IPv6 host was excluded");
+  activate(impl,replacement,2);impl.media_signal_state->ice_route_mode="all";
+  negotiate(impl,replacement);complete(replacement);const auto second=impl.media_signal_state->negotiation_id;
+  answer(impl,second);received(impl,"ice_candidate",relay);expect(replacement.added.empty(),"old relay crossed negotiation fence");
+  relay["media_negotiation_id"]=second;received(impl,"ice_candidate",relay);
+  expect(replacement.added.size()==1,"fresh fallback did not admit TURN");
+}
 int main(){int failed=0;const std::vector<std::pair<const char*,void(*)()>> cases={
-  {"ICE-VEHICLE-MOCK-001",case_order},{"ICE-VEHICLE-MOCK-002",case_late_callbacks},
+  {"ICE-VEHICLE-MOCK-001",case_order},{"ICE-VEHICLE-MOCK-ATTEST",case_isolated_mock_attestation},{"ICE-VEHICLE-MOCK-TRANSIENT",case_transient_hold_offer},{"ICE-VEHICLE-MOCK-002",case_late_callbacks},
   {"ICE-VEHICLE-MOCK-003",case_remote_order},{"ICE-VEHICLE-MOCK-004",case_legacy_retry},
   {"ICE-VEHICLE-MOCK-005",case_stale_invalid_answer},{"ICE-VEHICLE-MOCK-006",case_bounded_pending}};
   auto selected=cases;
@@ -257,6 +303,7 @@ int main(){int failed=0;const std::vector<std::pair<const char*,void(*)()>> case
   selected.emplace_back("ICE-VEHICLE-MIXED-001",case_failed_unpublished_attempt);
   selected.emplace_back("ICE-ANSWER-COMPLETION-001",case_answer_completion);
   selected.emplace_back("ICE-ANSWER-COMPLETION-002",case_retired_answer_completion);
+  selected.emplace_back("ICE-DIRECT-FALLBACK-VEHICLE-001",case_direct_filter_and_fresh_fallback);
 #endif
   for(const auto& [id,run]:selected){try{run();std::cout<<"PASS "<<id<<'\n';}catch(const std::exception& e){++failed;std::cerr<<"FAIL "<<id<<": "<<e.what()<<'\n';}}
   return failed?1:0;
@@ -279,6 +326,38 @@ def main():
     methods += section(source, "  static void on_ice_candidate(", "  static void on_control_channel_open(")
     methods += section(source, "  static void on_offer_created(", "  void emit_diagnostic(")
     methods += section(source, "  void flush_outgoing_signals()", "  void poll_bus()")
+    # Selected-pair observation is diagnostic only. Upstream documents the libnice
+    # "agent" property as unsafe to rely on, so its absence must never abort media.
+    observe = section(source, "  bool observe_ice_agent() {", "\n  }\n")
+    if "throw" in observe:
+        raise AssertionError("selected-pair observation must never abort the media pipeline")
+    if "vehicle_ice_selected_pair_unavailable" not in observe:
+        raise AssertionError("missing diagnostic when libnice selected-pair observation is unavailable")
+    attested = section(source, "  bool isolated_mock_bench_attested() const {", "\n  }\n")
+    for needle in ("detail::isolated_mock_bench(", "config.vehicle_id", "config.vehicle_adapter.type",
+                   "config.field_safety.max_speed_kph", "config.field_safety.commissioning_mode"):
+        if needle not in attested:
+            raise AssertionError(f"isolated mock bench attestation no longer uses {needle}")
+    if 'starts_with("test_bench_")' in source:
+        raise AssertionError("scattered bench identity check; use isolated_mock_bench_attested()")
+    # Release bundles compile the bench tracing out. The switch gates diagnostics only: the attestation carried in the
+    # offer is a safety proof that a native mock client requires, so it must never depend on how the binary was built.
+    trace = section(source, "  bool isolated_mock_trace() const {", "\n  }\n")
+    if "isolated_mock_trace_enabled(" not in trace or "kBenchExperimentsCompiled" not in trace:
+        raise AssertionError("isolated mock tracing must honor the bench experiments compile switch")
+    if "kBenchExperimentsCompiled" in attested or "MINE_TELEOP_BENCH_EXPERIMENTS" in attested:
+        raise AssertionError("the isolated mock attestation must not depend on the bench experiments compile switch")
+    offer_payload = section(source, 'state->pending.emplace_back("webrtc_offer", Json{', "{\"media_tracks\"")
+    if "kBenchExperimentsCompiled" in offer_payload:
+        raise AssertionError("the offer's bench attestation must not depend on the bench experiments compile switch")
+    if source.count("kBenchExperimentsCompiled") != 2:
+        raise AssertionError("kBenchExperimentsCompiled must be defined once and used only by isolated_mock_trace()")
+    epoch = section(source, "        if (decision.changed) {", "        }\n")
+    if "note_transport_epoch_changed" not in epoch:
+        raise AssertionError("transport epoch changes must escalate an active hold with their own reason")
+    call_site = section(source, "      configure_ice_servers();", "    } catch (const std::exception& error) {")
+    if "observe_ice_agent();" not in call_site:
+        raise AssertionError("ICE agent observation call site moved unexpectedly")
     unit = args.output / "actual-vehicle-methods-mock.cpp"
     definitions = "#define HAS_MEDIA_SCOPE_STATUS\n" if "media_scope_status()" in source else ""
     if args.race_only:
@@ -293,6 +372,7 @@ def main():
     # With no local checkout/override, use the compiler's system include path.
     # Missing dependencies fail compilation and never become a skipped PASS.
     command = [args.compiler, "-std=c++20", "-Wall", "-Wextra", "-Wpedantic", "-Werror"]
+    command += ["-I" + str(ROOT / "include")]
     command += ["-I" + str(value) for value in includes]
     if args.sanitize:
         command += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]

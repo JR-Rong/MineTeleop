@@ -25,7 +25,17 @@ control:
   rate_hz: 20
   max_command_gap_ms: 200
   degraded_timeout_ms: 300
-  control_timeout_ms: 800
+  # Hard watchdog; transient_hold may spend up to max_hold_ms of it before the staged stop.
+  control_timeout_ms: 1200
+  bridge_apply_timeout_ms: 800
+  transient_hold:
+    enabled: true
+    max_hold_ms: 700
+    hold_brake: 0.15
+    resume_fresh_commands: 2
+    budget_window_ms: 60000
+    max_holds_per_window: 6
+    max_hold_time_per_window_ms: 3000
   timeout_action:
     deceleration_profile:
       - after_ms: 0

@@ -44,8 +44,9 @@ def publish(directory):
         notes = (f'Source commit: {commit}\n\n'
                  f'Build and validation: https://github.com/{repository}/actions/runs/{os.environ["GITHUB_RUN_ID"]}\n\n'
                  'Includes Windows arm64/x64, macOS arm64 and Ubuntu x64 desktop controllers, '
-                 'Ubuntu 22.04 x64 cloud and vehicle bundles. SHA-256 files and RELEASE-MANIFEST.json '
-                 'identify all packages. CI validation does not replace target hardware acceptance.\n')
+                 'Ubuntu 22.04 x64 and Windows x64 cloud/signaling bundles, and Ubuntu 22.04 x64 vehicle bundle. '
+                 'SHA-256 files and RELEASE-MANIFEST.json identify all packages. '
+                 'CI validation does not replace target hardware acceptance.\n')
         gh('release', 'create', tag, '--target', commit, '--draft', '--title', f'MineTeleop {tag}', '--notes', notes)
     else:
         raise RuntimeError(result.stderr)

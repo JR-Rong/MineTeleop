@@ -41,6 +41,9 @@ end = source.index('      const bool stale_safe_heartbeat =', start)
 guard = extract('      if (stop_requested || control_inhibited ||', end)
 admission_start = source.index('        const auto decision = control_transport_fence.admit(', end)
 admission_end = source.index('        if (decision.changed)', admission_start)
+profile_start = source.index('      if (!command.estop) {\n        const bool profile_active =', admission_end)
+profile_end = source.index('      if (stale_safe_heartbeat)', profile_start)
 Path(a.result_output).write_text(source[start:end] +
     '      static_cast<void>(verified_stop_only);\n'
-    '      std::unique_lock lock(control_mutex);\n' + guard + source[admission_start:admission_end])
+    '      std::unique_lock lock(control_mutex);\n' + guard + source[admission_start:admission_end] +
+    source[profile_start:profile_end])

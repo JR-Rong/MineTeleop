@@ -1,0 +1,61 @@
+{
+  "date": "2026-10-29",
+  "scope": "Windows Edge headless to Orin cellular, PR26 dual ISX031, UDP direct, media only",
+  "source": {
+    "windows_control_ci_head": "0602c52e2e18a1f108c3811c1e206cd845885e10",
+    "orin_runtime": "920e019029c7c7593843fb182ba58026276ba822"
+  },
+  "network": "Windows WLAN public IPv6 and Orin cellular public IPv6; cloud signaling via restricted SSH tunnels from each endpoint; media direct; route observation sampled",
+  "candidate_configuration": "Isolated Edge was launched with WebRtcHideLocalIpsWithMdns disabled. A previous attempt with default mDNS host candidates failed to establish a selected pair; this observation does not alone establish root cause.",
+  "strict_candidate_samples_60s": {
+    "duration_seconds": 60.047,
+    "samples": 13,
+    "every_sample_selected_expected_public_endpoints": true,
+    "local_type": "host",
+    "remote_type": "host",
+    "transport": "udp",
+    "decode_frames_delta": [
+      1802,
+      1802
+    ],
+    "dropped_frames_delta": [
+      0,
+      0
+    ],
+    "sample_interval_seconds": 5,
+    "orin_selected_peer_route_check": "70 samples, 0 failures; began after test started; not continuous coverage"
+  },
+  "long_attempt": {
+    "duration_seconds": 265.0,
+    "good_samples": 53,
+    "samples": 54,
+    "terminal_error": "Error: selected_pair_or_tracks_invalid",
+    "termination_note": "The invalid sample did not preserve candidate fields; later snapshot showed connected IPv6 UDP and unchanged endpoints. Do not infer cause or count as 30-minute success.",
+    "decode_frames_delta": [
+      7956,
+      7936
+    ],
+    "dropped_frames_delta": [
+      3,
+      23
+    ],
+    "orin_guard_route_failed": false,
+    "orin_conflicts": []
+  },
+  "prior_attempt": "windows-ice-smoke-03 was interrupted by Orin route guard; no 60-second observation accepted",
+  "safety": "control disabled, mock, zero speed, CAN DOWN; temporary bench time uncertainty limit 100ms; no control readiness claimed",
+  "limits": [
+    "No scanout, no end-to-end latency, no real-user UI A/B, Edge headless and GPU disabled",
+    "Five-second ICE samples can miss transient changes",
+    "The sender and receiver clocks are not synchronized enough for end-to-end measurement",
+    "Cellular radio generation unverified",
+    "Temporary test keys and credentials removed after test"
+  ],
+  "sha256": {
+    "ice-60-exact-sensitive.json": "7e2095f11560c2172fc3b1f375abe80f53c25df619bd0c880e153f422dcec5df",
+    "long-partial-sensitive.json": "dffc1feeaa7dab97e06525ba3f3f39d4417e0258b0231f7548835fd8d35e415a",
+    "windows-ice-smoke-03-orin-metadata.json": "22b71194479c30ea5d58e9cabde189d68d6068ea23017edf9bc57591d44db671",
+    "windows-ice-smoke-04-orin-metadata.json": "f580e16444814f0e6abb8d400d91749c8c1526ad46dd3e425eaeb6284dc50ca6",
+    "windows-ice-long-01-orin-metadata.json": "c8c7446984ef4ba1c51d01018d263e86951019196a82cf13c890b3bd381f681d"
+  }
+}

@@ -48,6 +48,16 @@
         now - health.lastFrameAt < staleMs && health.status !== 'offline';
   }
 
+  // Transient means every blocked critical view is only stale, recovering or muted.
+  // Ended, missing, paused, disconnected or never-presented views, and revision
+  // overflow, are faults and keep the existing immediate braking behavior.
+  const TRANSIENT_VIDEO_REASONS = new Set(['presented_frame_stale', 'recovering_frames', 'awaiting_valid_frame', 'track_muted']);
+  function criticalVideoTransient(cameras, overflow) {
+    if (overflow || !Array.isArray(cameras)) return false;
+    const blocked = cameras.filter(camera => camera && camera.ready !== true);
+    return blocked.length > 0 && blocked.every(camera => TRANSIENT_VIDEO_REASONS.has(camera.reason));
+  }
+
   function mount(grid) {
     const entries = new Map();
     // Only current entries hold per-source history. The aggregate survives
@@ -57,6 +67,10 @@
     let revisionSnapshot = null;
     let disconnected = false;
     let connectionState = 'connected';
+    // Set from the native driver's status once the vehicle's transient hold is
+    // negotiated; until then every anomaly keeps its legacy braking meaning.
+    let transientHoldNegotiated = false;
+    function setTransientHoldNegotiated(value) { transientHoldNegotiated = value === true; }
 
     function advanceRevision(record, key, amount = 1) {
       if (!Number.isSafeInteger(amount) || amount < 0 || amount > Number.MAX_SAFE_INTEGER - record[key]) {
@@ -75,11 +89,15 @@
       return {identity, generation: identity, bad: 0, brake: 0, overflow: false};
     }
 
-    function observeBadSamples(observation, count) {
+    function observeBadSamples(observation, count, transient = false) {
       advanceRevision(observation.history, 'bad', count);
       const previous = observation.consecutiveAnomalies;
       observation.consecutiveAnomalies = Math.min(3, previous + count);
-      if (previous < 3 && observation.consecutiveAnomalies === 3) advanceRevision(observation.history, 'brake');
+      // A negotiated transient anomaly stays visible in the bad revision only: the
+      // vehicle holds traction instead of entering the braking wait. Anything else,
+      // or any anomaly before negotiation, keeps the legacy third-sample brake event.
+      if (previous < 3 && observation.consecutiveAnomalies === 3 && !(transient && transientHoldNegotiated))
+        advanceRevision(observation.history, 'brake');
     }
 
     function criticalRevisions(ids) {
@@ -128,6 +146,9 @@
           (!Number.isFinite(entry.video.readyState) || entry.video.readyState >= 2);
       const stateHealthy = Boolean(track && track.readyState === 'live' && !track.muted &&
           !disconnected && videoUsable);
+      // A live but muted track on a connected peer is a stall, not a failure.
+      const transientState = Boolean(track && track.readyState === 'live' && track.muted &&
+          !disconnected && videoUsable);
       // Changes are sampled from actual track/video/peer state, including events
       // between control polls. Re-reading the same state is not another sample.
       const stateKey = JSON.stringify([track ? track.readyState : 'missing',
@@ -138,7 +159,7 @@
         observation.sampleSeq++;
         observation.awaitingValidFrame = true;
         observation.recoveryFrames = 0;
-        if (!stateHealthy) observeBadSamples(observation, 1);
+        if (!stateHealthy) observeBadSamples(observation, 1, transientState);
       }
       if (frames === 0 && observation.lastValidFrameAt == null) observation.frames = 0;
       const advanced = Number.isFinite(frames) ? Math.max(0, frames - observation.frames) : 0;
@@ -157,7 +178,7 @@
           observation.recoveryFrames = Math.min(3, observation.recoveryFrames + advanced);
           if (observation.recoveryFrames >= 3) observation.admitted = true;
         } else {
-          observeBadSamples(observation, advanced);
+          observeBadSamples(observation, advanced, transientState);
         }
       }
       observation.rawStateHealthy = stateHealthy;
@@ -166,7 +187,7 @@
     function paint(entry, status) {
       if (entry.box.dataset.state === status) return;
       entry.box.dataset.state = status;
-      entry.status.textContent = {waiting: '等待视频', live: '', stale: '画面中断 / 暂无新帧', offline: '视频已断开'}[status];
+      entry.status.textContent = {waiting: '等待视频', live: '', stale: '画面短暂中断', offline: '视频已断开'}[status];
       entry.status.hidden = status === 'live';
       // The opaque status overlay covers stale video without pausing playback.
     }
@@ -318,6 +339,7 @@
       return {ready: !revision.overflow && ids.length > 0 && missing.length === 0,
         sample_healthy: !revision.overflow && ids.length > 0 && cameras.every(camera => camera.sample_healthy),
         bad_sample_revision: revision.bad_sample_revision, brake_sample_revision: revision.brake_sample_revision,
+        transient: criticalVideoTransient(cameras, revision.overflow),
         missing, cameras};
     }
 
@@ -341,8 +363,10 @@
         })};
     }
 
-    return {configure, attach, reset, refresh, setConnectionState, criticalHealth, presentationSnapshot};
+    return {configure, attach, reset, refresh, setConnectionState, criticalHealth, presentationSnapshot,
+      setTransientHoldNegotiated};
   }
 
-  return Object.freeze({CAMERAS, STALE_MS, CRITICAL_DISPLAY_STALE_MS, orderedCameraIds, cameraLabel, frameHealth, criticalFrameFresh, mount});
+  return Object.freeze({CAMERAS, STALE_MS, CRITICAL_DISPLAY_STALE_MS, orderedCameraIds, cameraLabel, frameHealth, criticalFrameFresh,
+    criticalVideoTransient, mount});
 });

@@ -27,6 +27,11 @@ class ReleaseTests(unittest.TestCase):
             self.package(name, 'DESKTOP-BUILD.json', info)
         for role in ['cloud', 'vehicle']:
             self.package(f'mine-teleop-{role}-ubuntu22.04-x64-test.tar.gz', 'BUILD-INFO.txt', f'source_commit={SHA}\nrelease_version=1.2.3\n')
+        self.package(
+            'mine-teleop-cloud-windows-x64-test.zip',
+            'BUILD-INFO.txt',
+            f'target_platform=windows\ntarget_architecture=x64\nsource_commit={SHA}\nrelease_version=1.2.3\n',
+        )
 
     def package(self, name, member, contents):
         path = self.source / name
@@ -46,17 +51,31 @@ class ReleaseTests(unittest.TestCase):
 
     def test_complete_inventory_and_portable_checksums(self):
         manifest = self.prepare()
-        self.assertEqual(len(manifest['packages']), 6)
+        self.assertEqual(len(manifest['packages']), 7)
         self.assertTrue(manifest['includes_vehicle_runtime'])
         for checksum in self.output.glob('*.sha256'):
             self.assertNotIn('/old/runner/', checksum.read_text())
+
+    def test_missing_windows_cloud_blocks_release(self):
+        next(self.source.glob('mine-teleop-cloud-windows-x64-*.zip')).unlink()
+        with self.assertRaisesRegex(ValueError, 'expected one package'):
+            self.prepare()
+
+    def test_wrong_windows_cloud_platform_rejected(self):
+        self.package(
+            'mine-teleop-cloud-windows-x64-test.zip',
+            'BUILD-INFO.txt',
+            f'target_platform=windows\ntarget_architecture=arm64\nsource_commit={SHA}\nrelease_version=1.2.3\n',
+        )
+        with self.assertRaisesRegex(ValueError, 'platform mismatch'):
+            self.prepare()
 
     def test_missing_vehicle_blocks_formal_release(self):
         next(self.source.glob('mine-teleop-vehicle-*.tar.gz')).unlink()
         with self.assertRaisesRegex(ValueError, 'expected one package'):
             self.prepare()
         self.assertFalse(self.output.exists())
-        self.assertEqual(len(self.prepare(vehicle=False)['packages']), 5)
+        self.assertEqual(len(self.prepare(vehicle=False)['packages']), 6)
 
     def test_duplicate_package_rejected(self):
         duplicate = self.source / 'duplicate'
