@@ -518,6 +518,12 @@ endif()
 
 if(MINE_TELEOP_BUILD_TESTS OR MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
   enable_testing()
+  add_executable(mine-teleop-close-fail-safe-tests cpp/tests/close_fail_safe_tests.cpp)
+  target_link_libraries(mine-teleop-close-fail-safe-tests PRIVATE mine_teleop_runtime)
+  mine_teleop_enable_warnings(mine-teleop-close-fail-safe-tests)
+  add_test(NAME mine-teleop-close-fail-safe-tests COMMAND mine-teleop-close-fail-safe-tests)
+  set_tests_properties(mine-teleop-close-fail-safe-tests PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   add_executable(mine-teleop-isolated-mock-bench-tests cpp/tests/isolated_mock_bench_tests.cpp)
   target_link_libraries(mine-teleop-isolated-mock-bench-tests PRIVATE mine_teleop_runtime)
   mine_teleop_enable_warnings(mine-teleop-isolated-mock-bench-tests)

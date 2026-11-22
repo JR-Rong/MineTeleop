@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -4076,12 +4077,28 @@ bool VehicleControlService::reset_estop(
 
 void VehicleControlService::close(VehicleStopContext context) {
   if (!started_) return;
-  adapter_->apply_safe_stop(
-      ControlOutput{"N", 0.0, 0.0, 1.0, true},
-      context);
+  // The adapter close is the only path that runs the bridge's reverse VCU
+  // handshake and confirms the electronic parking brakes. A failed service-
+  // brake apply must not skip it: that would leave the vehicle unparked when
+  // the control process exits. Preserve the first failure for diagnostics.
+  std::exception_ptr safe_stop_error;
+  try {
+    adapter_->apply_safe_stop(
+        ControlOutput{"N", 0.0, 0.0, 1.0, true},
+        context);
+  } catch (...) {
+    safe_stop_error = std::current_exception();
+  }
   clear_session_profile();
-  adapter_->close();
   started_ = false;
+  std::exception_ptr adapter_close_error;
+  try {
+    adapter_->close();
+  } catch (...) {
+    adapter_close_error = std::current_exception();
+  }
+  if (adapter_close_error) std::rethrow_exception(adapter_close_error);
+  if (safe_stop_error) std::rethrow_exception(safe_stop_error);
 }
 
 Json VehicleControlService::control_timing(std::int64_t /*timestamp_ms*/) const {

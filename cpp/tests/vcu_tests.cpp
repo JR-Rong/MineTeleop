@@ -10,6 +10,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -1271,6 +1272,10 @@ void test_disarm_waits_for_torque_stop_neutral_park_and_manual() {
   expect(controller.state() == State::DisarmTorque, "disarm skipped torque feedback");
   const auto& braking = find_frame(frames, mine_teleop::vcu::ids::kAduEhb01);
   expect(signal(braking, 4, 12) == 250, "disarm did not apply calibrated brake pressure");
+  const auto& torque_phase_epb =
+      find_frame(frames, mine_teleop::vcu::ids::kAduEpb);
+  expect(signal(torque_phase_epb, 0, 2) == 0,
+      "disarm released the parking brake during the torque phase");
 
   for (std::size_t index = 0; index < kMotorStatus01Ids.size(); ++index) {
     controller.ingest(motor_torque_feedback(index, 0.0));
@@ -1293,6 +1298,11 @@ void test_disarm_waits_for_torque_stop_neutral_park_and_manual() {
   expect(
       signal(epb, 0, 2) == 2 && signal(epb, 16, 2) == 2,
       "disarm did not request EPB parked value 2");
+  const auto& park_phase_brake =
+      find_frame(frames, mine_teleop::vcu::ids::kAduEhb01);
+  expect(
+      signal(park_phase_brake, 0, 4) == 1 && signal(park_phase_brake, 4, 12) == 250,
+      "parking-brake phase dropped the calibrated EHB stop before park confirmed");
 
   controller.ingest(parking_brake_feedback(2));
   frames = controller.tick();
@@ -1300,6 +1310,12 @@ void test_disarm_waits_for_torque_stop_neutral_park_and_manual() {
   const auto& shake = find_frame(frames, mine_teleop::vcu::ids::kAduShake);
   expect(signal(shake, 0, 8) == 0, "intelligent-driving handshake was not cleared after parking");
   expect(signal(shake, 16, 8) == 0, "CloudShakeReq was asserted during disarm");
+  const auto& manual_phase_brake =
+      find_frame(frames, mine_teleop::vcu::ids::kAduEhb01);
+  expect(
+      signal(manual_phase_brake, 0, 4) == 1 &&
+          signal(manual_phase_brake, 4, 12) == 250,
+      "manual-handshake confirmation dropped the calibrated EHB stop");
 
   prepare_parking_gate(controller);
   frames = controller.tick();
@@ -1313,6 +1329,11 @@ void test_disarm_waits_for_torque_stop_neutral_park_and_manual() {
     const auto& neutral = find_frame(frames, mine_teleop::vcu::ids::kAduShake);
     expect(signal(neutral, 0, 8) == 0 && signal(neutral, 8, 8) == 1,
         "completed disarm did not retain manual authority and N");
+    const auto& parked_brake =
+        find_frame(frames, mine_teleop::vcu::ids::kAduEhb01);
+    expect(
+        signal(parked_brake, 0, 4) == 0 && signal(parked_brake, 4, 12) == 0,
+        "confirmed park did not release the EHB service-brake hold");
     frames = controller.tick();
   }
   expect(
@@ -1321,6 +1342,83 @@ void test_disarm_waits_for_torque_stop_neutral_park_and_manual() {
   expect(
       controller.state() == State::Initial,
       "reconnect did not restart the five-frame low-handshake phase");
+}
+
+void test_stalled_exit_keeps_service_brake_and_never_releases_epb() {
+  ParallelController controller;
+  advance_to_ready(controller);
+  Command emergency;
+  emergency.gear = 1;
+  emergency.brake_pressure_bar.fill(25.0);
+  expect(
+      controller.set_emergency_command(emergency),
+      "stalled-exit emergency calibration failed");
+  controller.request_disarm();
+
+  auto assert_fail_safe_output = [&](const std::vector<CanFrame>& frames,
+                                     std::string_view phase) {
+    const auto& epb = find_frame(frames, mine_teleop::vcu::ids::kAduEpb);
+    for (int axis = 0; axis < 4; ++axis) {
+      expect(
+          signal(epb, static_cast<unsigned>(axis * 8), 2) != 1,
+          std::string(phase) + " wrote an EPB release request");
+    }
+    const auto& brake = find_frame(frames, mine_teleop::vcu::ids::kAduEhb01);
+    expect(
+        signal(brake, 0, 4) == 1 && signal(brake, 4, 12) == 250,
+        std::string(phase) + " did not retain the calibrated EHB stop");
+  };
+
+  auto frames = controller.tick();
+  expect(
+      controller.state() == State::DisarmTorque,
+      "stalled-exit setup skipped the torque phase");
+  assert_fail_safe_output(frames, "torque phase");
+
+  for (std::size_t index = 0; index < kMotorStatus01Ids.size(); ++index) {
+    controller.ingest(motor_torque_feedback(index, 0.0));
+  }
+  frames = controller.tick();
+  expect(
+      controller.state() == State::DisarmStop,
+      "stalled-exit setup skipped the stop phase");
+  controller.ingest(speed_feedback(3.6));
+  frames = controller.tick();
+  expect(
+      controller.state() == State::DisarmStop,
+      "nonzero speed left the stop phase");
+  assert_fail_safe_output(frames, "moving stop phase");
+
+  controller.ingest(speed_feedback(0.0));
+  frames = controller.tick();
+  expect(
+      controller.state() == State::DisarmNeutral,
+      "stopped exit skipped the neutral phase");
+  controller.ingest(gear_feedback(3));
+  frames = controller.tick();
+  expect(
+      controller.state() == State::DisarmNeutral,
+      "drive-gear feedback left the neutral phase");
+  assert_fail_safe_output(frames, "neutral phase");
+
+  controller.ingest(gear_feedback(1));
+  frames = controller.tick();
+  expect(
+      controller.state() == State::DisarmParkingBrake,
+      "neutral feedback did not start the park phase");
+  for (int cycle = 0; cycle < 5; ++cycle) {
+    const auto& epb = find_frame(frames, mine_teleop::vcu::ids::kAduEpb);
+    for (int axis = 0; axis < 4; ++axis) {
+      expect(
+          signal(epb, static_cast<unsigned>(axis * 8), 2) == 2,
+          "stalled park phase withdrew the parking-brake request");
+    }
+    assert_fail_safe_output(frames, "stalled park phase");
+    frames = controller.tick();
+  }
+  expect(
+      controller.state() == State::DisarmParkingBrake,
+      "stalled park phase advanced without fresh park feedback");
 }
 
 void advance_to_disarm_manual(ParallelController& controller) {
@@ -1613,6 +1711,8 @@ int main() {
        test_handshake_loss_forces_zero_torque_and_calibrated_brake},
       {"disarm_waits_for_torque_stop_neutral_park_and_manual",
        test_disarm_waits_for_torque_stop_neutral_park_and_manual},
+      {"stalled_exit_keeps_service_brake_and_never_releases_epb",
+       test_stalled_exit_keeps_service_brake_and_never_releases_epb},
       {"disarm_rejects_stale_partial_and_unsafe_phase_feedback",
        test_disarm_rejects_stale_partial_and_unsafe_phase_feedback},
       {"disarm_manual_requires_each_new_safe_feedback",
