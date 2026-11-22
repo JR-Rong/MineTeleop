@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -48,8 +49,8 @@ class NvencVideoEncoder final : public VideoEncoder {
   [[nodiscard]] EncoderBackend backend() const override { return EncoderBackend::Nvenc; }
   [[nodiscard]] VideoCodec codec() const override { return codec_; }
   [[nodiscard]] std::string factory_name() const override {
-    return codec_ == VideoCodec::H265 ? first_available({"nvh265enc", "nvautogpuh265enc"})
-                                      : first_available({"nvh264enc", "nvautogpuh264enc"});
+    return codec_ == VideoCodec::H265 ? first_available({"nvh265enc", "nvautogpuh265enc", "nvv4l2h265enc"})
+                                      : first_available({"nvh264enc", "nvautogpuh264enc", "nvv4l2h264enc"});
   }
   [[nodiscard]] std::string pipeline_stage(
       const VideoEncoderSettings& settings,
@@ -98,6 +99,35 @@ class VaapiVideoEncoder final : public VideoEncoder {
   VideoCodec codec_;
 };
 
+class CpuVideoEncoder final : public VideoEncoder {
+ public:
+  explicit CpuVideoEncoder(VideoCodec codec) : codec_(codec) {}
+
+  [[nodiscard]] EncoderBackend backend() const override { return EncoderBackend::Cpu; }
+  [[nodiscard]] VideoCodec codec() const override { return codec_; }
+  [[nodiscard]] std::string factory_name() const override {
+    return codec_ == VideoCodec::H264 ? first_available({"x264enc"}) : std::string{};
+  }
+  [[nodiscard]] std::string pipeline_stage(
+      const VideoEncoderSettings& settings,
+      std::string_view element_name) const override {
+    if (factory_name().empty()) throw std::runtime_error("CPU H.264 x264 encoder is unavailable");
+    std::ostringstream value;
+    // Bound encoder parallelism and buffering so a bench CPU stream leaves
+    // capacity for capture, signaling and the control watchdog.
+    value << "x264enc name=" << element_name
+          << " bitrate=" << settings.bitrate_kbps
+          << " key-int-max=" << settings.keyframe_interval_frames
+          << " speed-preset=ultrafast tune=zerolatency threads=4"
+          << " bframes=0 rc-lookahead=0 sync-lookahead=0 byte-stream=true aud=true"
+          << " ! video/x-h264,profile=constrained-baseline";
+    return value.str();
+  }
+
+ private:
+  VideoCodec codec_;
+};
+
 }  // namespace
 
 int realtime_keyframe_interval_frames(int fps, int stale_brake_ms) {
@@ -118,6 +148,22 @@ std::string build_nvenc_pipeline_stage(
     unsigned int gstreamer_major,
     unsigned int gstreamer_minor) {
   std::ostringstream value;
+  if (factory_name == "nvv4l2h264enc" || factory_name == "nvv4l2h265enc") {
+    if (settings.bitrate_kbps <= 0 ||
+        static_cast<std::uint64_t>(settings.bitrate_kbps) > std::numeric_limits<unsigned int>::max() / 1000U ||
+        settings.keyframe_interval_frames <= 0) {
+      throw std::invalid_argument("Jetson encoder bitrate or keyframe interval is outside hardware bounds");
+    }
+    // Jetson accepts NVMM surfaces and bits/s; the desktop NVENC plugin uses
+    // system-memory input and kbit/s with a different set of properties.
+    value << "nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! "
+          << factory_name << " name=" << element_name
+          << " bitrate=" << static_cast<std::uint64_t>(settings.bitrate_kbps) * 1000U
+          << " control-rate=1 iframeinterval=" << settings.keyframe_interval_frames
+          << " idrinterval=" << settings.keyframe_interval_frames
+          << " num-B-Frames=0 insert-sps-pps=true copy-timestamp=true preset-level=1";
+    return value.str();
+  }
   value << factory_name << " name=" << element_name
         << " bitrate=" << settings.bitrate_kbps
         << " gop-size=" << settings.keyframe_interval_frames
@@ -136,7 +182,12 @@ std::string to_string(VideoCodec codec) {
 }
 
 std::string to_string(EncoderBackend backend) {
-  return backend == EncoderBackend::Nvenc ? "nvenc" : "vaapi";
+  switch (backend) {
+    case EncoderBackend::Nvenc: return "nvenc";
+    case EncoderBackend::Vaapi: return "vaapi";
+    case EncoderBackend::Cpu: return "cpu";
+  }
+  throw std::invalid_argument("unknown video encoder backend");
 }
 
 VideoCodec parse_video_codec(std::string_view value) {
@@ -150,20 +201,33 @@ EncoderBackend parse_encoder_backend(std::string_view value) {
   const auto normalized = lower(value);
   if (normalized == "nvenc" || normalized == "nvidia") return EncoderBackend::Nvenc;
   if (normalized == "vaapi" || normalized == "intel") return EncoderBackend::Vaapi;
-  throw std::invalid_argument("unsupported hardware video encoder: " + std::string(value));
+  if (normalized == "cpu") return EncoderBackend::Cpu;
+  throw std::invalid_argument("unsupported video encoder: " + std::string(value));
 }
 
 std::vector<EncoderCandidate> encoder_candidate_order(const HardwareConfig& hardware, VideoCodec codec) {
   const auto preferred = parse_encoder_backend(hardware.preferred_encoder);
   const auto fallback = parse_encoder_backend(hardware.fallback_encoder);
-  std::vector<EncoderCandidate> candidates{{preferred, codec}};
-  if (fallback != preferred) candidates.push_back({fallback, codec});
+  if (hardware.require_hardware_encoder &&
+      (preferred == EncoderBackend::Cpu || fallback == EncoderBackend::Cpu)) {
+    throw std::invalid_argument("CPU encoding requires hardware.encoding.require_hardware_encoder=false");
+  }
+  std::vector<EncoderCandidate> candidates;
+  const auto append = [&](EncoderBackend backend) {
+    if (backend != EncoderBackend::Cpu || codec == VideoCodec::H264) {
+      candidates.push_back({backend, codec});
+    }
+  };
+  append(preferred);
+  if (fallback != preferred) append(fallback);
   return candidates;
 }
 
 std::unique_ptr<VideoEncoder> create_video_encoder(const EncoderCandidate& candidate) {
   if (candidate.backend == EncoderBackend::Nvenc) return std::make_unique<NvencVideoEncoder>(candidate.codec);
-  return std::make_unique<VaapiVideoEncoder>(candidate.codec);
+  if (candidate.backend == EncoderBackend::Vaapi) return std::make_unique<VaapiVideoEncoder>(candidate.codec);
+  if (candidate.backend == EncoderBackend::Cpu) return std::make_unique<CpuVideoEncoder>(candidate.codec);
+  throw std::invalid_argument("unknown video encoder backend");
 }
 
 GstElement* parse_initialized_gstreamer_pipeline(const char* description, GError** error) {
@@ -181,7 +245,7 @@ bool gstreamer_factory_available(std::string_view factory_name) {
 
 Json probe_video_encoders() {
   Json probes = Json::array();
-  for (const auto backend : {EncoderBackend::Nvenc, EncoderBackend::Vaapi}) {
+  for (const auto backend : {EncoderBackend::Nvenc, EncoderBackend::Vaapi, EncoderBackend::Cpu}) {
     for (const auto codec : {VideoCodec::H265, VideoCodec::H264}) {
       const EncoderCandidate candidate{backend, codec};
       const auto encoder = create_video_encoder(candidate);
@@ -194,7 +258,8 @@ Json probe_video_encoders() {
       });
     }
   }
-  return {{"event", "video_encoder_probe"}, {"runtime", "cpp"}, {"probes", std::move(probes)}};
+  return {{"event", "video_encoder_probe"}, {"runtime", "cpp"}, {"availability_scope", "factory_only"},
+      {"functional_validation", "not_run"}, {"probes", std::move(probes)}};
 }
 
 }  // namespace mine_teleop

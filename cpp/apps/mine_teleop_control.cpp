@@ -219,13 +219,15 @@ int run(const Arguments& arguments, const char* executable) {
   const auto configured_password = environment("MINE_TELEOP_DRIVER_PASSWORD");
   const auto password = arguments.value(
       "--driver-password", configured_password);
+  const mine_teleop::ScopedWifiStreaming wifi_streaming;
   auto runtime = std::make_shared<mine_teleop::DriverConsoleRuntime>(
       std::move(config), arguments.value("--vehicle-id", "vehicle-001"), password);
   auto app = std::make_shared<mine_teleop::DriverConsoleHttpApp>(runtime);
   mine_teleop::SimpleHttpServer server(
       host,
       port_option(arguments),
-      [app](const auto& request) { return app->handle(request); });
+      [app](const auto& request) { return app->handle(request); },
+      8 * 1024 * 1024, {}, mine_teleop::HttpConnectionPolicy::BoundedKeepAlive);
 
   try {
     server.start();
@@ -243,6 +245,12 @@ int run(const Arguments& arguments, const char* executable) {
                    {"sent_at_utc_ms", mine_teleop::now_ms()},
                    {"runtime", "cpp"},
                    {"platform", mine_teleop::platform_name()},
+                   {"wifi_streaming_mode", {
+                       {"api_available", wifi_streaming.status().api_available},
+                       {"connected_interfaces", wifi_streaming.status().connected_interfaces},
+                       {"enabled_interfaces", wifi_streaming.status().enabled_interfaces},
+                       {"background_scan_disabled_interfaces", wifi_streaming.status().background_scan_disabled_interfaces},
+                       {"error_code", wifi_streaming.status().error_code}}},
                    {"host", host},
                    {"port", server.port()},
                    {"url", url},

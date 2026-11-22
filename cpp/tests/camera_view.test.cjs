@@ -1,6 +1,6 @@
 'use strict';
 const assert = require('assert').strict;
-const {orderedCameraIds, cameraLabel, frameHealth, criticalFrameFresh} = require('../web/camera_view.js');
+const {orderedCameraIds, cameraLabel, frameHealth, criticalFrameFresh, criticalVideoTransient} = require('../web/camera_view.js');
 let failed = 0;
 function test(name, body) {
   try { body(); console.log('[PASS] ' + name); }
@@ -397,6 +397,50 @@ test('reset folds unread critical faults before releasing old source history and
   oldTrack.muted=true;oldTrack.emit('mute');const detached=f.health(['vehicle-49']);
   assert.equal(detached.bad_sample_revision,after.bad_sample_revision);
   assert.equal(detached.brake_sample_revision,after.brake_sample_revision);
+});
+
+
+test('only stale, recovering or muted critical views are transient', () => {
+  assert.equal(criticalVideoTransient([{ready: false, reason: 'presented_frame_stale'}, {ready: true, reason: 'ready'}], false), true);
+  assert.equal(criticalVideoTransient([{ready: false, reason: 'track_muted'}, {ready: false, reason: 'recovering_frames'}], false), true);
+  assert.equal(criticalVideoTransient([{ready: false, reason: 'awaiting_valid_frame'}], false), true);
+  for (const reason of ['track_ended', 'track_missing', 'camera_missing', 'peer_disconnected', 'video_paused',
+      'video_not_ready', 'no_presented_frame'])
+    assert.equal(criticalVideoTransient([{ready: false, reason}], false), false, reason);
+  assert.equal(criticalVideoTransient([{ready: false, reason: 'presented_frame_stale'}, {ready: false, reason: 'peer_disconnected'}], false), false);
+  assert.equal(criticalVideoTransient([{ready: false, reason: 'presented_frame_stale'}], true), false);
+  assert.equal(criticalVideoTransient([{ready: true, reason: 'ready'}], false), false);
+  assert.equal(criticalVideoTransient([], false), false);
+  assert.equal(criticalVideoTransient(null, false), false);
+});
+test('three muted-track anomalies brake only until the vehicle hold is negotiated', () => {
+  for (const negotiated of [false, true]) {
+    const f = cameraFixture(['front']); f.bootstrap();
+    f.view.setTransientHoldNegotiated(negotiated);
+    const before = f.health().brake_sample_revision;
+    f.tracks.front.muted = true;
+    for (const time of [200, 233, 266]) { f.time(time); f.video('front').frames++; f.health(); }
+    const after = f.health();
+    assert.equal(after.cameras[0].consecutive_anomalies, 3);
+    assert.equal(after.ready, false);
+    assert.equal(after.brake_sample_revision - before, negotiated ? 0 : 1,
+      negotiated ? 'a negotiated transient stall advanced the brake revision' : 'the legacy third anomaly lost its brake event');
+    assert.equal(after.transient, true, 'a muted live track must be reported transient');
+    assert(after.bad_sample_revision > 0, 'the stall was not recorded as link degradation');
+  }
+});
+test('an ended track keeps its brake event and is never transient, even when negotiated', () => {
+  for (const alsoMuted of [false, true]) {
+    const f = cameraFixture(['front']); f.bootstrap();
+    f.view.setTransientHoldNegotiated(true);
+    const before = f.health().brake_sample_revision;
+    f.tracks.front.readyState = 'ended';
+    f.tracks.front.muted = alsoMuted;  // An ended track is often muted as well; that is still a fault.
+    for (const time of [200, 233, 266]) { f.time(time); f.video('front').frames++; f.health(); }
+    const after = f.health();
+    assert.equal(after.transient, false, `ended track (muted=${alsoMuted}) reported transient`);
+    assert(after.brake_sample_revision > before, `a fault-class anomaly lost its brake event (muted=${alsoMuted})`);
+  }
 });
 
 process.exitCode = failed ? 1 : 0;

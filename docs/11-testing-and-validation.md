@@ -33,6 +33,23 @@ scripts/test/check.sh
 
 任何 C++、CMake、配置或 Linux 打包改动都必须通过此门禁。
 
+瞬态链路保持（[设计](64-transient-link-hold-design.md)）对应的 CTest：
+
+- `mine-teleop-transient-hold-policy-tests`：纯逻辑策略（恢复、升级、预算、时钟倒退、offer 解析、车端视频分类，含未协商时与原规则逐位一致的穷举检查）；
+- `mine-teleop-transient-hold-service-tests`：真实车端控制服务（输出、制动下限、各类原因、硬超时、ESTOP、制动等待释放不产生假断流）；
+- `mine-teleop-recovery-enforcer-tests`、`mine-teleop-media-freshness-gstreamer-tests`、`mine-teleop-ice-vehicle-callback-mock-tests`：车端视频分类、故障类修订号、offer 声明；
+- `mine-teleop-native-control-ack-tests`：驾驶端 ACK 容忍模式；
+- `mine-teleop-transient-hold-integration-tests`：真实回环 WSS 上的断流尖峰，以及同一断流下无保持能力的车端仍制动的对照；
+  这组测试用真实定时器对 700 ms 的保持上限计时，对夹具的吞吐敏感：断流结束后，车端要先读完套接字里积压的命令，积压的命令全部过期，
+  只有读完之后到达的新鲜命令才能让保持恢复。夹具像车端那样每次 `pump()` 把已排队的事件读空；如果每次只读一条，而 `pump()` 一轮要
+  25–60 ms（驾驶端和 courier 也在这个循环里，GitHub 的 macOS 运行器上就是这样），读取速度追不上 20 Hz 的命令流，保持会用满 700 ms 后升级。
+  失败信息附带按命令排列的时间线和最大 `pump()` 间隔，不重试任何东西。
+  本地对照：每轮 `pump()` 额外加 15 ms，每次读一条的旧夹具 0/6 通过，读空的新夹具 6/6；加 25 ms 新夹具 6/6。
+  2 核加 6 个忙循环（三倍超订）下仍会失败，那是持续的 CPU 饥饿，不要在那种条件下运行它。
+- `mine-teleop-transient-hold-netem-tests`：用 `tc netem` 在回环口注入真实丢包。需要 root 和 `sch_netem`，不满足时退出码 77，CTest 记为**跳过**——跳过不计为通过，汇报时必须单独列出。
+
+页面逻辑由 `cpp/tests/camera_view.test.cjs`、`cpp/tests/control_logic.test.cjs` 覆盖，随 `scripts/test/run_offline_regressions.py` 运行。
+
 ### 3. Ubuntu 车端成品
 
 ```bash
@@ -102,7 +119,11 @@ relay、短期凭据、错误密码、匿名和过期凭据拒绝。二者仍不
 - 乱序、过期、跨车辆和无权命令全部拒绝；
 - 断网、浏览器退出、进程重启和 token 过期均触发安全状态；
 - `control_timeout_ms` 必须由目标车辆、载重、坡度和路面制动数据标定；
-- 急停解除必须经过现场物理确认。
+- 急停解除必须经过现场物理确认；
+- 瞬态保持的现场验收：直连（5G P2P）和中转（云端 WSS）各做一轮 30 分钟 mock 长测，再做一轮有人监护的实车低速测试；
+  导出车端 `vehicle-runtime.log`，运行 `python3 scripts/test/transient_hold_analyze.py <日志文件...>` 汇总保持次数、时长分布、升级原因和硬停车次数。
+  验收标准：短于容忍上限的尖峰没有任何升级，每次升级都能归因到超过上限的中断、频次预算用尽或故障类原因；
+  硬保护复核：拔网线后 1000 ms 内全制动、1200 ms 硬超时，保持期间急停立即生效，拔掉相机立即进入制动等待。
 
 ### 录像与上传
 

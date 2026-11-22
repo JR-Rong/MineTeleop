@@ -49,6 +49,7 @@ try{
   await cp(path.resolve(args.config||path.join(repo,'configs/driver-console.three-machine.dev.yaml')),path.join(controller,'config/driver-console.yaml'));
   const packages=await packager({dir:appSource,name:'MineTeleop',executableName:'MineTeleop',platform,arch,electronVersion,out:output,overwrite:false,asar:true,prune:true,extraResource:[controller],appBundleId:'com.mineteleop.control',appCategoryType:'public.app-category.business'});
   for(const folder of packages){
+    if(platform==='win32')for(const file of ['performance-profile.psm1','run-high-performance.ps1','Start-High-Performance.cmd'])await cp(path.join(repo,'packaging/windows',file),path.join(folder,file));
     if(platform==='darwin'&&process.platform==='darwin')execFileSync('codesign',['--force','--deep','--sign','-',path.join(folder,'MineTeleop.app')]);
     if(platform==='linux'){
       if(process.platform!=='linux')throw Error('Linux final packaging must run on Linux to collect and verify runtime dependencies');

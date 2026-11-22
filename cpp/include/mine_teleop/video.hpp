@@ -11,7 +11,7 @@
 namespace mine_teleop {
 
 enum class VideoCodec { H264, H265 };
-enum class EncoderBackend { Nvenc, Vaapi };
+enum class EncoderBackend { Nvenc, Vaapi, Cpu };
 
 std::string to_string(VideoCodec codec);
 std::string to_string(EncoderBackend backend);

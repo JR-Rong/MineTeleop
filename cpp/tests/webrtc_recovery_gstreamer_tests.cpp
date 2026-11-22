@@ -117,9 +117,9 @@ void verify_start_without_camera_frames(bool configured, const std::string& code
     description += "appsrc name=source" + std::to_string(lane) +
         " is-live=true format=time caps=video/x-" + (codec == "H264" ? "h264" : "h265") +
         ",stream-format=byte-stream,alignment=au ! " + (codec == "H264" ? "rtph264pay" : "rtph265pay") +
-        " pt=" + std::to_string(96 + lane) +
+        " pt=" + std::to_string(96 + lane) + " ssrc=" + std::to_string(1000 + lane) +
         " ! application/x-rtp,media=video,encoding-name=" + codec +
-        ",payload=" + std::to_string(96 + lane) +
+        ",payload=" + std::to_string(96 + lane) + ",ssrc=(uint)" + std::to_string(1000 + lane) +
         (codec == "H265" ? ",profile-id=(string)1,tier-flag=(string)0,tx-mode=(string)SRST" : ",packetization-mode=(string)1") +
         " ! peer. ";
   }
@@ -194,16 +194,20 @@ void verify_start_without_camera_frames(bool configured, const std::string& code
         const auto* media = gst_sdp_message_get_media(offer->sdp, lane);
         expect(std::string(gst_sdp_media_get_media(media)) == "video", "camera media missing");
         const auto mapping = std::to_string(96 + lane) + " " + codec + "/90000";
-        bool found = false, packetization = false;
+        bool found = false, packetization = false, source_identity = false;
         for (guint index = 0; index < gst_sdp_media_attributes_len(media); ++index) {
           const auto* attr = gst_sdp_media_get_attribute(media, index);
           if (std::string(attr->key) == "rtpmap" && attr->value && mapping == attr->value) found = true;
+          if (std::string(attr->key) == "ssrc" && attr->value &&
+              std::string(attr->value).starts_with(std::to_string(1000 + lane) + " msid:"))
+            source_identity = true;
           if (std::string(attr->key) == "fmtp" && attr->value &&
               std::string(attr->value).find(codec == "H264" ? "packetization-mode=1" : "tx-mode=SRST") != std::string::npos)
             packetization = true;
         }
         expect(found, "silent-camera offer changed codec or payload identity");
         expect(packetization, "silent-camera offer lost the payloader packetization mode");
+        expect(source_identity, "first offer SSRC differs from the configured RTP source");
       }
       if (control_before_caps)
         expect(std::string(gst_sdp_media_get_media(gst_sdp_message_get_media(offer->sdp, 8))) == "application",
@@ -254,11 +258,31 @@ void verify_control_only_offer() {
   g_object_unref(channel); gst_object_unref(peer); gst_object_unref(pipeline);
 }
 
+void verify_missing_ssrc_rejected() {
+  GError* error = nullptr;
+  auto* pipeline = gst_parse_launch(
+      "webrtcbin name=peer appsrc is-live=true format=time "
+      "caps=application/x-rtp,media=video,encoding-name=H264,clock-rate=90000,payload=96 "
+      "! application/x-rtp,media=video,encoding-name=H264,clock-rate=90000,payload=96 ! peer.", &error);
+  expect(!error && pipeline, "missing-SSRC fixture unavailable");
+  auto* peer = gst_bin_get_by_name(GST_BIN(pipeline), "peer");
+  bool rejected = false;
+  try {
+    mine_teleop::detail::configure_webrtc_video_transceivers(peer);
+  } catch (const std::runtime_error& failure) {
+    rejected = std::string(failure.what()).find("explicit RTP SSRC") != std::string::npos;
+  }
+  gst_object_unref(peer);
+  gst_object_unref(pipeline);
+  expect(rejected, "negotiation accepted a lane with no RTP source identity");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   gst_init(&argc, &argv);
   try {
+    verify_missing_ssrc_rejected();
     verify_control_only_offer();
     verify_offer(false);
     verify_offer(true);

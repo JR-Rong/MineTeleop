@@ -413,10 +413,10 @@ test('notification and periodic tick racing use one owner and ignore invalid pro
 });
 test('shipped page wires both result notifications to the scheduler and retains periodic fetches',async()=>{
   const source=fs.readFileSync(path.join(__dirname,'../src/server.cpp'),'utf8');
-  const first=source.indexOf('const controlTransportCourier='),last=source.indexOf('setInterval(()=>cameraView.refresh(),500);',first);
+  const first=source.indexOf('const controlTransportActor='),last=source.indexOf('setInterval(()=>cameraView.refresh(),500);',first);
   assert.ok(first>=0&&last>first);
   const requests=[],timers=[];
-  const context={MineTeleopControlTransport:api,performance:{now:()=>0},polling:true,controlAuthorityLost:false,
+  const context={MineTeleopControlWorker:require('../web/control_transport_worker.js'),URLSearchParams,location:{search:'?control_courier=page'},MineTeleopControlTransport:api,performance:{now:()=>0},polling:true,controlAuthorityLost:false,
     nativeControlSessionId:'s',nativeControlSessionGeneration:7,uiInstanceId:'owner',nativeControlUiEpoch:2,mediaOfferScope:{id:'a'},
     latestRuntimeStatus:{native_control:{control_transport:{enabled:true,mode:'cloud_only'},emergency_stop_capability:api.emergencyProtocol}},
     peer:null,controlChannel:null,controlTraceEnabled:false,applyVehicleControlMessage:()=>{},clearControlInput:()=>{},clientLog:()=>{},

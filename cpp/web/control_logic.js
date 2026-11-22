@@ -1127,12 +1127,15 @@
     const waiting = timing.control_braking_wait === true;
     const holding = timing.recovery_brake_hold === true;
     const delayed = telemetry.safety_state === 'DEGRADED';
-    if (!waiting && !holding && !delayed) return hidden;
+    const transientHold = Boolean(timing.transient_hold && timing.transient_hold.active === true);
+    if (!waiting && !holding && !delayed && !transientHold) return hidden;
     const cause = waiting || holding ? String(timing.control_recovery_cause || '') : 'control_delay';
     const reasons = {critical_video: '关键视频中断或无新帧', time_sync: '时间同步不可信',
       input_lease: '驾驶输入刷新过期', control_link: '控制命令延迟或短暂中断', control_delay: '控制指令延迟或短暂中断'};
     const reason = reasons[cause] || '控制链路暂时异常';
     const guidance = controlRecoveryGuidance(timing, feedbackFresh);
+    if (feedbackFresh && guidance.visible && guidance.phase === 'transient_hold')
+      return {visible: true, severity: 'info', banner: guidance.text, alert: guidance.text, cause: 'transient_hold'};
     // Report the last authoritative vehicle state without claiming that old
     // feedback confirms current physical braking or a completed stop.
     const banner = !feedbackFresh
@@ -1149,6 +1152,19 @@
     const holding = timing.recovery_brake_hold === true;
     const rearm = timing.rearm_required === true;
     const hidden = {visible: false, phase: 'none', causes: [], reason: '', nextStep: '', text: ''};
+    const hold = timing.transient_hold && typeof timing.transient_hold === 'object' ? timing.transient_hold : null;
+    // A transient hold needs no operator action: input is kept and motion resumes by itself.
+    if (feedbackFresh && hold && hold.active === true && !waiting) {
+      const labels = {control_gap: '控制链路中断', late_commands: '控制命令迟到',
+        driver_video_stale: '驾驶端画面停顿', vehicle_video_stale: '车端画面停顿'};
+      const causes = Array.isArray(hold.causes) ? hold.causes.filter(cause => labels[cause]) : [];
+      const elapsed = Number.isFinite(hold.elapsed_ms) ? Math.max(0, Math.round(hold.elapsed_ms)) : null;
+      const limit = Number.isFinite(hold.max_hold_ms) ? hold.max_hold_ms : null;
+      const reason = causes.length ? causes.map(cause => labels[cause]).join('、') : '链路或画面短暂波动';
+      const progress = elapsed !== null && limit ? `（${elapsed}/${limit} ms）` : '';
+      return {visible: true, phase: 'transient_hold', causes, reason, nextStep: '无需操作，恢复后自动继续',
+        text: `链路/画面短暂波动，已暂停牵引（轻制动）${progress} · 原因：${reason} · 无需操作，恢复后自动继续`};
+    }
     if (!waiting && !holding && !rearm) return hidden;
     const labels = {critical_video: '关键视频未就绪', input_lease: '驾驶输入刷新未就绪',
       control_link: '控制命令时效或链路未就绪', time_sync: '时间同步不可信'};
@@ -1173,7 +1189,29 @@
       phase = 'await_fresh_input'; reason = '等待新的驾驶操作，制动保持';
       nextStep = '释放旧方向输入、归零后重新按下；持续制动可保持';
     }
-    return {visible: true, phase, causes, reason, nextStep, text: `当前阻挡：${reason} · 下一步：${nextStep}`};
+    // A budget escalation means the link keeps dropping: say so instead of showing a bare wait.
+    const holdLast = hold && hold.last && typeof hold.last === 'object' ? hold.last : null;
+    const unstable = waiting && holdLast && holdLast.outcome === 'escalated' &&
+      ['budget_count_exceeded', 'budget_time_exceeded'].includes(holdLast.escalation_reason);
+    const holds = Number.isInteger(hold && hold.holds_in_window) ? hold.holds_in_window : '多';
+    const prefix = unstable ? `链路不稳定（1 分钟内保持 ${holds} 次）· ` : '';
+    return {visible: true, phase, causes, reason, nextStep, text: `${prefix}当前阻挡：${reason} · 下一步：${nextStep}`};
+  }
+
+  // Monitoring row for the vehicle-led transient hold. Display only.
+  function transientHoldPresentation(runtime, telemetry) {
+    const negotiated = Boolean(runtime && runtime.native_control && runtime.native_control.transient_hold &&
+      runtime.native_control.transient_hold.negotiated === true);
+    if (!negotiated) return {text: '未启用', level: ''};
+    const hold = telemetry && telemetry.control_timing && telemetry.control_timing.transient_hold;
+    if (!hold || typeof hold !== 'object') return {text: '已启用，等待车端状态', level: ''};
+    if (hold.active === true) return {text: '保持中', level: 'warn'};
+    const count = Number.isInteger(hold.holds_in_window) ? hold.holds_in_window : 0;
+    const last = hold.last && typeof hold.last === 'object' ? hold.last : null;
+    const duration = last && Number.isFinite(last.duration_ms) ? Math.round(last.duration_ms) : null;
+    const outcome = last ? (last.outcome === 'resumed' ? '已自动恢复' : last.outcome === 'escalated' ? '已升级为制动等待' : '') : '';
+    const tail = last && duration !== null && outcome ? ` · 最近 ${duration} ms ${outcome}` : '';
+    return {text: `1 分钟内 ${count} 次${tail}`, level: last && last.outcome === 'escalated' ? 'critical' : 'ok'};
   }
 
   function deriveControlCommandRejection(issueCodeValue) {
@@ -1392,12 +1430,52 @@
     return transports.every(value => value === 'udp') ? 'turn_udp' : 'turn_unknown';
   }
 
-  function iceAddressFamily(address) {
-    const text = String(address || '');
-    if (/^[\da-f:]+(?:%[\w.-]+)?$/i.test(text) && text.includes(':')) return 'ipv6';
-    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(text)) return 'ipv4';
-    if (/\.local\.?$/i.test(text)) return 'mdns';
-    return 'unknown';
+  // Shared by product diagnostics and the isolated WAN bench. No network IO.
+  function iceAddressInfo(value) {
+    const raw = String(value || '').toLowerCase();
+    const text = raw.includes(':') ? raw.split('%', 1)[0] : raw;
+    const unknown = {family:'unknown', scope:'unknown', address:''};
+    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(text)) {
+      const p = text.split('.').map(Number), [a,b,c] = p;
+      if (!p.every((v,i)=>v<=255 && String(v)===text.split('.')[i])) return unknown;
+      const scope = a===10 || (a===172&&b>=16&&b<=31) || (a===192&&b===168) ? 'private'
+        : a===100&&b>=64&&b<=127 ? 'shared_cgnat' : a===127 ? 'loopback'
+        : a===169&&b===254 ? 'link_local'
+        : (a===192&&b===0&&c===2)||(a===198&&b===51&&c===100)||(a===203&&b===0&&c===113) ? 'documentation'
+        : a===198&&(b===18||b===19) ? 'benchmark' : a>=224&&a<240 ? 'multicast'
+        : a===0||a>=240||(a===192&&b===0&&c===0)||(a===192&&b===88&&c===99) ? 'reserved' : 'public';
+      return {family:'ipv4',scope,address:text};
+    }
+    if (text.includes(':') && /^[0-9a-f:.]+$/.test(text)) {
+      try {
+        const address = new URL('http://['+text+']/').hostname.slice(1,-1);
+        const first = parseInt(address.split(':')[0] || '0',16);
+        const scope = address==='::1' ? 'loopback' : address==='::' ? 'unspecified'
+          : (first&0xfe00)===0xfc00 ? 'private' : (first&0xffc0)===0xfe80 ? 'link_local'
+          : (first&0xff00)===0xff00 ? 'multicast' : address.startsWith('2001:db8:') || (first===0x3fff && (parseInt(address.split(':')[1] || '0',16)&0xf000)===0) ? 'documentation'
+          : (first&0xe000)===0x2000 ? 'public' : 'reserved';
+        return {family:'ipv6',scope,address};
+      } catch { return unknown; }
+    }
+    return /\.local\.?$/.test(text) ? {family:'mdns',scope:'obfuscated',address:''} : unknown;
+  }
+  function iceAddressFamily(address) { return iceAddressInfo(address).family; }
+  function iceServersForMode(servers, mode) {
+    if (!['all','direct','relay'].includes(mode)) throw Error('unsupported ICE route mode');
+    return servers.map(server=>({...server, urls:(Array.isArray(server.urls)?server.urls:[server.urls])
+      .filter(url=>typeof url==='string' && (mode!=='direct'||!/^turns?:/i.test(url)))})).filter(server=>server.urls.length);
+  }
+
+  // Renegotiation refreshes short-lived TURN credentials. A failed refresh keeps
+  // the cached list for direct/all attempts; a relay-only attempt cannot proceed.
+  async function refreshIceServersOrCached(fetchServers, cached, routeMode) {
+    try {
+      return {servers: await fetchServers(), refreshed: true};
+    } catch (error) {
+      if (routeMode === 'relay') throw error;
+      return {servers: Array.isArray(cached) ? cached : [], refreshed: false,
+        error: String(error && error.message || error)};
+    }
   }
 
   function iceCandidateSummary(candidate) {
@@ -1407,6 +1485,7 @@
     return {candidate_type: ['host', 'srflx', 'prflx', 'relay'].includes(type) ? type : 'unknown',
       protocol: ['udp', 'tcp'].includes(String(parts[2]).toLowerCase()) ? parts[2].toLowerCase() : 'unknown',
       address_family: iceAddressFamily(parts[4] || candidate?.address),
+      address_class: iceAddressInfo(parts[4] || candidate?.address).scope,
       sdp_mline_index: candidate?.sdpMLineIndex ?? null};
   }
 
@@ -1445,6 +1524,8 @@
         remote_type: token(remote.candidateType, ['host', 'srflx', 'prflx', 'relay']),
         local_address_family: iceAddressFamily(local.address ?? local.ip),
         remote_address_family: iceAddressFamily(remote.address ?? remote.ip),
+        local_address_class: iceAddressInfo(local.address ?? local.ip).scope,
+        remote_address_class: iceAddressInfo(remote.address ?? remote.ip).scope,
         protocol: token(local.protocol, ['udp', 'tcp']),
         relay_protocol: token(local.relayProtocol, ['udp', 'tcp', 'tls']),
         remote_relay_protocol: token(remote.relayProtocol, ['udp', 'tcp', 'tls']),
@@ -1460,6 +1541,29 @@
     pairs.sort((a, b) => rank(a) - rank(b));
     return {candidates, candidate_families: candidateFamilies, pair_states: states, path_checks: paths, pair_count: pairs.length,
       pairs: pairs.slice(0, 16), pairs_truncated: pairs.length > 16};
+  }
+
+  // RTC delay totals are cumulative. Their lifetime averages conceal short
+  // stalls, so keep a separate interval view without changing safety decisions.
+  function receiverIntervalStats(stats, previous) {
+    const counters = {id:stats.id,ssrc:stats.ssrc,timestamp:stats.timestamp,
+      framesDecoded:stats.framesDecoded,totalDecodeTime:stats.totalDecodeTime,
+      totalProcessingDelay:stats.totalProcessingDelay,
+      jitterBufferEmittedCount:stats.jitterBufferEmittedCount,
+      jitterBufferDelay:stats.jitterBufferDelay,jitterBufferTargetDelay:stats.jitterBufferTargetDelay};
+    const current = previous && stats.id === previous.id && stats.ssrc === previous.ssrc &&
+      Number.isFinite(stats.timestamp) && Number.isFinite(previous.timestamp) && stats.timestamp > previous.timestamp;
+    const delta = key => current && Number.isFinite(stats[key]) && Number.isFinite(previous[key]) &&
+      previous[key] >= 0 && stats[key] >= previous[key] ? stats[key] - previous[key] : null;
+    const average = (total, count) => {
+      const numerator = delta(total), denominator = delta(count);
+      return numerator !== null && denominator !== null && denominator > 0 ? numerator * 1000 / denominator : null;
+    };
+    return {counters,framesDecoded:delta('framesDecoded'),
+      decodeMs:average('totalDecodeTime','framesDecoded'),
+      processingMs:average('totalProcessingDelay','framesDecoded'),
+      jitterMs:average('jitterBufferDelay','jitterBufferEmittedCount'),
+      targetJitterMs:average('jitterBufferTargetDelay','jitterBufferEmittedCount')};
   }
 
   function receiverLatency(stats, captureEncodeMs, roundTripSeconds) {
@@ -1735,6 +1839,7 @@
     deriveEstopPresentation,
     deriveControlRecoveryPresentation,
     controlRecoveryGuidance,
+    transientHoldPresentation,
     deriveControlCommandRejection,
     isCurrentPeer,
     isCurrentControlChannel,
@@ -1743,8 +1848,12 @@
     controlPrepareDeadlineMs,
     createLatestControlWriteQueue,
     receiverLatency,
+    receiverIntervalStats,
     iceConnectivity,
     iceCandidateSummary,
+    iceAddressInfo,
+    iceServersForMode,
+    refreshIceServersOrCached,
     iceNetworkPath,
     iceServerError,
     CONTROL_OUTCOMES,

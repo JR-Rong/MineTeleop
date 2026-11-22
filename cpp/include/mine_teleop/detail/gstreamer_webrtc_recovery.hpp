@@ -30,6 +30,13 @@ inline guint configure_webrtc_video_transceivers(GstElement* peer) {
       g_array_unref(transceivers);
       throw std::runtime_error("WebRTC video lane lacks fixed RTP codec capabilities");
     }
+    guint ssrc = 0;
+    if (!gst_structure_get_uint(gst_caps_get_structure(caps, 0), "ssrc", &ssrc) ||
+        ssrc == 0 || ssrc == G_MAXUINT) {
+      gst_caps_unref(caps);
+      g_array_unref(transceivers);
+      throw std::runtime_error("WebRTC video lane lacks an explicit RTP SSRC before negotiation");
+    }
     g_object_set(transceiver, "codec-preferences", caps, nullptr);
     gst_caps_unref(caps);
     g_object_set(transceiver, "do-nack", TRUE, nullptr);

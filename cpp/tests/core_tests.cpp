@@ -499,6 +499,129 @@ void test_config_loads_current_vehicle_yaml() {
       "safe default ordinary brake pressure changed");
 }
 
+void test_ice_configuration_source_and_direct_budget() {
+  const auto base = read_text("configs/vehicle-agent.dev.yaml");
+  expect(mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml").cloud.ice_direct_timeout_ms == 0,
+         "direct-first retry must be opt-in");
+  for (const auto budget : {0, 3000, 30000, -1, 30001}) {
+    auto source = base;
+    replace_once(source, "cloud:\n", "cloud:\n  ice_direct_timeout_ms: " + std::to_string(budget) + "\n");
+    const auto path = write_temp_vehicle_config("ice-budget", source);
+    if (budget < 0 || budget > 30000) {
+      expect_throws([&] { static_cast<void>(mine_teleop::load_vehicle_config(path)); }, "invalid ICE budget accepted");
+    } else {
+      const auto config = mine_teleop::load_vehicle_config(path);
+      expect(config.cloud.ice_direct_timeout_ms == budget, "ICE budget lost");
+      expect(config.redacted_summary().at("ice_servers_source") == "authenticated_signaling", "ICE source missing");
+    }
+    std::filesystem::remove(path);
+  }
+  for (const auto* key : {"stun_servers", "turn_servers"}) {
+    const auto path = write_temp_vehicle_config("dead-ice-key", base + "\nice:\n  " + key + ": []\n");
+    expect_throws([&] { static_cast<void>(mine_teleop::load_vehicle_config(path)); }, "unused vehicle ICE key silently accepted");
+    std::filesystem::remove(path);
+  }
+}
+
+void test_transient_hold_configuration() {
+  const auto base = read_text("configs/vehicle-agent.dev.yaml");
+  // The dev YAML carries exactly one "  control_timeout_ms: 800\n" under control:
+  // and a 300 ms degraded threshold, which the validation rule below relies on.
+  const std::string anchor = "  control_timeout_ms: 800\n";
+  const auto load = [&](const std::string& control_timeout, const std::string& extra, std::string_view name) {
+    auto source = base;
+    replace_once(source, anchor, "  control_timeout_ms: " + control_timeout + "\n" + extra);
+    const auto path = write_temp_vehicle_config(name, source);
+    struct Cleanup {
+      std::filesystem::path path;
+      ~Cleanup() { std::error_code ignored; std::filesystem::remove(path, ignored); }
+    } cleanup{path};
+    return mine_teleop::load_vehicle_config(path);
+  };
+  const auto rejects = [&](const std::string& control_timeout, const std::string& extra, std::string_view name,
+                           std::string_view message) {
+    expect_throws([&] { static_cast<void>(load(control_timeout, extra, name)); }, message);
+  };
+  const std::string enable = "  transient_hold:\n    enabled: true\n";
+
+  const auto defaults = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  expect(!defaults.control.transient_hold.enabled &&
+             defaults.control.bridge_apply_timeout_ms == defaults.control.control_timeout_ms,
+         "missing transient_hold must be disabled and the bridge timeout must default to control_timeout_ms");
+
+  const auto enabled = load("1200", "  bridge_apply_timeout_ms: 800\n" + enable, "transient-ok");
+  expect(enabled.control.transient_hold.enabled && enabled.control.transient_hold.max_hold_ms == 700 &&
+             enabled.control.transient_hold.resume_fresh_commands == 2 &&
+             enabled.control.transient_hold.budget_window_ms == 60000 &&
+             enabled.control.transient_hold.max_holds_per_window == 6 &&
+             enabled.control.transient_hold.max_hold_time_per_window_ms == 3000 &&
+             enabled.control.bridge_apply_timeout_ms == 800 && enabled.control.control_timeout_ms == 1200,
+         "transient_hold defaults or bridge timeout not loaded");
+  expect_near(enabled.control.transient_hold.hold_brake, 0.15, 1e-12, "default hold brake changed");
+
+  const auto explicit_values = load("1200",
+      "  transient_hold:\n    enabled: true\n    max_hold_ms: 500\n    hold_brake: 0.2\n"
+      "    resume_fresh_commands: 3\n    budget_window_ms: 30000\n    max_holds_per_window: 4\n"
+      "    max_hold_time_per_window_ms: 2000\n", "transient-explicit");
+  const auto& explicit_hold = explicit_values.control.transient_hold;
+  expect(explicit_hold.max_hold_ms == 500 && explicit_hold.resume_fresh_commands == 3 &&
+             explicit_hold.budget_window_ms == 30000 && explicit_hold.max_holds_per_window == 4 &&
+             explicit_hold.max_hold_time_per_window_ms == 2000,
+         "explicit transient_hold values were not loaded");
+  expect_near(explicit_hold.hold_brake, 0.2, 1e-12, "explicit hold brake not loaded");
+  // Absent bridge_apply_timeout_ms follows control_timeout_ms, so a hold-enabled
+  // vehicle without the key keeps its bridge watchdog at the longer window.
+  expect(explicit_values.control.bridge_apply_timeout_ms == 1200, "bridge timeout did not follow control_timeout_ms");
+
+  // degraded (300) + max_hold (700) + 100 ms margin must fit inside the hard watchdog.
+  static_cast<void>(load("1100", enable, "transient-boundary-ok"));
+  rejects("1099", enable, "transient-boundary", "hold window one millisecond past the hard watchdog was accepted");
+  rejects("800", enable, "transient-too-long", "hold window longer than the hard watchdog allows was accepted");
+  static_cast<void>(load("800", "", "transient-disabled-800"));  // Disabled hold keeps the legacy 800 ms watchdog.
+
+  const std::pair<const char*, const char*> bad_fields[]{
+      {"max_hold_ms: 99", "max_hold_ms below 100"}, {"max_hold_ms: 1501", "max_hold_ms above 1500"},
+      {"hold_brake: 0.4", "hold_brake above 0.3"}, {"hold_brake: -0.1", "negative hold_brake"},
+      {"resume_fresh_commands: 0", "zero fresh commands"}, {"resume_fresh_commands: 6", "six fresh commands"},
+      {"budget_window_ms: 9999", "budget window below 10 s"}, {"budget_window_ms: 600001", "budget window above 600 s"},
+      {"max_holds_per_window: 0", "zero holds per window"}, {"max_holds_per_window: 101", "101 holds per window"},
+      {"max_hold_time_per_window_ms: 99", "hold time budget below 100 ms"},
+      {"max_hold_time_per_window_ms: 70000", "hold time budget beyond the window"}};
+  for (const auto& [line, label] : bad_fields)
+    rejects("2000", enable + "    " + line + "\n", "transient-bad-field", std::string(label) + " was accepted");
+
+  // A malformed block must fail loudly instead of leaving a safety setting at its default.
+  rejects("1200", "  transient_hold: true\n", "transient-scalar", "scalar transient_hold block was accepted");
+  rejects("1200", enable + "    max_hold_msec: 900\n", "transient-typo", "misspelled transient_hold key was ignored");
+  expect(!load("1200", "  transient_hold:\n", "transient-empty").control.transient_hold.enabled,
+         "an empty transient_hold block must stay disabled");
+
+  rejects("1200", "  bridge_apply_timeout_ms: 5000\n", "bridge-too-long",
+          "bridge timeout longer than control_timeout_ms was accepted");
+  rejects("1200", "  bridge_apply_timeout_ms: 100\n", "bridge-below-feedback",
+          "bridge timeout below the speed feedback timeout was accepted");
+
+  // The shipped field configs opt in with the longer hard watchdog; every other
+  // example and bench config keeps the legacy behavior.
+  for (const auto* path : {"configs/vehicle-agent.three-machine.field.yaml", "configs/vehicle-agent.ccg2-8m.yaml"}) {
+    const auto field = mine_teleop::load_vehicle_config(path);
+    expect(field.control.transient_hold.enabled && field.control.transient_hold.max_hold_ms == 700 &&
+               field.control.control_timeout_ms == 1200 && field.control.bridge_apply_timeout_ms == 800,
+           std::string("field config does not carry the transient hold settings: ") + path);
+    const auto summary = field.redacted_summary();
+    expect(summary.at("control_timeout_ms") == 1200 && summary.at("bridge_apply_timeout_ms") == 800 &&
+               summary.at("transient_hold").at("enabled") == true,
+           std::string("effective config summary hides the transient hold settings: ") + path);
+  }
+  for (const auto* path : {"configs/vehicle-agent.dev.yaml", "configs/vehicle-agent.bench.yaml",
+                           "configs/vehicle-agent.orin-cpu-bench.yaml", "configs/vehicle-agent.orin-isx031-bench.yaml"}) {
+    const auto other = mine_teleop::load_vehicle_config(path);
+    expect(!other.control.transient_hold.enabled && other.control.control_timeout_ms == 800 &&
+               other.control.bridge_apply_timeout_ms == 800,
+           std::string("example or bench config changed its control timing: ") + path);
+  }
+}
+
 void test_camera_identity_contract() {
   const auto base = read_text("configs/vehicle-agent.dev.yaml");
   for (const auto& id : {"fish_front", "fish_rear", "fish_left", "fish_right",
@@ -1003,6 +1126,42 @@ void test_camera_backend_config_rejects_unknown_and_invalid_ccg2_modes() {
       [&] { static_cast<void>(mine_teleop::load_vehicle_config(odd_width_path)); },
       "odd CCG2 capture width was accepted");
   std::filesystem::remove(odd_width_path, error);
+}
+
+void test_orin_isx031_config_uses_native_uyvy_and_independent_output_size() {
+  const auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.orin-isx031-bench.yaml");
+  expect(config.vehicle_adapter.type == "mock" && !config.hardware.require_hardware_encoder,
+         "Orin bench must remain explicitly CPU/mock");
+  expect(config.enabled_cameras().size() == 2, "ISX031 bench must define two cameras");
+  for (const auto& camera : config.enabled_cameras()) {
+    expect(mine_teleop::classify_camera_source(camera) == mine_teleop::CameraSourceKind::V4l2Uyvy,
+           "ISX031 was incorrectly classified as MJPEG or the CCG2 YUYV quirk");
+    const auto& realtime = config.realtime_profile(camera.realtime_profile);
+    const auto input = mine_teleop::camera_input_spec(camera, realtime);
+    expect(input.codec == "uyvy" && input.width == 1920 && input.height == 1536 && input.fps == 30,
+           "ISX031 capture size was replaced by the smaller encoding size");
+    expect(realtime.width == 960 && realtime.height == 768, "ISX031 output must preserve aspect ratio");
+    auto capture = realtime;
+    capture.codec = input.codec; capture.width = input.width; capture.height = input.height; capture.fps = input.fps;
+    mine_teleop::CameraFrameSource source(camera, capture);
+    expect(source.command().empty(), "native UYVY source unexpectedly invokes a bridge process");
+    expect_throws([&] { mine_teleop::CameraFrameSource bad(camera, realtime); },
+                  "UYVY source accepted an encoded H.264 acquisition profile");
+    const auto pipeline = mine_teleop::build_camera_input_pipeline("isx031_input", input, realtime);
+    expect(pipeline.find("width=1920,height=1536") != std::string::npos &&
+           pipeline.find("width=960,height=768") != std::string::npos &&
+           pipeline.find("jpegdec") == std::string::npos,
+           "ISX031 raw conversion/scaling contract was lost");
+  }
+  auto yaml = read_text("configs/vehicle-agent.orin-isx031-bench.yaml");
+  replace_once(yaml, "capture_width: 1920", "capture_width: 1919");
+  const auto invalid = write_temp_vehicle_config("isx031-invalid-width", yaml);
+  expect_throws([&] { mine_teleop::load_vehicle_config(invalid); }, "UYVY odd capture width was accepted");
+  std::filesystem::remove(invalid);
+  expect(mine_teleop::classify_camera_issue("V4L2 UYVY driver did not negotiate UYVY: /dev/video0").code ==
+             "camera_uyvy_format_invalid", "native UYVY format error was misclassified");
+  expect(mine_teleop::classify_camera_issue("V4L2 UYVY V4L2 buffer flagged error for /dev/video0").retryable,
+         "native UYVY capture error lost bounded reopen behavior");
 }
 
 void test_ccg2_uyvy_row_packing_handles_stride_and_rejects_invalid_frames() {
@@ -1832,6 +1991,59 @@ void test_control_command_json_round_trip_and_validation() {
   auto invalid = original;
   invalid.throttle = 1.5;
   expect_throws([&] { invalid.validate(); }, "invalid throttle was accepted");
+}
+
+void test_transient_hold_command_fields() {
+  auto value = command(1, 1000);
+  value.transient_hold_capable = true;
+  value.critical_video_ready = false;
+  value.critical_video_transient = true;
+  const auto json = value.to_json();
+  expect(json.at("transient_hold") == "transient-hold-v1" && json.at("critical_video_transient") == true,
+         "transient hold fields not serialized");
+  const auto parsed = ControlCommand::from_json(json);
+  expect(parsed.transient_hold_capable && parsed.critical_video_transient, "transient hold fields not parsed");
+
+  auto legacy = command(2, 1000).to_json();
+  expect(!legacy.contains("transient_hold") && !legacy.contains("critical_video_transient"),
+         "legacy command gained new keys");
+  expect(!ControlCommand::from_json(legacy).transient_hold_capable, "legacy command negotiated hold");
+  // Capable but with healthy video: the marker is present, the transient flag is explicit false.
+  auto capable = command(3, 1000);
+  capable.transient_hold_capable = true;
+  const auto capable_json = capable.to_json();
+  expect(capable_json.at("transient_hold") == "transient-hold-v1" && capable_json.at("critical_video_transient") == false,
+         "capable command with healthy video serialized the wrong transient flag");
+
+  const auto rejects = [&](const std::function<void(mine_teleop::Json&)>& change, std::string_view message) {
+    auto broken = json;
+    change(broken);
+    expect_throws([&] { static_cast<void>(ControlCommand::from_json(broken)); }, message);
+  };
+  rejects([](mine_teleop::Json& body) { body["transient_hold"] = "transient-hold-v2"; }, "unknown capability accepted");
+  rejects([](mine_teleop::Json& body) { body["transient_hold"] = true; }, "non-string capability accepted");
+  rejects([](mine_teleop::Json& body) { body["critical_video_transient"] = "yes"; }, "non-boolean transient video flag accepted");
+  rejects([](mine_teleop::Json& body) { body["critical_video_ready"] = true; },
+          "transient video flag accepted while video was ready");
+  rejects([](mine_teleop::Json& body) { body.erase("transient_hold"); },
+          "transient video flag accepted without the hold capability");
+
+  auto direct = value;
+  direct.critical_video_ready = true;
+  expect_throws([&] { direct.validate(); }, "validate accepted a transient video flag with ready video");
+
+  // A verified ESTOP never depends on the optional hold schema: unknown or
+  // contradictory hold fields are ignored instead of rejecting the stop.
+  auto stop = json;
+  stop["estop"] = true;
+  stop["transient_hold"] = "transient-hold-v2";
+  stop["critical_video_ready"] = true;
+  const auto parsed_stop = ControlCommand::from_json(stop);
+  expect(parsed_stop.estop && !parsed_stop.transient_hold_capable && !parsed_stop.critical_video_transient,
+         "estop kept unverified hold fields");
+  auto direct_stop = direct;
+  direct_stop.estop = true;
+  direct_stop.validate();
 }
 
 void test_session_control_profile_json_round_trip_and_physical_units() {
@@ -4672,6 +4884,100 @@ void test_nvenc_pipeline_stage_tracks_gstreamer_property_compatibility() {
       "GStreamer 1.24 NVENC stage did not apply preset and ultra-low-latency tune");
 }
 
+void test_jetson_encoder_uses_nvmm_and_hardware_units() {
+  const auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.orin-nx-isx031-bench.yaml");
+  const auto candidates = mine_teleop::encoder_candidate_order(config.hardware, mine_teleop::VideoCodec::H264);
+  expect(config.vehicle_adapter.type == "mock" && config.hardware.require_hardware_encoder,
+         "Jetson bench must keep mock isolation and require actual hardware");
+  expect(candidates.size() == 1 && candidates.front().backend == mine_teleop::EncoderBackend::Nvenc,
+         "Jetson hardware-only configuration admitted a CPU fallback");
+  for (const auto* factory : {"nvv4l2h264enc", "nvv4l2h265enc"}) {
+    const auto stage = mine_teleop::build_nvenc_pipeline_stage(factory, {1500, 7}, "encoder_front", 1, 20);
+    expect(stage.starts_with("nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! "),
+           "Jetson encoder did not receive converted NVMM surfaces");
+    expect(stage.find(std::string(factory) + " name=encoder_front bitrate=1500000 ") != std::string::npos,
+           "Jetson bitrate was not converted from kbit/s to bit/s");
+    for (const auto* property : {"control-rate=1", "iframeinterval=7", "idrinterval=7",
+                                 "num-B-Frames=0", "copy-timestamp=true", "insert-sps-pps=true"}) {
+      expect(stage.find(property) != std::string::npos, "Jetson recovery/timestamp contract missing");
+    }
+    expect(stage.find("zerolatency=") == std::string::npos && stage.find("gop-size=") == std::string::npos,
+           "Jetson stage inherited incompatible desktop NVENC properties");
+  }
+  expect_throws([] {
+    static_cast<void>(mine_teleop::build_nvenc_pipeline_stage("nvv4l2h264enc", {std::numeric_limits<int>::max(), 7}, "enc", 1, 20));
+  }, "Jetson bitrate overflow was accepted");
+}
+
+void test_cpu_encoder_requires_opt_in_and_preserves_codec_fallback() {
+  const auto path = "configs/vehicle-agent.orin-cpu-bench.yaml";
+  const auto config = mine_teleop::load_vehicle_config(path);
+  expect(config.vehicle_adapter.type == "mock", "CPU bench must use the mock adapter");
+  expect(!config.hardware.require_hardware_encoder, "CPU bench did not explicitly opt in");
+  const auto h264 = mine_teleop::encoder_candidate_order(config.hardware, mine_teleop::VideoCodec::H264);
+  expect(h264.size() == 1 && h264.front().backend == mine_teleop::EncoderBackend::Cpu,
+         "CPU-only H.264 selection is missing or duplicated");
+  expect(mine_teleop::encoder_candidate_order(config.hardware, mine_teleop::VideoCodec::H265).empty(),
+         "CPU backend incorrectly advertises H.265 support");
+
+  auto hardware = config.hardware;
+  hardware.preferred_encoder = "nvenc";
+  expect(mine_teleop::encoder_candidate_order(hardware, mine_teleop::VideoCodec::H264).size() == 2,
+         "explicit hardware-to-CPU H.264 fallback was lost");
+  const auto h265 = mine_teleop::encoder_candidate_order(hardware, mine_teleop::VideoCodec::H265);
+  expect(h265.size() == 1 && h265.front().backend == mine_teleop::EncoderBackend::Nvenc,
+         "unsupported CPU codec displaced the hardware H.265 candidate");
+  hardware.require_hardware_encoder = true;
+  expect_throws([&] { mine_teleop::encoder_candidate_order(hardware, mine_teleop::VideoCodec::H264); },
+                "hardware-only policy allowed a CPU fallback");
+
+  auto yaml = read_text(path);
+  replace_once(yaml, "require_hardware_encoder: false", "require_hardware_encoder: true");
+  const auto invalid = write_temp_vehicle_config("cpu-policy", yaml);
+  expect_throws([&] { mine_teleop::load_vehicle_config(invalid); },
+                "configuration accepted CPU encoding while requiring hardware");
+  std::filesystem::remove(invalid);
+}
+
+void test_cpu_h264_encoder_produces_parsed_baseline_buffers() {
+  const auto encoder = mine_teleop::create_video_encoder(
+      {mine_teleop::EncoderBackend::Cpu, mine_teleop::VideoCodec::H264});
+  if (encoder->factory_name().empty() || !mine_teleop::gstreamer_factory_available("h264parse")) {
+    std::cout << "SKIP CPU encode integration: x264enc/h264parse not installed\n";
+    return;
+  }
+  const auto description =
+      "videotestsrc num-buffers=24 ! video/x-raw,format=NV12,width=160,height=120,framerate=30/1 ! " +
+      encoder->pipeline_stage({300, 30}, "cpu_encoder") +
+      " ! h264parse ! video/x-h264,profile=constrained-baseline,alignment=au"
+      " ! fakesink name=encoded_sink signal-handoffs=true sync=false";
+  GError* parse_error = nullptr;
+  GstElement* pipeline = mine_teleop::parse_initialized_gstreamer_pipeline(description.c_str(), &parse_error);
+  const std::string error = parse_error == nullptr ? "" : parse_error->message;
+  if (parse_error != nullptr) g_error_free(parse_error);
+  if (pipeline == nullptr || !error.empty()) {
+    if (pipeline != nullptr) gst_object_unref(pipeline);
+    throw TestFailure("CPU H.264 pipeline could not be parsed: " + error);
+  }
+  std::atomic<int> encoded_count{0};
+  auto* sink = gst_bin_get_by_name(GST_BIN(pipeline), "encoded_sink");
+  g_signal_connect(sink, "handoff", G_CALLBACK(+[](GstElement*, GstBuffer*, GstPad*, gpointer data) {
+    static_cast<std::atomic<int>*>(data)->fetch_add(1);
+  }), &encoded_count);
+  GstBus* bus = gst_element_get_bus(pipeline);
+  const auto state = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+  GstMessage* message = gst_bus_timed_pop_filtered(
+      bus, 10 * GST_SECOND, static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+  const bool eos = message != nullptr && GST_MESSAGE_TYPE(message) == GST_MESSAGE_EOS;
+  gst_element_set_state(pipeline, GST_STATE_NULL);
+  if (message != nullptr) gst_message_unref(message);
+  gst_object_unref(bus);
+  gst_object_unref(sink);
+  gst_object_unref(pipeline);
+  expect(state != GST_STATE_CHANGE_FAILURE && eos && encoded_count == 24,
+         "CPU H.264 failed to emit all 24 parsed baseline access units before EOS");
+}
+
 void test_native_testsrc_acquisition_does_not_spawn_ffmpeg() {
   const auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   const auto camera = config.enabled_cameras().front();
@@ -5028,6 +5334,8 @@ void test_uploader_requires_closed_fragment_and_defers_digest() {
 int main() {
   const std::vector<std::pair<std::string, std::function<void()>>> tests{
       {"config_loads_current_vehicle_yaml", test_config_loads_current_vehicle_yaml},
+      {"ice_configuration_source_and_direct_budget", test_ice_configuration_source_and_direct_budget},
+      {"transient_hold_configuration", test_transient_hold_configuration},
       {"camera_identity_contract", test_camera_identity_contract},
       {"vehicle_config_rejects_unimplemented_control_safety_options", test_vehicle_config_rejects_unimplemented_control_safety_options},
       {"vehicle_config_validates_full_scale_motor_torque", test_vehicle_config_validates_full_scale_motor_torque},
@@ -5040,6 +5348,7 @@ int main() {
       {"camera_source_classification_is_canonical", test_camera_source_classification_is_canonical},
       {"camera_input_spec_is_explicit_for_ccg2_and_legacy_safe", test_camera_input_spec_is_explicit_for_ccg2_and_legacy_safe},
       {"camera_backend_config_rejects_unknown_and_invalid_ccg2_modes", test_camera_backend_config_rejects_unknown_and_invalid_ccg2_modes},
+      {"orin_isx031_config_uses_native_uyvy_and_independent_output_size", test_orin_isx031_config_uses_native_uyvy_and_independent_output_size},
       {"ccg2_uyvy_row_packing_handles_stride_and_rejects_invalid_frames", test_ccg2_uyvy_row_packing_handles_stride_and_rejects_invalid_frames},
       {"camera_input_pipeline_keeps_legacy_jpeg_and_adds_raw_ccg2", test_camera_input_pipeline_keeps_legacy_jpeg_and_adds_raw_ccg2},
       {"camera_input_pipeline_always_bounds_raw_delivery_without_duplication", test_camera_input_pipeline_always_bounds_raw_delivery_without_duplication},
@@ -5062,6 +5371,7 @@ int main() {
       {"bench_config_drives_unified_vehicle_runtime", test_bench_config_drives_unified_vehicle_runtime},
       {"field_config_pins_tls_route_without_system_dns", test_field_config_pins_tls_route_without_system_dns},
       {"control_command_json_round_trip_and_validation", test_control_command_json_round_trip_and_validation},
+      {"transient_hold_command_fields", test_transient_hold_command_fields},
       {"session_control_profile_json_round_trip_and_physical_units", test_session_control_profile_json_round_trip_and_physical_units},
       {"shared_protocol_v1_vectors_and_session_states", test_shared_protocol_v1_vectors_and_session_states},
       {"control_receiver_enforces_token_sequence_and_gap", test_control_receiver_enforces_token_sequence_and_gap},
@@ -5114,7 +5424,10 @@ int main() {
       {"signaling_time_sync_common_domain", test_signaling_time_sync_common_domain},
       {"driver_config_and_hardware_encoder_priority", test_driver_config_and_hardware_encoder_priority},
       {"realtime_keyframe_interval_reserves_video_recovery_budget", test_realtime_keyframe_interval_reserves_video_recovery_budget},
+      {"cpu_encoder_requires_opt_in_and_preserves_codec_fallback", test_cpu_encoder_requires_opt_in_and_preserves_codec_fallback},
+      {"cpu_h264_encoder_produces_parsed_baseline_buffers", test_cpu_h264_encoder_produces_parsed_baseline_buffers},
       {"nvenc_pipeline_stage_tracks_gstreamer_property_compatibility", test_nvenc_pipeline_stage_tracks_gstreamer_property_compatibility},
+      {"jetson_encoder_uses_nvmm_and_hardware_units", test_jetson_encoder_uses_nvmm_and_hardware_units},
       {"native_testsrc_acquisition_does_not_spawn_ffmpeg", test_native_testsrc_acquisition_does_not_spawn_ffmpeg},
       {"basler_camera_uses_minimal_aravis_bridge", test_basler_camera_uses_minimal_aravis_bridge},
       {"native_driver_to_vehicle_signaling_control_payload", test_native_driver_to_vehicle_signaling_control_payload},

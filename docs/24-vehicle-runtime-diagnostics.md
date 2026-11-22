@@ -170,6 +170,9 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 
 | `event` / `issue_code` | 触发条件 | 关键附加字段 | 频率 |
 | --- | --- | --- | --- |
+| `vehicle_transient_hold_entered` / 同名 | 协商了瞬态保持的会话里出现瞬态原因（控制断流、迟到命令、驾驶端画面停顿、车端画面停顿），牵引撤销并施加轻制动 | `causes`, `max_hold_ms`, `hold_brake`, `holds_in_window` | 每次进入一次；`severity=info` |
+| `vehicle_transient_hold_resumed` / 同名 | 瞬态原因消失且连续新鲜命令达到要求，自动恢复，无需重按 | `last.duration_ms`, `last.outcome=resumed` | 每次恢复一次；`severity=info` |
+| `vehicle_transient_hold_escalated` / 同名 | 保持超过 `max_hold_ms`、频次或累计时长预算用尽、保持期间出现故障类原因、传输代际变化、时钟倒退，或更强的停车（硬超时、锁存、急停）接管 | `last.escalation_reason`, `last.duration_ms`, `holds_in_window` | 每次升级一次；`severity=warning`；升级后按原有制动等待处理 |
 | `vehicle_media_time_sync_failed` / `media_initial_time_sync_failed` | 初始时间同步请求失败 | `error` | 每次 session 尝试一次 |
 | `vehicle_media_time_sync_failed` / `media_time_sync_uncertainty_exceeded` | 初始不确定度超过安全阈值 | `uncertainty_ms`, `limit_ms` | 即时 |
 | `vehicle_media_signaling_failed` / `vehicle_signaling_registration_failed` | vehicle online 注册失败 | `error` | 每次重连一次 |
@@ -526,3 +529,9 @@ ICE server 错误同时记录实际 URL 的 udp/tcp transport 和错误类别
 边界，仍含线程调度/解密，不能当作内核收包时刻或纯网络 RTT。
 `ack_poll_failed` 在关闭连接前尽力记录 socket/TCP 诊断，并保持会话/generation
 校验和既有失败处理。新增日志仅使用现有 opt-in 异步 native trace。
+
+### 原生 UYVY（ISX031）
+
+`camera_uyvy_format_invalid` 表示原生 UYVY 格式、尺寸或 stride 协商失败；检查 capture_* 配置与 SerDes 初始化。
+`camera_uyvy_layout_invalid` 表示原始帧布局不合法，应先核对驱动的 bytesperline/sizeimage。
+`camera_uyvy_buffer_error` 表示错误 buffer 或短帧，沿用有界重开和关键相机安全策略；检查 CSI/VI 日志及 sensor_mode，不能把错误帧当成有效视频。
