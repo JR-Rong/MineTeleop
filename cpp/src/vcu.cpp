@@ -758,12 +758,10 @@ std::vector<CanFrame> ParallelController::tick() {
   if (state_ == State::WaitParkingBrakeReleased ||
       state_ == State::WaitGear ||
       state_ == State::WaitActuatorModes ||
-      state_ == State::Ready ||
-      state_ == State::DisarmTorque ||
-      state_ == State::DisarmStop ||
-      state_ == State::DisarmNeutral) {
-    // Once state 5 has been revoked, do not keep asking the VCU to release the
-    // EPB while the staged shutdown removes torque and stops the vehicle.
+      state_ == State::Ready) {
+    // Release the EPB only while arming. The reverse sequence below must never
+    // write an explicit release: it can start from a parked vehicle, and a
+    // stalled exit would otherwise leave the last request unparked.
     if (!handshake_revoked_) {
       parking_brake.fill(kParkingBrakeRelease);
     }
@@ -854,14 +852,25 @@ std::vector<CanFrame> ParallelController::tick() {
     steering_axis_mode.fill(kByWireMode);
     brake_mode.fill(kByWireMode);
     brake_pressure = emergency_.brake_pressure_bar;
-  } else if (state_ == State::DisarmParkingBrake) {
+  } else if (state_ == State::DisarmParkingBrake ||
+             state_ == State::DisarmManual) {
     gear = kNeutralGear;
+    if (state_ == State::DisarmManual) handshake_request = kNoRequest;
     parking_brake.fill(kParkingBrakePark);
-  } else if (state_ == State::DisarmManual || state_ == State::Disarmed) {
+    // Hold the calibrated EHB service brake until all four EPBs confirm park.
+    // Dropping it here would leave the vehicle on the parking brake alone
+    // during its take-up delay, which is a roll window on a grade. The state
+    // machine only leaves this phase on fresh park feedback.
+    brake_mode.fill(kByWireMode);
+    brake_pressure = emergency_.brake_pressure_bar;
+  } else if (state_ == State::Disarmed) {
     gear = kNeutralGear;
     handshake_request = kNoRequest;
     // Keep the confirmed parking request in the final batch sent before close.
+    // EHB is released only after all four EPBs have reported park.
     parking_brake.fill(kParkingBrakePark);
+    brake_mode.fill(kNoRequest);
+    brake_pressure.fill(0.0);
   }
 
   std::vector<CanFrame> frames;
